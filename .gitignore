@@ -1,0 +1,78 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Config files (contain sensitive data)
+*.json
+configs/
+
+# Nuitka build files
+nuitka_cache/
+NuitkaCache/
+*.build/
+*.dist/
+main.build/
+main.dist/
+*.onefile-build/
+build_nuitka.py
+
+# Test and debug files
+test_*.py
+debug_*.py
+manual_extract.py
+
+# Browser storage
+browser_storage.json
+
+# Excel files
+*.xlsx
+*.xls
+*.csv
+
+# Icons (keep love.ico)
+!love.ico
+
+# PyInstaller spec files
+*.spec
+
+# Nuitka crash reports
+nuitka-crash-report.xml
