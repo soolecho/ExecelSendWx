@@ -477,6 +477,7 @@ class TableFilterTab(QWidget):
         
         self.persons_list = QListWidget()
         self.persons_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        self.persons_list.setMinimumHeight(150)
         persons_layout.addWidget(self.persons_list)
         
         btn_layout = QHBoxLayout()
@@ -493,8 +494,8 @@ class TableFilterTab(QWidget):
         
         self.preview_text = QTextEdit()
         self.preview_text.setReadOnly(True)
-        self.preview_text.setMinimumHeight(100)
-        self.preview_text.setMaximumHeight(120)
+        self.preview_text.setMinimumHeight(150)
+        self.preview_text.setMaximumHeight(200)
         preview_layout.addWidget(self.preview_text)
         
         middle_layout.addWidget(preview_group)
@@ -526,6 +527,8 @@ class TableFilterTab(QWidget):
         self.chat_delay_spin.setRange(0.0, 10.0)
         self.chat_delay_spin.setSingleStep(0.1)
         self.chat_delay_spin.setValue(1.0)
+        self.chat_delay_spin.setFixedWidth(100)
+        chat_delay_layout.addWidget(self.chat_delay_spin)
         send_layout.addLayout(chat_delay_layout)
         
         self.custom_msg_checkbox = QCheckBox("发送后追加自定义消息")
