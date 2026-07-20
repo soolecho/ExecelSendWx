@@ -176,10 +176,11 @@ class ExcelReadWorker(QThread):
 
 
 class SendWorker(QThread):
-    def __init__(self, tasks, send_interval=2):
+    def __init__(self, tasks, send_interval=2, chat_delay=0.8):
         super().__init__()
         self.tasks = tasks
         self.send_interval = send_interval
+        self.chat_delay = chat_delay
         self.signals = WorkerSignals()
         self.paused_event = threading.Event()
         self.stopped_event = threading.Event()
@@ -224,7 +225,7 @@ class SendWorker(QThread):
                     for j in range(0, len(person_data), max_message_length):
                         messages.append(person_data[j:j+max_message_length])
                     
-                    success = sender.send_multiple_messages(messages, recipient)
+                    success = sender.send_multiple_messages(messages, recipient, chat_delay=self.chat_delay)
                     if success:
                         self.signals.log.emit(f"[{i+1}/{total_count}] ✅ 成功发送给 {recipient}")
                         success_count += 1
@@ -234,7 +235,7 @@ class SendWorker(QThread):
                         failed_tasks.append((name, recipient))
                     
                     if custom_msg:
-                        sender.send_message(custom_msg, recipient)
+                        sender.send_message(custom_msg, recipient, chat_delay=self.chat_delay)
                         self.signals.log.emit(f"[{i+1}/{total_count}] 已发送自定义消息")
                     
                 except Exception as e:
@@ -465,12 +466,17 @@ class TableFilterTab(QWidget):
         
         left_layout.addWidget(filter_group)
         
+        left_layout.addStretch()
+        splitter.addWidget(left_panel)
+        
+        middle_panel = QWidget()
+        middle_layout = QVBoxLayout(middle_panel)
+        
         persons_group = QGroupBox("人员列表")
         persons_layout = QVBoxLayout(persons_group)
         
         self.persons_list = QListWidget()
         self.persons_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
-        self.persons_list.setMaximumHeight(100)
         persons_layout.addWidget(self.persons_list)
         
         btn_layout = QHBoxLayout()
@@ -480,7 +486,23 @@ class TableFilterTab(QWidget):
         btn_layout.addWidget(self.deselect_all_btn)
         persons_layout.addLayout(btn_layout)
         
-        left_layout.addWidget(persons_group)
+        middle_layout.addWidget(persons_group)
+        
+        preview_group = QGroupBox("数据预览")
+        preview_layout = QVBoxLayout(preview_group)
+        
+        self.preview_text = QTextEdit()
+        self.preview_text.setReadOnly(True)
+        self.preview_text.setMaximumHeight(80)
+        preview_layout.addWidget(self.preview_text)
+        
+        middle_layout.addWidget(preview_group)
+        
+        middle_layout.addStretch()
+        splitter.addWidget(middle_panel)
+        
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
         
         send_group = QGroupBox("发送设置")
         send_layout = QVBoxLayout(send_group)
@@ -497,6 +519,14 @@ class TableFilterTab(QWidget):
         interval_layout.addWidget(self.send_interval_spin)
         send_layout.addLayout(interval_layout)
         
+        chat_delay_layout = QHBoxLayout()
+        chat_delay_layout.addWidget(QLabel("聊天窗口延迟(秒):"))
+        self.chat_delay_spin = QSpinBox()
+        self.chat_delay_spin.setRange(0, 10)
+        self.chat_delay_spin.setSingleStep(1)
+        self.chat_delay_spin.setValue(1)
+        send_layout.addLayout(chat_delay_layout)
+        
         self.custom_msg_checkbox = QCheckBox("发送后追加自定义消息")
         send_layout.addWidget(self.custom_msg_checkbox)
         
@@ -512,23 +542,7 @@ class TableFilterTab(QWidget):
         self.send_btn.setEnabled(False)
         send_layout.addWidget(self.send_btn)
         
-        left_layout.addWidget(send_group)
-        
-        left_layout.addStretch()
-        splitter.addWidget(left_panel)
-        
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        
-        preview_group = QGroupBox("数据预览")
-        preview_layout = QVBoxLayout(preview_group)
-        
-        self.preview_text = QTextEdit()
-        self.preview_text.setReadOnly(True)
-        self.preview_text.setMaximumHeight(80)
-        preview_layout.addWidget(self.preview_text)
-        
-        right_layout.addWidget(preview_group)
+        right_layout.addWidget(send_group)
         
         progress_group = QGroupBox("发送进度")
         progress_layout = QVBoxLayout(progress_group)
@@ -576,7 +590,7 @@ class TableFilterTab(QWidget):
         right_layout.addStretch()
         splitter.addWidget(right_panel)
         
-        splitter.setSizes([350, 550])
+        splitter.setSizes([280, 300, 270])
         
         main_layout.addWidget(splitter)
         self.setLayout(main_layout)
@@ -1010,7 +1024,8 @@ class TableFilterTab(QWidget):
         
         self.worker = SendWorker(
             tasks=tasks,
-            send_interval=self.send_interval_spin.value()
+            send_interval=self.send_interval_spin.value(),
+            chat_delay=self.chat_delay_spin.value()
         )
         self.worker.signals.result.connect(self.on_send_result)
         self.worker.signals.error.connect(self.on_send_error)

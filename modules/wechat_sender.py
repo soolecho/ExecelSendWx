@@ -19,7 +19,7 @@ class WeChatSender:
             logger.error(f"Failed to initialize WeChat: {e}")
             return False
 
-    def send_message(self, content, recipient, first_send=False):
+    def send_message(self, content, recipient, first_send=False, chat_delay=0.8):
         if not self.wx:
             self.log(f"初始化微信客户端...")
             if not self.initialize():
@@ -35,8 +35,8 @@ class WeChatSender:
             self.log(f"打开聊天窗口: {recipient}")
             self.wx.ChatWith(recipient)
             
-            self.log(f"等待聊天窗口激活...")
-            time.sleep(0.8)
+            self.log(f"等待聊天窗口激活({chat_delay}秒)...")
+            time.sleep(chat_delay)
             
             self.wx.SendMsg(content, who=recipient)
             
@@ -79,11 +79,11 @@ class WeChatSender:
             self.log(f"❌ 发送文件失败: {e}")
             return False
 
-    def send_multiple_messages(self, messages, recipient):
+    def send_multiple_messages(self, messages, recipient, chat_delay=0.8):
         success_count = 0
         for i, message in enumerate(messages):
             self.log(f"发送消息 {i+1}/{len(messages)} 给 {recipient}")
-            if self.send_message(message, recipient, first_send=(i == 0)):
+            if self.send_message(message, recipient, first_send=(i == 0), chat_delay=chat_delay):
                 success_count += 1
             time.sleep(0.5)
         
