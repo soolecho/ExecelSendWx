@@ -14,6 +14,7 @@ from PyQt6.QtGui import QFont, QIcon
 
 from modules.wechat_sender import WeChatSender
 from modules.table_processor import TableProcessor
+from modules.wps_extractor import WPSExtractor
 
 
 
@@ -148,8 +149,8 @@ class ExcelReadWorker(QThread):
             return headers, values
             
         except Exception as e:
-            self.signals.log(f"✗ pandas读取失败: {e}")
-            self.signals.log("尝试使用openpyxl直接读取...")
+            self.signals.log.emit(f"✗ pandas读取失败: {e}")
+            self.signals.log.emit("尝试使用openpyxl直接读取...")
             
             try:
                 from openpyxl import load_workbook

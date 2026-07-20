@@ -54,6 +54,7 @@ main.build/
 main.dist/
 *.onefile-build/
 build_nuitka.py
+build_pyinstaller.py
 
 # Test and debug files
 test_*.py

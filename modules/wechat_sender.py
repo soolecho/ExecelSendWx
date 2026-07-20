@@ -19,7 +19,7 @@ class WeChatSender:
             logger.error(f"Failed to initialize WeChat: {e}")
             return False
 
-    def send_message(self, content, recipient):
+    def send_message(self, content, recipient, first_send=False):
         if not self.wx:
             self.log(f"初始化微信客户端...")
             if not self.initialize():
@@ -28,7 +28,27 @@ class WeChatSender:
         
         self.log(f"发送消息给 {recipient}")
         try:
+            if first_send:
+                self.log(f"首次发送，等待微信窗口就绪...")
+                time.sleep(2)
+            
+            self.log(f"打开聊天窗口: {recipient}")
+            self.wx.ChatWith(recipient)
+            
+            self.log(f"等待聊天窗口激活...")
+            time.sleep(0.8)
+            
             self.wx.SendMsg(content, who=recipient)
+            
+            message_length = len(content)
+            if message_length > 500:
+                self.log(f"消息较长({message_length}字符)，等待发送完成...")
+                time.sleep(1)
+            elif message_length > 100:
+                time.sleep(0.5)
+            else:
+                time.sleep(0.2)
+            
             self.log(f"✅ 消息发送成功")
             return True
         except Exception as e:
@@ -63,7 +83,7 @@ class WeChatSender:
         success_count = 0
         for i, message in enumerate(messages):
             self.log(f"发送消息 {i+1}/{len(messages)} 给 {recipient}")
-            if self.send_message(message, recipient):
+            if self.send_message(message, recipient, first_send=(i == 0)):
                 success_count += 1
             time.sleep(0.5)
         
