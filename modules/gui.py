@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QTabWidget, QLabel, QLineEdit, QPushButton, QTextEdit,
     QComboBox, QListWidget, QListWidgetItem, QGroupBox,
     QCheckBox, QProgressBar, QMessageBox, QSplitter, QSpinBox,
-    QDialog, QDialogButtonBox, QFileDialog
+    QDoubleSpinBox, QDialog, QDialogButtonBox, QFileDialog
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread
 from PyQt6.QtGui import QFont, QIcon
@@ -493,7 +493,8 @@ class TableFilterTab(QWidget):
         
         self.preview_text = QTextEdit()
         self.preview_text.setReadOnly(True)
-        self.preview_text.setMaximumHeight(80)
+        self.preview_text.setMinimumHeight(100)
+        self.preview_text.setMaximumHeight(120)
         preview_layout.addWidget(self.preview_text)
         
         middle_layout.addWidget(preview_group)
@@ -521,10 +522,10 @@ class TableFilterTab(QWidget):
         
         chat_delay_layout = QHBoxLayout()
         chat_delay_layout.addWidget(QLabel("聊天窗口延迟(秒):"))
-        self.chat_delay_spin = QSpinBox()
-        self.chat_delay_spin.setRange(0, 10)
-        self.chat_delay_spin.setSingleStep(1)
-        self.chat_delay_spin.setValue(1)
+        self.chat_delay_spin = QDoubleSpinBox()
+        self.chat_delay_spin.setRange(0.0, 10.0)
+        self.chat_delay_spin.setSingleStep(0.1)
+        self.chat_delay_spin.setValue(1.0)
         send_layout.addLayout(chat_delay_layout)
         
         self.custom_msg_checkbox = QCheckBox("发送后追加自定义消息")
@@ -590,7 +591,7 @@ class TableFilterTab(QWidget):
         right_layout.addStretch()
         splitter.addWidget(right_panel)
         
-        splitter.setSizes([280, 300, 270])
+        splitter.setSizes([285, 280, 285])
         
         main_layout.addWidget(splitter)
         self.setLayout(main_layout)
