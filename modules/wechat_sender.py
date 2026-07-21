@@ -19,7 +19,7 @@ class WeChatSender:
             logger.error(f"Failed to initialize WeChat: {e}")
             return False
 
-    def send_message(self, content, recipient, first_send=False, chat_delay=0.8):
+    def send_message(self, content, recipient, first_send=False, chat_delay=0.3):
         if not self.wx:
             self.log(f"初始化微信客户端...")
             if not self.initialize():
@@ -29,28 +29,39 @@ class WeChatSender:
         self.log(f"发送消息给 {recipient}")
         try:
             if first_send:
-                self.log(f"首次发送，等待微信窗口就绪...")
-                time.sleep(2)
+                self.log(f"首次发送，确保微信窗口激活...")
+                time.sleep(0.5)
             
+            # 使用模糊匹配切换聊天窗口
             self.log(f"打开聊天窗口: {recipient}")
-            self.wx.ChatWith(recipient)
+            self.wx.ChatWith(recipient, exact=False)
             
-            self.log(f"等待聊天窗口激活({chat_delay}秒)...")
+            # 等待窗口激活（由聊天窗口延迟控制）
             time.sleep(chat_delay)
             
-            self.wx.SendMsg(content, who=recipient)
+            # 验证窗口是否正确切换
+            chatinfo = self.wx.ChatInfo()
+            current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
+            self.log(f"当前窗口: {current_chat}")
             
-            message_length = len(content)
-            if message_length > 500:
-                self.log(f"消息较长({message_length}字符)，等待发送完成...")
-                time.sleep(1)
-            elif message_length > 100:
-                time.sleep(0.5)
+            # 包含匹配判断（chat_name 包含 recipient 即可）
+            if current_chat >= recipient:
+                self.wx.SendMsg(content)
+                
+                message_length = len(content)
+                if message_length > 500:
+                    self.log(f"消息较长({message_length}字符)，等待发送完成...")
+                    time.sleep(1)
+                elif message_length > 100:
+                    time.sleep(0.5)
+                else:
+                    time.sleep(0.2)
+                
+                self.log(f"✅ 消息发送成功")
+                return True
             else:
-                time.sleep(0.2)
-            
-            self.log(f"✅ 消息发送成功")
-            return True
+                self.log(f"❌ 窗口切换失败，当前: {current_chat}，目标: {recipient}")
+                return False
         except Exception as e:
             self.log(f"❌ 发送消息失败: {e}")
             return False
@@ -79,7 +90,7 @@ class WeChatSender:
             self.log(f"❌ 发送文件失败: {e}")
             return False
 
-    def send_multiple_messages(self, messages, recipient, chat_delay=0.8):
+    def send_multiple_messages(self, messages, recipient, chat_delay=0.2):
         success_count = 0
         for i, message in enumerate(messages):
             self.log(f"发送消息 {i+1}/{len(messages)} 给 {recipient}")

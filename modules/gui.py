@@ -194,7 +194,7 @@ class SendWorker(QThread):
         try:
             self.signals.log.emit("初始化微信客户端...")
             sender = WeChatSender()
-            if not sender.is_online():
+            if not sender.initialize():
                 self.signals.error.emit("微信未登录或未打开")
                 return
             self.signals.log.emit("微信客户端初始化成功")
@@ -215,7 +215,7 @@ class SendWorker(QThread):
                 try:
                     if i == 0:
                         self.signals.log.emit("等待微信就绪...")
-                        time.sleep(2)
+                        time.sleep(0.2)
                     
                     self.signals.log.emit(f"[{i+1}/{total_count}] 正在发送给 {recipient} ({name})...")
                     self.signals.progress.emit(int((i + 1) / total_count * 100))
@@ -232,7 +232,7 @@ class SendWorker(QThread):
                     else:
                         self.signals.log.emit(f"[{i+1}/{total_count}] ❌ 发送失败: {recipient}")
                         failed_count += 1
-                        failed_tasks.append((name, recipient))
+                        failed_tasks.append((name, person_data, recipient, custom_msg))
                     
                     if custom_msg:
                         sender.send_message(custom_msg, recipient, chat_delay=self.chat_delay)
@@ -241,18 +241,18 @@ class SendWorker(QThread):
                 except Exception as e:
                     self.signals.log.emit(f"[{i+1}/{total_count}] ❌ 发送异常: {name} - {str(e)}")
                     failed_count += 1
-                    failed_tasks.append((name, recipient))
+                    failed_tasks.append((name, person_data, recipient, custom_msg))
                 
                 if i < total_count - 1 and not self.stopped_event.is_set():
                     time.sleep(self.send_interval)
             
             if failed_tasks:
                 self.signals.log.emit(f"\n--- 发送失败列表 ({failed_count}人) ---")
-                for name, recipient in failed_tasks:
+                for name, _, recipient, _ in failed_tasks:
                     self.signals.log.emit(f"❌ {name} → {recipient}")
             
             self.signals.log.emit(f"\n发送完成！成功: {success_count}, 失败: {failed_count}, 总计: {total_count}")
-            self.signals.result.emit((success_count, failed_count, total_count))
+            self.signals.result.emit((success_count, failed_count, total_count, failed_tasks))
             
         except Exception as e:
             import traceback
@@ -526,7 +526,7 @@ class TableFilterTab(QWidget):
         self.chat_delay_spin = QDoubleSpinBox()
         self.chat_delay_spin.setRange(0.0, 10.0)
         self.chat_delay_spin.setSingleStep(0.1)
-        self.chat_delay_spin.setValue(1.0)
+        self.chat_delay_spin.setValue(0.3)
         self.chat_delay_spin.setFixedWidth(100)
         chat_delay_layout.addWidget(self.chat_delay_spin)
         send_layout.addLayout(chat_delay_layout)
@@ -589,6 +589,11 @@ class TableFilterTab(QWidget):
         self.stop_send_btn.setEnabled(False)
         control_layout.addWidget(self.stop_send_btn)
         
+        self.retry_send_btn = QPushButton("🔄 重试发送")
+        self.retry_send_btn.setStyleSheet("background-color: #00BCD4; color: white; padding: 8px; font-size: 14px;")
+        self.retry_send_btn.setEnabled(False)
+        control_layout.addWidget(self.retry_send_btn)
+        
         right_layout.addWidget(control_group)
         
         right_layout.addStretch()
@@ -609,6 +614,7 @@ class TableFilterTab(QWidget):
         self.start_send_btn.clicked.connect(self.send_data)
         self.pause_send_btn.clicked.connect(self.pause_send)
         self.stop_send_btn.clicked.connect(self.stop_send)
+        self.retry_send_btn.clicked.connect(self.retry_send)
         self.send_btn.clicked.connect(self.send_data)
         self.select_all_btn.clicked.connect(lambda: self.persons_list.selectAll())
         self.deselect_all_btn.clicked.connect(lambda: self.persons_list.clearSelection())
@@ -820,7 +826,6 @@ class TableFilterTab(QWidget):
             self.current_file_label.setText(f"当前文件: {os.path.basename(file_path)}")
             self.open_excel_btn.setEnabled(True)
             self.reload_btn.setEnabled(True)
-            self.excel_btn.setEnabled(False)
             
             self._load_excel_data(file_path)
     
@@ -861,8 +866,12 @@ class TableFilterTab(QWidget):
         
         self.sheet_combo.clear()
         self.sheet_combo.addItems(self.sheet_names)
-        self.sheet_combo.setCurrentText(self.current_sheet)
         
+        self.sheet_combo.blockSignals(True)
+        self.sheet_combo.setCurrentText(self.current_sheet)
+        self.sheet_combo.blockSignals(False)
+        
+        self.sheet_combo.setEnabled(True)
         self._update_column_combos()
         self.log("Excel文件读取完成！请选择Sheet和列，然后点击'加载数据'")
     
@@ -888,6 +897,10 @@ class TableFilterTab(QWidget):
             self.extract_columns_btn.setEnabled(False)
             self.wechat_column_combo.setEnabled(False)
             self.load_data_btn.setEnabled(False)
+            
+            if hasattr(self, 'excel_worker') and self.excel_worker and self.excel_worker.isRunning():
+                self.excel_worker.stop()
+                self.excel_worker.wait()
             
             self.excel_worker = ExcelReadWorker(self.current_excel_path, sheet_name)
             self.excel_worker.signals.result.connect(self.on_excel_read_result)
@@ -1055,6 +1068,34 @@ class TableFilterTab(QWidget):
             self.worker.set_paused(False)
             self.log("⏹ 正在停止发送...")
 
+    def retry_send(self):
+        if not hasattr(self, 'last_failed_tasks') or not self.last_failed_tasks:
+            QMessageBox.warning(self, "警告", "没有可重试的任务")
+            return
+        
+        failed_tasks = self.last_failed_tasks
+        self.log(f"🔄 开始重试发送，共 {len(failed_tasks)} 个失败任务")
+        
+        self.send_btn.setEnabled(False)
+        self.start_send_btn.setEnabled(False)
+        self.retry_send_btn.setEnabled(False)
+        self.pause_send_btn.setEnabled(True)
+        self.stop_send_btn.setEnabled(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("正在重试发送...")
+        
+        self.worker = SendWorker(
+            tasks=failed_tasks,
+            send_interval=self.send_interval_spin.value(),
+            chat_delay=self.chat_delay_spin.value()
+        )
+        self.worker.signals.result.connect(self.on_send_result)
+        self.worker.signals.error.connect(self.on_send_error)
+        self.worker.signals.finished.connect(self.on_send_finished)
+        self.worker.signals.log.connect(self.log)
+        self.worker.signals.progress.connect(self.on_send_progress)
+        self.worker.start()
+
     def on_send_finished(self):
         self.send_btn.setEnabled(True)
         self.start_send_btn.setEnabled(True)
@@ -1072,9 +1113,16 @@ class TableFilterTab(QWidget):
         self.progress_label.setText(f"发送进度: {value}%")
 
     def on_send_result(self, result):
-        success_count, failed_count, total_count = result
+        success_count, failed_count, total_count, failed_tasks = result
+        self.last_failed_tasks = failed_tasks
         QMessageBox.information(self, "完成", f"发送完成！成功 {success_count}, 失败 {failed_count}, 总计 {total_count}")
         self.progress_label.setText(f"发送完成: 成功 {success_count}, 失败 {failed_count}")
+        
+        if failed_tasks:
+            self.retry_send_btn.setEnabled(True)
+            self.log(f"⚠ 有 {len(failed_tasks)} 个发送失败，可点击'重试发送'按钮重新发送")
+        else:
+            self.retry_send_btn.setEnabled(False)
 
     def on_send_error(self, error):
         QMessageBox.critical(self, "错误", f"发送失败: {error}")
