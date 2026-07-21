@@ -235,6 +235,7 @@ class SendWorker(QThread):
                         failed_tasks.append((name, person_data, recipient, custom_msg))
                     
                     if custom_msg:
+                        time.sleep(0.1)
                         sender.send_message(custom_msg, recipient, chat_delay=self.chat_delay, fast_mode=True)
                         self.signals.log.emit(f"[{i+1}/{total_count}] 已发送自定义消息")
                     
@@ -515,9 +516,10 @@ class TableFilterTab(QWidget):
         
         interval_layout = QHBoxLayout()
         interval_layout.addWidget(QLabel("发送间隔(秒):"))
-        self.send_interval_spin = QSpinBox()
-        self.send_interval_spin.setRange(0, 30)
-        self.send_interval_spin.setValue(2)
+        self.send_interval_spin = QDoubleSpinBox()
+        self.send_interval_spin.setRange(0.0, 30.0)
+        self.send_interval_spin.setSingleStep(0.1)
+        self.send_interval_spin.setValue(0.5)
         interval_layout.addWidget(self.send_interval_spin)
         send_layout.addLayout(interval_layout)
         
