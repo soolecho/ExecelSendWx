@@ -19,7 +19,7 @@ class WeChatSender:
             logger.error(f"Failed to initialize WeChat: {e}")
             return False
 
-    def send_message(self, content, recipient, first_send=False, chat_delay=0.3):
+    def send_message(self, content, recipient, first_send=False, chat_delay=0.3, fast_mode=False):
         if not self.wx:
             self.log(f"初始化微信客户端...")
             if not self.initialize():
@@ -32,19 +32,33 @@ class WeChatSender:
                 self.log(f"首次发送，确保微信窗口激活...")
                 time.sleep(0.5)
             
-            # 使用模糊匹配切换聊天窗口
-            self.log(f"打开聊天窗口: {recipient}")
-            self.wx.ChatWith(recipient, exact=False)
+            if fast_mode:
+                chatinfo = self.wx.ChatInfo()
+                current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
+                if current_chat >= recipient:
+                    self.log(f"当前窗口正确，直接发送")
+                    self.wx.SendMsg(content)
+                    
+                    message_length = len(content)
+                    if message_length > 500:
+                        time.sleep(1)
+                    elif message_length > 100:
+                        time.sleep(0.5)
+                    else:
+                        time.sleep(0.2)
+                    
+                    self.log(f"✅ 快速发送成功")
+                    return True
+                else:
+                    self.log(f"当前窗口不正确({current_chat})，需要重新切换")
             
-            # 等待窗口激活（由聊天窗口延迟控制）
+            self.wx.ChatWith(recipient, exact=False)
             time.sleep(chat_delay)
             
-            # 验证窗口是否正确切换
             chatinfo = self.wx.ChatInfo()
             current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
             self.log(f"当前窗口: {current_chat}")
             
-            # 包含匹配判断（chat_name 包含 recipient 即可）
             if current_chat >= recipient:
                 self.wx.SendMsg(content)
                 

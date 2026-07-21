@@ -235,7 +235,7 @@ class SendWorker(QThread):
                         failed_tasks.append((name, person_data, recipient, custom_msg))
                     
                     if custom_msg:
-                        sender.send_message(custom_msg, recipient, chat_delay=self.chat_delay)
+                        sender.send_message(custom_msg, recipient, chat_delay=self.chat_delay, fast_mode=True)
                         self.signals.log.emit(f"[{i+1}/{total_count}] 已发送自定义消息")
                     
                 except Exception as e:
