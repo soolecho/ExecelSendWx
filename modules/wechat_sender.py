@@ -52,30 +52,37 @@ class WeChatSender:
                 else:
                     self.log(f"当前窗口不正确({current_chat})，需要重新切换")
             
-            self.wx.ChatWith(recipient, exact=False)
-            time.sleep(chat_delay)
-            
-            chatinfo = self.wx.ChatInfo()
-            current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
-            self.log(f"当前窗口: {current_chat}")
-            
-            if current_chat >= recipient:
-                self.wx.SendMsg(content)
+            max_retries = 3
+            for attempt in range(max_retries):
+                self.log(f"尝试切换窗口 ({attempt+1}/{max_retries}): {recipient}")
+                self.wx.ChatWith(recipient, exact=False)
+                time.sleep(chat_delay)
                 
-                message_length = len(content)
-                if message_length > 500:
-                    self.log(f"消息较长({message_length}字符)，等待发送完成...")
-                    time.sleep(1)
-                elif message_length > 100:
-                    time.sleep(0.5)
+                chatinfo = self.wx.ChatInfo()
+                current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
+                self.log(f"当前窗口: {current_chat}")
+                
+                if current_chat >= recipient:
+                    self.wx.SendMsg(content)
+                    
+                    message_length = len(content)
+                    if message_length > 500:
+                        self.log(f"消息较长({message_length}字符)，等待发送完成...")
+                        time.sleep(1)
+                    elif message_length > 100:
+                        time.sleep(0.5)
+                    else:
+                        time.sleep(0.2)
+                    
+                    self.log(f"✅ 消息发送成功")
+                    return True
                 else:
-                    time.sleep(0.2)
-                
-                self.log(f"✅ 消息发送成功")
-                return True
-            else:
-                self.log(f"❌ 窗口切换失败，当前: {current_chat}，目标: {recipient}")
-                return False
+                    if attempt < max_retries - 1:
+                        self.log(f"窗口切换失败，尝试重新搜索 ({attempt+1}/{max_retries})")
+                        time.sleep(0.2)
+            
+            self.log(f"❌ 窗口切换失败，当前: {current_chat}，目标: {recipient}")
+            return False
         except Exception as e:
             self.log(f"❌ 发送消息失败: {e}")
             return False
