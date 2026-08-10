@@ -170,7 +170,7 @@ class TableProcessor:
         
         return "\n".join(result)
 
-    def get_person_data(self, name, name_column, extract_columns, conditions=None):
+    def get_person_table_data(self, name, name_column, extract_columns, conditions=None):
         name_index = self.get_header_index(name_column)
         if name_index < 0:
             logger.error(f"Name column '{name_column}' not found in headers: {self.headers}")
@@ -197,10 +197,30 @@ class TableProcessor:
         extracted_data = self.extract_columns(filtered_rows, column_indices=extract_indices)
         
         extract_names = [self.headers[i] for i in extract_indices]
+        return {
+            "headers": extract_names,
+            "rows": extracted_data
+        }
+
+    def get_person_data(self, name, name_column, extract_columns, conditions=None):
+        table_data = self.get_person_table_data(
+            name,
+            name_column,
+            extract_columns,
+            conditions
+        )
+        if not table_data:
+            return None
         
+        return self.format_table_data(table_data)
+
+    def format_table_data(self, table_data):
         formatted_results = []
-        for row in extracted_data:
-            formatted = self.format_row_data(row, column_names=extract_names)
+        for row in table_data["rows"]:
+            formatted = self.format_row_data(
+                row,
+                column_names=table_data["headers"]
+            )
             formatted_results.append(formatted)
         
         return "\n\n".join(formatted_results)

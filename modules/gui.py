@@ -176,11 +176,18 @@ class ExcelReadWorker(QThread):
 
 
 class SendWorker(QThread):
-    def __init__(self, tasks, send_interval=2, chat_delay=0.8):
+    def __init__(
+        self,
+        tasks,
+        send_interval=2,
+        chat_delay=0.8,
+        send_mode="text"
+    ):
         super().__init__()
         self.tasks = tasks
         self.send_interval = send_interval
         self.chat_delay = chat_delay
+        self.send_mode = send_mode
         self.signals = WorkerSignals()
         self.paused_event = threading.Event()
         self.stopped_event = threading.Event()
@@ -190,10 +197,12 @@ class SendWorker(QThread):
         failed_count = 0
         failed_tasks = []
         total_count = len(self.tasks)
+        sender = None
         
         try:
             self.signals.log.emit("初始化微信客户端...")
             sender = WeChatSender()
+            sender.cleanup_temp_images()
             if not sender.initialize():
                 self.signals.error.emit("微信未登录或未打开")
                 return
@@ -210,7 +219,7 @@ class SendWorker(QThread):
                     self.signals.log.emit("⏹ 发送已停止")
                     break
                 
-                name, person_data, recipient, custom_msg = task
+                name, person_data, table_data, recipient, custom_msg = task
                 
                 try:
                     if i == 0:
@@ -225,31 +234,65 @@ class SendWorker(QThread):
                     for j in range(0, len(person_data), max_message_length):
                         messages.append(person_data[j:j+max_message_length])
                     
-                    success = sender.send_multiple_messages(messages, recipient, chat_delay=self.chat_delay)
+                    if self.send_mode == "image":
+                        success = sender.send_table_images(
+                            table_data,
+                            recipient,
+                            chat_delay=self.chat_delay,
+                            should_stop=self.stopped_event.is_set
+                        )
+                    elif self.send_mode == "image_text":
+                        success = sender.send_table_images(
+                            table_data,
+                            recipient,
+                            chat_delay=self.chat_delay,
+                            should_stop=self.stopped_event.is_set
+                        )
+                        if success and not self.stopped_event.is_set():
+                            time.sleep(0.1)
+                            success = sender.send_multiple_messages(
+                                messages,
+                                recipient,
+                                chat_delay=self.chat_delay
+                            )
+                    else:
+                        success = sender.send_multiple_messages(
+                            messages,
+                            recipient,
+                            chat_delay=self.chat_delay
+                        )
                     if success:
                         self.signals.log.emit(f"[{i+1}/{total_count}] ✅ 成功发送给 {recipient}")
                         success_count += 1
                     else:
                         self.signals.log.emit(f"[{i+1}/{total_count}] ❌ 发送失败: {recipient}")
                         failed_count += 1
-                        failed_tasks.append((name, person_data, recipient, custom_msg))
+                        failed_tasks.append(task)
                     
-                    if custom_msg:
+                    if custom_msg and success and not self.stopped_event.is_set():
                         time.sleep(0.1)
-                        sender.send_message(custom_msg, recipient, chat_delay=self.chat_delay, fast_mode=True)
-                        self.signals.log.emit(f"[{i+1}/{total_count}] 已发送自定义消息")
+                        custom_success = sender.send_message(
+                            custom_msg,
+                            recipient,
+                            chat_delay=self.chat_delay,
+                            fast_mode=True
+                        )
+                        if custom_success:
+                            self.signals.log.emit(f"[{i+1}/{total_count}] 已发送自定义消息")
+                        else:
+                            self.signals.log.emit(f"[{i+1}/{total_count}] ⚠ 自定义消息发送失败")
                     
                 except Exception as e:
                     self.signals.log.emit(f"[{i+1}/{total_count}] ❌ 发送异常: {name} - {str(e)}")
                     failed_count += 1
-                    failed_tasks.append((name, person_data, recipient, custom_msg))
+                    failed_tasks.append(task)
                 
                 if i < total_count - 1 and not self.stopped_event.is_set():
                     time.sleep(self.send_interval)
             
             if failed_tasks:
                 self.signals.log.emit(f"\n--- 发送失败列表 ({failed_count}人) ---")
-                for name, _, recipient, _ in failed_tasks:
+                for name, _, _, recipient, _ in failed_tasks:
                     self.signals.log.emit(f"❌ {name} → {recipient}")
             
             self.signals.log.emit(f"\n发送完成！成功: {success_count}, 失败: {failed_count}, 总计: {total_count}")
@@ -260,6 +303,10 @@ class SendWorker(QThread):
             self.signals.log.emit(f"❌ 发送线程异常: {str(e)}")
             self.signals.log.emit(f"详细错误: {traceback.format_exc()[:300]}")
             self.signals.error.emit(str(e))
+        finally:
+            if sender:
+                sender.cleanup_temp_images()
+            self.signals.finished.emit()
 
     def set_paused(self, value):
         if value:
@@ -514,6 +561,15 @@ class TableFilterTab(QWidget):
         self.wechat_edit = QLineEdit()
         send_layout.addWidget(self.wechat_edit)
         
+        send_mode_layout = QHBoxLayout()
+        send_mode_layout.addWidget(QLabel("数据发送形式:"))
+        self.send_mode_combo = QComboBox()
+        self.send_mode_combo.addItem("文字", "text")
+        self.send_mode_combo.addItem("图片", "image")
+        self.send_mode_combo.addItem("图片后再发文字", "image_text")
+        send_mode_layout.addWidget(self.send_mode_combo)
+        send_layout.addLayout(send_mode_layout)
+
         interval_layout = QHBoxLayout()
         interval_layout.addWidget(QLabel("发送间隔(秒):"))
         self.send_interval_spin = QDoubleSpinBox()
@@ -980,22 +1036,24 @@ class TableFilterTab(QWidget):
         custom_msg = ""
         if self.custom_msg_checkbox.isChecked():
             custom_msg = self.custom_msg_edit.toPlainText().strip()
+        send_mode = self.send_mode_combo.currentData()
         
         tasks = []
         missing_wechat = []
         
         for item in selected_items:
             name = item.text()
-            person_data = self.processor.get_person_data(
+            table_data = self.processor.get_person_table_data(
                 name, 
                 name_column, 
                 extract_columns,
                 self.filter_conditions
             )
             
-            if not person_data:
+            if not table_data:
                 self.log(f"未找到 {name} 的数据，跳过")
                 continue
+            person_data = self.processor.format_table_data(table_data)
             
             recipient = self.wechat_mapping.get(name, "")
             if not recipient:
@@ -1004,7 +1062,7 @@ class TableFilterTab(QWidget):
             if not recipient:
                 recipient = name
             
-            tasks.append((name, person_data, recipient, custom_msg))
+            tasks.append((name, person_data, table_data, recipient, custom_msg))
         
         if missing_wechat:
             QMessageBox.warning(self, "警告", f"以下人员缺少微信接收人，已跳过:\n{', '.join(missing_wechat)}")
@@ -1015,12 +1073,13 @@ class TableFilterTab(QWidget):
         
         max_display = 20
         confirm_text = f"即将向以下 {len(tasks)} 人发送消息:\n\n"
-        for i, (name, _, recipient, _) in enumerate(tasks):
+        for i, (name, _, _, recipient, _) in enumerate(tasks):
             if i >= max_display:
                 confirm_text += f"  • ... 还有 {len(tasks) - max_display} 人\n"
                 break
             confirm_text += f"  • {name} → {recipient}\n"
         confirm_text += f"\n发送间隔: {self.send_interval_spin.value()}秒"
+        confirm_text += f"\n数据发送形式: {self.send_mode_combo.currentText()}"
         if custom_msg:
             confirm_text += f"\n包含自定义消息: {custom_msg[:30]}..." if len(custom_msg) > 30 else f"\n包含自定义消息: {custom_msg}"
         
@@ -1040,11 +1099,13 @@ class TableFilterTab(QWidget):
         self.stop_send_btn.setEnabled(True)
         self.progress_bar.setValue(0)
         self.progress_label.setText("正在发送...")
+        self.last_send_mode = send_mode
         
         self.worker = SendWorker(
             tasks=tasks,
             send_interval=self.send_interval_spin.value(),
-            chat_delay=self.chat_delay_spin.value()
+            chat_delay=self.chat_delay_spin.value(),
+            send_mode=send_mode
         )
         self.worker.signals.result.connect(self.on_send_result)
         self.worker.signals.error.connect(self.on_send_error)
@@ -1068,7 +1129,7 @@ class TableFilterTab(QWidget):
         if hasattr(self, 'worker') and self.worker.isRunning():
             self.worker.set_stopped(True)
             self.worker.set_paused(False)
-            self.log("⏹ 正在停止发送...")
+            self.log("⏹ 正在停止发送，当前操作结束后将清理临时图片...")
 
     def retry_send(self):
         if not hasattr(self, 'last_failed_tasks') or not self.last_failed_tasks:
@@ -1089,7 +1150,8 @@ class TableFilterTab(QWidget):
         self.worker = SendWorker(
             tasks=failed_tasks,
             send_interval=self.send_interval_spin.value(),
-            chat_delay=self.chat_delay_spin.value()
+            chat_delay=self.chat_delay_spin.value(),
+            send_mode=getattr(self, 'last_send_mode', 'text')
         )
         self.worker.signals.result.connect(self.on_send_result)
         self.worker.signals.error.connect(self.on_send_error)
