@@ -29,7 +29,29 @@ class WeChatSender:
             logger.error(f"Failed to initialize WeChat: {e}")
             return False
 
-    def send_message(self, content, recipient, first_send=False, chat_delay=0.3, fast_mode=False):
+    @staticmethod
+    def _stop_requested(stop_event):
+        return bool(stop_event and stop_event.is_set())
+
+    @staticmethod
+    def _wait_or_stopped(delay, stop_event):
+        if not stop_event:
+            time.sleep(delay)
+            return False
+        return stop_event.wait(delay)
+
+    def send_message(
+        self,
+        content,
+        recipient,
+        first_send=False,
+        chat_delay=0.3,
+        fast_mode=False,
+        stop_event=None
+    ):
+        if self._stop_requested(stop_event):
+            return False
+
         if not self.wx:
             self.log(f"初始化微信客户端...")
             if not self.initialize():
@@ -40,9 +62,12 @@ class WeChatSender:
         try:
             if first_send:
                 self.log(f"首次发送，确保微信窗口激活...")
-                time.sleep(0.5)
+                if self._wait_or_stopped(0.5, stop_event):
+                    return False
             
             if fast_mode:
+                if self._stop_requested(stop_event):
+                    return False
                 chatinfo = self.wx.ChatInfo()
                 current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
                 if self._is_target_chat(current_chat, recipient):
@@ -64,9 +89,13 @@ class WeChatSender:
             
             max_retries = 3
             for attempt in range(max_retries):
+                if self._stop_requested(stop_event):
+                    return False
+
                 self.log(f"尝试切换窗口 ({attempt+1}/{max_retries}): {recipient}")
                 self.wx.ChatWith(recipient, exact=False)
-                time.sleep(chat_delay)
+                if self._wait_or_stopped(chat_delay, stop_event):
+                    return False
                 
                 chatinfo = self.wx.ChatInfo()
                 current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
@@ -89,7 +118,8 @@ class WeChatSender:
                 else:
                     if attempt < max_retries - 1:
                         self.log(f"窗口切换失败，尝试重新搜索 ({attempt+1}/{max_retries})")
-                        time.sleep(0.2)
+                        if self._wait_or_stopped(0.2, stop_event):
+                            return False
             
             self.log(f"❌ 窗口切换失败，当前: {current_chat}，目标: {recipient}")
             return False
@@ -97,7 +127,17 @@ class WeChatSender:
             self.log(f"❌ 发送消息失败: {e}")
             return False
 
-    def send_file(self, file_path, recipient, chat_delay=0.3, fast_mode=False):
+    def send_file(
+        self,
+        file_path,
+        recipient,
+        chat_delay=0.3,
+        fast_mode=False,
+        stop_event=None
+    ):
+        if self._stop_requested(stop_event):
+            return False
+
         if not self.wx:
             if not self.initialize():
                 return False
@@ -105,6 +145,8 @@ class WeChatSender:
         self.log(f"发送文件 {file_path} 给 {recipient}")
         try:
             if fast_mode:
+                if self._stop_requested(stop_event):
+                    return False
                 chatinfo = self.wx.ChatInfo()
                 current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
                 if self._is_target_chat(current_chat, recipient):
@@ -116,9 +158,13 @@ class WeChatSender:
             max_retries = 3
             current_chat = ""
             for attempt in range(max_retries):
+                if self._stop_requested(stop_event):
+                    return False
+
                 self.log(f"尝试切换窗口 ({attempt + 1}/{max_retries}): {recipient}")
                 self.wx.ChatWith(recipient, exact=False)
-                time.sleep(chat_delay)
+                if self._wait_or_stopped(chat_delay, stop_event):
+                    return False
 
                 chatinfo = self.wx.ChatInfo()
                 current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
@@ -131,7 +177,8 @@ class WeChatSender:
 
                 if attempt < max_retries - 1:
                     self.log(f"窗口切换失败，尝试重新搜索 ({attempt + 1}/{max_retries})")
-                    time.sleep(0.2)
+                    if self._wait_or_stopped(0.2, stop_event):
+                        return False
 
             self.log(f"❌ 窗口切换失败，当前: {current_chat}，目标: {recipient}")
             return False
@@ -404,48 +451,106 @@ class WeChatSender:
                 text_y += line_height
             x += column_width
 
-    def send_table_images(
+    def send_table_images_progress(
         self,
         table_data,
         recipient,
         chat_delay=0.3,
-        should_stop=None
+        start_index=0,
+        stop_event=None
     ):
         image_paths = []
+        next_index = start_index
         try:
             image_paths = self._create_table_images(table_data)
-            self.log(f"临时图片目录: {self.get_temp_image_dir()}")
-            for index, image_path in enumerate(image_paths):
-                if should_stop and should_stop():
-                    self.log("⏹ 已停止图片发送")
-                    return False
+            if start_index >= len(image_paths):
+                return True, len(image_paths)
 
+            self.log(f"临时图片目录: {self.get_temp_image_dir()}")
+            for index in range(start_index, len(image_paths)):
+                if self._stop_requested(stop_event):
+                    self.log("⏹ 已停止图片发送")
+                    return False, next_index
+
+                image_path = image_paths[index]
                 self.log(f"发送图片 {index + 1}/{len(image_paths)} 给 {recipient}")
                 if not self.send_file(
                     image_path,
                     recipient,
                     chat_delay=chat_delay,
-                    fast_mode=(index > 0)
+                    fast_mode=(index > 0),
+                    stop_event=stop_event
                 ):
-                    return False
-            return True
+                    return False, next_index
+                next_index = index + 1
+            return True, next_index
         except Exception as e:
             self.log(f"❌ 生成或发送表格图片失败: {e}")
-            return False
+            return False, next_index
         finally:
             for image_path in image_paths:
                 self._remove_temp_image(image_path)
 
-    def send_multiple_messages(self, messages, recipient, chat_delay=0.2):
-        success_count = 0
-        for i, message in enumerate(messages):
+    def send_table_images(
+        self,
+        table_data,
+        recipient,
+        chat_delay=0.3,
+        stop_event=None
+    ):
+        success, _ = self.send_table_images_progress(
+            table_data,
+            recipient,
+            chat_delay=chat_delay,
+            stop_event=stop_event
+        )
+        return success
+
+    def send_multiple_messages_progress(
+        self,
+        messages,
+        recipient,
+        chat_delay=0.2,
+        start_index=0,
+        stop_event=None
+    ):
+        next_index = start_index
+        for i in range(start_index, len(messages)):
+            if self._stop_requested(stop_event):
+                return False, next_index
+
+            message = messages[i]
             self.log(f"发送消息 {i+1}/{len(messages)} 给 {recipient}")
-            if self.send_message(message, recipient, first_send=(i == 0), chat_delay=chat_delay):
-                success_count += 1
-            time.sleep(0.5)
+            if not self.send_message(
+                message,
+                recipient,
+                first_send=(i == 0),
+                chat_delay=chat_delay,
+                stop_event=stop_event
+            ):
+                return False, next_index
+
+            next_index = i + 1
+            if i < len(messages) - 1 and self._wait_or_stopped(0.5, stop_event):
+                return False, next_index
+
+        self.log(f"成功发送 {len(messages)}/{len(messages)} 条消息")
+        return True, next_index
         
-        self.log(f"成功发送 {success_count}/{len(messages)} 条消息")
-        return success_count == len(messages)
+    def send_multiple_messages(
+        self,
+        messages,
+        recipient,
+        chat_delay=0.2,
+        stop_event=None
+    ):
+        success, _ = self.send_multiple_messages_progress(
+            messages,
+            recipient,
+            chat_delay=chat_delay,
+            stop_event=stop_event
+        )
+        return success
 
     def get_chat_list(self):
         if not self.wx:

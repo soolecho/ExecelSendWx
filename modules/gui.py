@@ -1,25 +1,23 @@
 import sys
 import os
-import time
 import threading
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTabWidget, QLabel, QLineEdit, QPushButton, QTextEdit,
+    QLabel, QLineEdit, QPushButton, QTextEdit,
     QComboBox, QListWidget, QListWidgetItem, QGroupBox,
-    QCheckBox, QProgressBar, QMessageBox, QSplitter, QSpinBox,
+    QCheckBox, QProgressBar, QMessageBox, QSplitter,
     QDoubleSpinBox, QDialog, QDialogButtonBox, QFileDialog
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer
 from PyQt6.QtGui import QFont, QIcon
 
+from modules.config_manager import ConfigError, ConfigManager
 from modules.wechat_sender import WeChatSender
 from modules.table_processor import TableProcessor
-from modules.wps_extractor import WPSExtractor
 
 
 
 class WorkerSignals(QObject):
-    finished = pyqtSignal()
     error = pyqtSignal(str)
     progress = pyqtSignal(int)
     result = pyqtSignal(object)
@@ -27,46 +25,6 @@ class WorkerSignals(QObject):
 
 
 
-
-
-class ExtractionWorker(QThread):
-    def __init__(self, document_url, extraction_type, **kwargs):
-        super().__init__()
-        self.document_url = document_url
-        self.extraction_type = extraction_type
-        self.kwargs = kwargs
-        self.signals = WorkerSignals()
-
-    def run(self):
-        try:
-            self.signals.log.emit("开始提取文档内容...")
-            self.signals.log.emit(f"URL: {self.document_url[:50]}...")
-            self.signals.log.emit(f"类型: {self.extraction_type}")
-            self.signals.log.emit(f"参数: {str(self.kwargs)[:100]}...")
-            
-            result = WPSExtractor.extract_from_document(
-                self.document_url,
-                extraction_type=self.extraction_type,
-                **self.kwargs
-            )
-            
-            if result is None:
-                self.signals.log.emit("⚠ 提取返回空结果")
-            elif isinstance(result, list):
-                self.signals.log.emit(f"✓ 提取成功: {len(result)} 个表格")
-            else:
-                self.signals.log.emit(f"✓ 提取成功: {len(str(result))} 字符")
-                
-            self.signals.result.emit(result)
-            self.signals.log.emit("文档内容提取完成")
-        except Exception as e:
-            import traceback
-            error_msg = f"提取失败: {str(e)}"
-            self.signals.log.emit(f"❌ {error_msg}")
-            self.signals.log.emit(f"详细错误: {traceback.format_exc()[:500]}")
-            self.signals.error.emit(error_msg)
-        finally:
-            self.signals.finished.emit()
 
 
 class ExcelReadWorker(QThread):
@@ -101,14 +59,12 @@ class ExcelReadWorker(QThread):
             self.signals.log.emit(f"✗ {error_msg}")
             self.signals.log.emit(f"详细错误: {traceback.format_exc()[:300]}")
             self.signals.error.emit(error_msg)
-        finally:
-            self.signals.finished.emit()
 
     def _read_excel(self, file_path):
         import pandas as pd
         
-        xls = pd.ExcelFile(file_path)
-        sheet_names = xls.sheet_names
+        with pd.ExcelFile(file_path) as xls:
+            sheet_names = list(xls.sheet_names)
         self.signals.log.emit(f"找到 {len(sheet_names)} 个Sheet")
         
         if self.sheet_name and self.sheet_name in sheet_names:
@@ -156,17 +112,20 @@ class ExcelReadWorker(QThread):
                 from openpyxl import load_workbook
                 
                 wb = load_workbook(file_path, read_only=True, data_only=True)
-                ws = wb[sheet_name]
-                
-                data = []
-                for row in ws.iter_rows(values_only=True):
-                    data.append([str(cell) if cell is not None else "" for cell in row])
-                
-                wb.close()
+                try:
+                    ws = wb[sheet_name]
+                    data = []
+                    for row in ws.iter_rows(values_only=True):
+                        data.append([
+                            str(cell) if cell is not None else ""
+                            for cell in row
+                        ])
+                finally:
+                    wb.close()
                 
                 if len(data) > 0:
                     headers = [h if str(h).strip() != "" else f"列{i+1}" for i, h in enumerate(data[0])]
-                    self.signals.log(f"表头(openpyxl): {headers}")
+                    self.signals.log.emit(f"表头(openpyxl): {headers}")
                     return headers, data
                 else:
                     raise Exception("Sheet为空")
@@ -192,39 +151,76 @@ class SendWorker(QThread):
         self.paused_event = threading.Event()
         self.stopped_event = threading.Event()
 
+    def _normalize_task(self, task):
+        if isinstance(task, dict):
+            if "pending_steps" not in task:
+                task["pending_steps"] = self._create_steps(task.get("custom_msg", ""))
+            return task
+
+        name, person_data, table_data, recipient, custom_msg = task
+        return {
+            "name": name,
+            "person_data": person_data,
+            "table_data": table_data,
+            "recipient": recipient,
+            "custom_msg": custom_msg,
+            "pending_steps": self._create_steps(custom_msg)
+        }
+
+    def _create_steps(self, custom_msg):
+        steps = []
+        if self.send_mode in ("image", "image_text"):
+            steps.append({"type": "image", "index": 0})
+        if self.send_mode in ("text", "image_text"):
+            steps.append({"type": "text", "index": 0})
+        if custom_msg:
+            steps.append({"type": "custom", "index": 0})
+        return steps
+
     def run(self):
         success_count = 0
-        failed_count = 0
         failed_tasks = []
         total_count = len(self.tasks)
         sender = None
+        result_emitted = False
         
         try:
+            self.tasks = [self._normalize_task(task) for task in self.tasks]
             self.signals.log.emit("初始化微信客户端...")
             sender = WeChatSender()
             sender.cleanup_temp_images()
             if not sender.initialize():
                 self.signals.error.emit("微信未登录或未打开")
+                failed_tasks = list(self.tasks)
+                self.signals.result.emit((0, total_count, total_count, failed_tasks))
+                result_emitted = True
                 return
             self.signals.log.emit("微信客户端初始化成功")
             
             for i, task in enumerate(self.tasks):
                 if self.stopped_event.is_set():
                     self.signals.log.emit("⏹ 发送已停止")
+                    failed_tasks.extend(self.tasks[i:])
                     break
                 
                 while self.paused_event.is_set() and not self.stopped_event.is_set():
-                    time.sleep(0.1)
+                    self.stopped_event.wait(0.1)
                 if self.stopped_event.is_set():
                     self.signals.log.emit("⏹ 发送已停止")
+                    failed_tasks.extend(self.tasks[i:])
                     break
                 
-                name, person_data, table_data, recipient, custom_msg = task
+                name = task["name"]
+                person_data = task["person_data"]
+                table_data = task["table_data"]
+                recipient = task["recipient"]
                 
                 try:
                     if i == 0:
                         self.signals.log.emit("等待微信就绪...")
-                        time.sleep(0.2)
+                        if self.stopped_event.wait(0.2):
+                            failed_tasks.extend(self.tasks[i:])
+                            break
                     
                     self.signals.log.emit(f"[{i+1}/{total_count}] 正在发送给 {recipient} ({name})...")
                     self.signals.progress.emit(int((i + 1) / total_count * 100))
@@ -234,79 +230,112 @@ class SendWorker(QThread):
                     for j in range(0, len(person_data), max_message_length):
                         messages.append(person_data[j:j+max_message_length])
                     
-                    if self.send_mode == "image":
-                        success = sender.send_table_images(
-                            table_data,
-                            recipient,
-                            chat_delay=self.chat_delay,
-                            should_stop=self.stopped_event.is_set
-                        )
-                    elif self.send_mode == "image_text":
-                        success = sender.send_table_images(
-                            table_data,
-                            recipient,
-                            chat_delay=self.chat_delay,
-                            should_stop=self.stopped_event.is_set
-                        )
-                        if success and not self.stopped_event.is_set():
-                            time.sleep(0.1)
-                            success = sender.send_multiple_messages(
+                    while task["pending_steps"] and not self.stopped_event.is_set():
+                        step = task["pending_steps"][0]
+                        step_type = step["type"]
+                        start_index = step.get("index", 0)
+
+                        if step_type == "image":
+                            success, next_index = sender.send_table_images_progress(
+                                table_data,
+                                recipient,
+                                chat_delay=self.chat_delay,
+                                start_index=start_index,
+                                stop_event=self.stopped_event
+                            )
+                            step["index"] = next_index
+                        elif step_type == "text":
+                            success, next_index = sender.send_multiple_messages_progress(
                                 messages,
                                 recipient,
-                                chat_delay=self.chat_delay
+                                chat_delay=self.chat_delay,
+                                start_index=start_index,
+                                stop_event=self.stopped_event
                             )
-                    else:
-                        success = sender.send_multiple_messages(
-                            messages,
-                            recipient,
-                            chat_delay=self.chat_delay
-                        )
-                    if success:
+                            step["index"] = next_index
+                        else:
+                            success = sender.send_message(
+                                task["custom_msg"],
+                                recipient,
+                                chat_delay=self.chat_delay,
+                                fast_mode=True,
+                                stop_event=self.stopped_event
+                            )
+                            if success:
+                                self.signals.log.emit(
+                                    f"[{i+1}/{total_count}] 已发送自定义消息"
+                                )
+
+                        if not success:
+                            break
+
+                        task["pending_steps"].pop(0)
+                        if (
+                            task["pending_steps"]
+                            and self.stopped_event.wait(0.1)
+                        ):
+                            break
+
+                    if not task["pending_steps"]:
                         self.signals.log.emit(f"[{i+1}/{total_count}] ✅ 成功发送给 {recipient}")
                         success_count += 1
                     else:
-                        self.signals.log.emit(f"[{i+1}/{total_count}] ❌ 发送失败: {recipient}")
-                        failed_count += 1
-                        failed_tasks.append(task)
-                    
-                    if custom_msg and success and not self.stopped_event.is_set():
-                        time.sleep(0.1)
-                        custom_success = sender.send_message(
-                            custom_msg,
-                            recipient,
-                            chat_delay=self.chat_delay,
-                            fast_mode=True
-                        )
-                        if custom_success:
-                            self.signals.log.emit(f"[{i+1}/{total_count}] 已发送自定义消息")
+                        if self.stopped_event.is_set():
+                            self.signals.log.emit(
+                                f"[{i+1}/{total_count}] ⏹ 已停止，保留未完成任务: {recipient}"
+                            )
                         else:
-                            self.signals.log.emit(f"[{i+1}/{total_count}] ⚠ 自定义消息发送失败")
+                            self.signals.log.emit(f"[{i+1}/{total_count}] ❌ 发送失败: {recipient}")
+                        failed_tasks.append(task)
                     
                 except Exception as e:
                     self.signals.log.emit(f"[{i+1}/{total_count}] ❌ 发送异常: {name} - {str(e)}")
-                    failed_count += 1
                     failed_tasks.append(task)
                 
-                if i < total_count - 1 and not self.stopped_event.is_set():
-                    time.sleep(self.send_interval)
+                if self.stopped_event.is_set():
+                    failed_tasks.extend(self.tasks[i + 1:])
+                    self.signals.log.emit("⏹ 发送已停止，剩余任务已保留")
+                    break
+
+                if (
+                    i < total_count - 1
+                    and self.stopped_event.wait(self.send_interval)
+                ):
+                    failed_tasks.extend(self.tasks[i + 1:])
+                    self.signals.log.emit("⏹ 发送已停止，剩余任务已保留")
+                    break
             
+            failed_count = len(failed_tasks)
             if failed_tasks:
                 self.signals.log.emit(f"\n--- 发送失败列表 ({failed_count}人) ---")
-                for name, _, _, recipient, _ in failed_tasks:
-                    self.signals.log.emit(f"❌ {name} → {recipient}")
+                for failed_task in failed_tasks:
+                    self.signals.log.emit(
+                        f"❌ {failed_task['name']} → {failed_task['recipient']}"
+                    )
             
             self.signals.log.emit(f"\n发送完成！成功: {success_count}, 失败: {failed_count}, 总计: {total_count}")
             self.signals.result.emit((success_count, failed_count, total_count, failed_tasks))
+            result_emitted = True
             
         except Exception as e:
             import traceback
             self.signals.log.emit(f"❌ 发送线程异常: {str(e)}")
             self.signals.log.emit(f"详细错误: {traceback.format_exc()[:300]}")
             self.signals.error.emit(str(e))
+            if not result_emitted:
+                remaining_tasks = [
+                    task for task in self.tasks
+                    if (
+                        not isinstance(task, dict)
+                        or task.get("pending_steps")
+                    )
+                ]
+                self.signals.result.emit(
+                    (success_count, len(remaining_tasks), total_count, remaining_tasks)
+                )
         finally:
             if sender:
                 sender.cleanup_temp_images()
-            self.signals.finished.emit()
 
     def set_paused(self, value):
         if value:
@@ -327,88 +356,6 @@ class SendWorker(QThread):
         return self.stopped_event.is_set()
 
 
-class APIAuthWorker(QThread):
-    """后台线程：处理WPS API授权"""
-    def __init__(self, app_id, app_key, redirect_uri):
-        super().__init__()
-        self.app_id = app_id
-        self.app_key = app_key
-        self.redirect_uri = redirect_uri
-        self.signals = WorkerSignals()
-
-    def run(self):
-        try:
-            from modules.wps_official_api import WPSOfficialAPI
-
-            self.signals.log.emit("🔐 开始WPS开放平台授权流程...")
-            self.signals.log.emit(f"AppID: {self.app_id}")
-            self.signals.log.emit(f"回调地址: {self.redirect_uri}")
-            self.signals.log.emit("即将打开浏览器进行授权，请在浏览器中完成登录和授权...")
-            self.signals.log.emit("如果浏览器没有自动打开，请查看终端输出的授权URL")
-
-            api = WPSOfficialAPI(self.app_id, self.app_key, self.redirect_uri)
-            token_data = api.authorize()
-
-            if token_data and token_data.get("access_token"):
-                self.signals.log.emit("✓ 授权成功！")
-                self.signals.log.emit(f"  access_token: {token_data['access_token'][:20]}...")
-                self.signals.log.emit(f"  有效期: {token_data.get('expires_in', '未知')} 秒")
-                self.signals.result.emit(token_data)
-            else:
-                self.signals.log.emit("✗ 授权失败：未获取到 access_token")
-                self.signals.error.emit("未获取到 access_token")
-
-        except Exception as e:
-            import traceback
-            error_msg = f"授权出错: {str(e)}"
-            self.signals.log.emit(f"✗ {error_msg}")
-            self.signals.log.emit(f"详细错误: {traceback.format_exc()[:500]}")
-            self.signals.error.emit(error_msg)
-        finally:
-            self.signals.finished.emit()
-
-
-class APIExtractWorker(QThread):
-    """后台线程：使用WPS官方API提取表格数据"""
-    def __init__(self, app_id, app_key, redirect_uri, document_url, sheet_name):
-        super().__init__()
-        self.app_id = app_id
-        self.app_key = app_key
-        self.redirect_uri = redirect_uri
-        self.document_url = document_url
-        self.sheet_name = sheet_name
-        self.signals = WorkerSignals()
-
-    def run(self):
-        try:
-            from modules.wps_official_api import WPSOfficialAPI
-
-            self.signals.log.emit("📊 使用WPS官方API提取表格数据...")
-            self.signals.log.emit(f"URL: {self.document_url}")
-            self.signals.log.emit(f"Sheet: {self.sheet_name or '(未指定)'}")
-
-            api = WPSOfficialAPI(self.app_id, self.app_key, self.redirect_uri)
-            result = api.extract_table(self.document_url, self.sheet_name)
-
-            if result and len(result) > 0:
-                table_data = result[0]
-                self.signals.log.emit(f"✓ API提取成功: {len(table_data)} 行, {len(table_data[0])} 列")
-                self.signals.log.emit(f"表头: {table_data[0]}")
-                self.signals.result.emit(result)
-            else:
-                self.signals.log.emit("✗ API提取失败")
-                self.signals.result.emit(None)
-
-        except Exception as e:
-            import traceback
-            error_msg = f"API提取出错: {str(e)}"
-            self.signals.log.emit(f"✗ {error_msg}")
-            self.signals.log.emit(f"详细错误: {traceback.format_exc()[:500]}")
-            self.signals.error.emit(error_msg)
-        finally:
-            self.signals.finished.emit()
-
-
 class TableFilterTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -416,9 +363,20 @@ class TableFilterTab(QWidget):
         self.processor = None
         self.wechat_mapping = {}
         self.filter_conditions = []
+        self.current_excel_path = None
+        self.sheet_names = []
+        self.current_sheet = None
+        self.headers = []
+        self.excel_worker = None
+        self.worker = None
+        self.last_failed_tasks = []
+        self.config_manager = ConfigManager()
+        self.current_config_path = None
+        self.pending_config = None
         
         self.init_ui()
         self.connect_signals()
+        self.refresh_recent_configs()
 
     def init_ui(self):
         main_layout = QVBoxLayout()
@@ -428,6 +386,37 @@ class TableFilterTab(QWidget):
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         
+        config_group = QGroupBox("配置管理")
+        config_layout = QVBoxLayout(config_group)
+
+        self.current_config_label = QLabel("当前配置: 未加载")
+        self.current_config_label.setWordWrap(True)
+        self.current_config_label.setStyleSheet(
+            "color: #666; font-size: 11px;"
+        )
+        config_layout.addWidget(self.current_config_label)
+
+        config_btn_layout = QHBoxLayout()
+        self.save_config_btn = QPushButton("保存配置")
+        self.save_config_btn.setEnabled(False)
+        config_btn_layout.addWidget(self.save_config_btn)
+
+        self.save_as_config_btn = QPushButton("另存为配置")
+        self.save_as_config_btn.setEnabled(False)
+        config_btn_layout.addWidget(self.save_as_config_btn)
+
+        self.load_config_btn = QPushButton("加载配置")
+        config_btn_layout.addWidget(self.load_config_btn)
+        config_layout.addLayout(config_btn_layout)
+
+        config_layout.addWidget(QLabel("最近配置（双击加载）:"))
+        self.recent_config_list = QListWidget()
+        self.recent_config_list.setMinimumHeight(50)
+        self.recent_config_list.setMaximumHeight(72)
+        config_layout.addWidget(self.recent_config_list)
+
+        left_layout.addWidget(config_group)
+
         url_group = QGroupBox("文档设置")
         url_layout = QVBoxLayout(url_group)
         
@@ -663,6 +652,12 @@ class TableFilterTab(QWidget):
         self.setLayout(main_layout)
 
     def connect_signals(self):
+        self.save_config_btn.clicked.connect(self.save_config)
+        self.save_as_config_btn.clicked.connect(self.save_config_as)
+        self.load_config_btn.clicked.connect(self.load_config)
+        self.recent_config_list.itemDoubleClicked.connect(
+            self.load_recent_config
+        )
         self.excel_btn.clicked.connect(self.select_excel_file)
         self.reload_btn.clicked.connect(self.reload_excel_file)
         self.open_excel_btn.clicked.connect(self.open_current_excel)
@@ -681,6 +676,302 @@ class TableFilterTab(QWidget):
         self.clear_filter_btn.clicked.connect(self.clear_filter_conditions)
         self.apply_filter_btn.clicked.connect(self.apply_filter)
         self.custom_msg_checkbox.stateChanged.connect(self.on_custom_msg_checkbox_changed)
+
+    def refresh_recent_configs(self):
+        self.recent_config_list.clear()
+        for config_path in self.config_manager.get_recent_profiles():
+            item = QListWidgetItem(os.path.basename(config_path))
+            item.setToolTip(config_path)
+            item.setData(Qt.ItemDataRole.UserRole, config_path)
+            self.recent_config_list.addItem(item)
+
+    def _set_current_config(self, config_path):
+        self.current_config_path = os.path.abspath(config_path)
+        self.current_config_label.setText(
+            f"当前配置: {os.path.basename(self.current_config_path)}"
+        )
+        self.current_config_label.setToolTip(self.current_config_path)
+
+    def _build_profile_data(self):
+        if self.excel_worker and self.excel_worker.isRunning():
+            QMessageBox.warning(self, "警告", "Excel 正在读取，请稍候再保存配置")
+            return None
+
+        if not self.current_excel_path or not self.headers:
+            QMessageBox.warning(self, "警告", "请先读取 Excel 文件")
+            return None
+
+        name_column = self.name_column_combo.currentText().strip()
+        if not name_column:
+            QMessageBox.warning(self, "警告", "请选择人员所在列")
+            return None
+
+        if not self.selected_columns:
+            QMessageBox.warning(self, "警告", "请至少选择一列提取信息")
+            return None
+
+        wechat_column = ""
+        if self.wechat_column_combo.currentIndex() > 0:
+            wechat_column = self.wechat_column_combo.currentText().strip()
+
+        return {
+            "version": ConfigManager.PROFILE_VERSION,
+            "excel": {
+                "path": os.path.abspath(self.current_excel_path),
+                "sheet": self.sheet_combo.currentText().strip(),
+                "name_column": name_column,
+                "extract_columns": list(self.selected_columns),
+                "wechat_column": wechat_column,
+            },
+            "send": {
+                "manual_recipient": self.wechat_edit.text().strip(),
+                "mode": self.send_mode_combo.currentData(),
+                "interval": self.send_interval_spin.value(),
+                "chat_delay": self.chat_delay_spin.value(),
+                "custom_message_enabled": (
+                    self.custom_msg_checkbox.isChecked()
+                ),
+                "custom_message": self.custom_msg_edit.toPlainText(),
+            },
+        }
+
+    def save_config(self):
+        if not self.current_config_path:
+            self.save_config_as()
+            return
+        self._save_config_to(self.current_config_path)
+
+    def save_config_as(self):
+        profile = self._build_profile_data()
+        if not profile:
+            return
+
+        if self.current_config_path:
+            current_name = os.path.splitext(
+                os.path.basename(self.current_config_path)
+            )[0]
+            default_path = os.path.join(
+                os.path.dirname(self.current_config_path),
+                f"{current_name}_副本.json",
+            )
+        else:
+            excel_name = os.path.splitext(
+                os.path.basename(self.current_excel_path)
+            )[0]
+            default_path = os.path.join(
+                str(self.config_manager.profile_dir),
+                f"{excel_name}.json",
+            )
+
+        config_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "另存为配置",
+            default_path,
+            "表格发送配置 (*.json)",
+        )
+        if config_path:
+            self._save_config_to(config_path, profile)
+
+    def _save_config_to(self, config_path, profile=None):
+        profile = profile or self._build_profile_data()
+        if not profile:
+            return False
+
+        try:
+            saved_path = self.config_manager.save_profile(
+                config_path,
+                profile,
+            )
+        except ConfigError as error:
+            QMessageBox.warning(self, "保存失败", str(error))
+            self.log(f"✗ 配置保存失败: {error}")
+            return False
+
+        self._set_current_config(saved_path)
+        self.refresh_recent_configs()
+        self.log(f"配置已保存: {saved_path}")
+        QMessageBox.information(
+            self,
+            "保存成功",
+            f"配置已保存到:\n{saved_path}",
+        )
+        return True
+
+    def load_config(self):
+        if not self._can_load_config():
+            return
+
+        start_path = (
+            os.path.dirname(self.current_config_path)
+            if self.current_config_path
+            else str(self.config_manager.profile_dir)
+        )
+        config_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "加载配置",
+            start_path,
+            "表格发送配置 (*.json)",
+        )
+        if config_path:
+            self._load_config_file(config_path)
+
+    def load_recent_config(self, item):
+        config_path = item.data(Qt.ItemDataRole.UserRole)
+        if not config_path:
+            return
+        if not os.path.isfile(config_path):
+            self.config_manager.remove_recent(config_path)
+            self.refresh_recent_configs()
+            QMessageBox.warning(self, "配置不存在", "该配置文件已被移动或删除")
+            return
+        self._load_config_file(config_path)
+
+    def _can_load_config(self):
+        if self.excel_worker and self.excel_worker.isRunning():
+            QMessageBox.warning(self, "请稍候", "Excel 正在读取，暂时不能加载配置")
+            return False
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(self, "请稍候", "正在发送消息，暂时不能加载配置")
+            return False
+        return True
+
+    def _load_config_file(self, config_path):
+        if not self._can_load_config():
+            return False
+
+        try:
+            profile = self.config_manager.load_profile(config_path)
+        except ConfigError as error:
+            QMessageBox.warning(self, "加载失败", str(error))
+            self.log(f"✗ 配置加载失败: {error}")
+            return False
+
+        excel_path = profile["excel"]["path"]
+        if not os.path.isfile(excel_path):
+            QMessageBox.warning(
+                self,
+                "Excel 文件不存在",
+                "配置中的 Excel 文件已被移动或删除，请重新选择该文件。",
+            )
+            excel_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "重新定位 Excel 文件",
+                os.path.dirname(excel_path),
+                "Excel文件 (*.xlsx *.xls)",
+            )
+            if not excel_path:
+                return False
+            profile["excel"]["path"] = os.path.abspath(excel_path)
+
+        self._set_current_config(config_path)
+        self.config_manager.add_recent(self.current_config_path)
+        self.refresh_recent_configs()
+
+        self.pending_config = {
+            "profile": profile,
+            "excel_path": os.path.abspath(excel_path),
+        }
+        sheet_name = profile["excel"].get("sheet") or None
+        if not self._load_excel_data(excel_path, sheet_name):
+            self.pending_config = None
+            return False
+
+        self.log(
+            f"正在加载配置: {os.path.basename(self.current_config_path)}"
+        )
+        return True
+
+    def _apply_pending_config(self, worker):
+        if not self.pending_config:
+            return False
+
+        expected_path = os.path.normcase(
+            os.path.abspath(self.pending_config["excel_path"])
+        )
+        actual_path = os.path.normcase(os.path.abspath(worker.file_path))
+        if expected_path != actual_path:
+            return False
+
+        profile = self.pending_config["profile"]
+        self.pending_config = None
+        excel_settings = profile["excel"]
+        send_settings = profile["send"]
+        missing_settings = []
+
+        saved_sheet = excel_settings.get("sheet", "")
+        if saved_sheet and saved_sheet != self.current_sheet:
+            missing_settings.append(
+                f"Sheet“{saved_sheet}”不存在，已使用“{self.current_sheet}”"
+            )
+
+        name_column = excel_settings["name_column"]
+        if name_column in self.headers:
+            self.name_column_combo.setCurrentText(name_column)
+        else:
+            missing_settings.append(f"人员列“{name_column}”不存在")
+
+        selected_columns = [
+            column
+            for column in excel_settings["extract_columns"]
+            if column in self.headers
+        ]
+        missing_columns = [
+            column
+            for column in excel_settings["extract_columns"]
+            if column not in self.headers
+        ]
+        self.selected_columns = selected_columns
+        self._update_selected_columns_label()
+        if missing_columns:
+            missing_settings.append(
+                f"提取列不存在: {', '.join(missing_columns)}"
+            )
+
+        wechat_column = excel_settings.get("wechat_column", "")
+        if not wechat_column:
+            self.wechat_column_combo.setCurrentIndex(0)
+        elif wechat_column in self.headers:
+            self.wechat_column_combo.setCurrentText(wechat_column)
+        else:
+            self.wechat_column_combo.setCurrentIndex(0)
+            missing_settings.append(f"微信列“{wechat_column}”不存在")
+
+        self.wechat_edit.setText(
+            send_settings.get("manual_recipient", "")
+        )
+        send_mode_index = self.send_mode_combo.findData(
+            send_settings.get("mode", "text")
+        )
+        if send_mode_index >= 0:
+            self.send_mode_combo.setCurrentIndex(send_mode_index)
+        self.send_interval_spin.setValue(send_settings.get("interval", 0.5))
+        self.chat_delay_spin.setValue(
+            send_settings.get("chat_delay", 0.3)
+        )
+        self.custom_msg_checkbox.setChecked(
+            send_settings.get("custom_message_enabled", False)
+        )
+        self.custom_msg_edit.setPlainText(
+            send_settings.get("custom_message", "")
+        )
+
+        can_load_data = (
+            name_column in self.headers
+            and bool(self.selected_columns)
+        )
+        if can_load_data:
+            self.load_data()
+            self.log("配置已应用，并已自动加载人员数据")
+        else:
+            self.log("⚠ 配置已部分应用，请重新选择缺失的列")
+
+        if missing_settings:
+            QMessageBox.warning(
+                self,
+                "配置部分失效",
+                "\n".join(missing_settings),
+            )
+        return True
 
     def get_available_operators(self):
         return [
@@ -768,13 +1059,19 @@ class TableFilterTab(QWidget):
         dialog = MultiSelectDialog("选择要提取的列", self.headers, self.selected_columns, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.selected_columns = dialog.selected_columns
-            if self.selected_columns:
-                if len(self.selected_columns) <= 3:
-                    self.selected_columns_label.setText(f"已选择: {', '.join(self.selected_columns)}")
-                else:
-                    self.selected_columns_label.setText(f"已选择: {len(self.selected_columns)}列")
-            else:
-                self.selected_columns_label.setText("已选择: 0列")
+            self._update_selected_columns_label()
+
+    def _update_selected_columns_label(self):
+        if not self.selected_columns:
+            self.selected_columns_label.setText("已选择: 0列")
+        elif len(self.selected_columns) <= 3:
+            self.selected_columns_label.setText(
+                f"已选择: {', '.join(self.selected_columns)}"
+            )
+        else:
+            self.selected_columns_label.setText(
+                f"已选择: {len(self.selected_columns)}列"
+            )
 
     def build_filter_conditions(self):
         conditions = []
@@ -872,6 +1169,10 @@ class TableFilterTab(QWidget):
         self.preview_text.setPlainText("\n".join(preview_content))
 
     def select_excel_file(self):
+        if self.excel_worker and self.excel_worker.isRunning():
+            self.log("Excel文件正在读取，请稍候...")
+            return
+
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "选择Excel文件",
@@ -880,16 +1181,20 @@ class TableFilterTab(QWidget):
         )
         
         if file_path:
-            self.current_excel_path = file_path
-            self.current_file_label.setText(f"当前文件: {os.path.basename(file_path)}")
-            self.open_excel_btn.setEnabled(True)
-            self.reload_btn.setEnabled(True)
-            
+            self.pending_config = None
             self._load_excel_data(file_path)
     
     def reload_excel_file(self):
-        if hasattr(self, 'current_excel_path') and self.current_excel_path:
-            self._load_excel_data(self.current_excel_path)
+        if not getattr(self, 'current_excel_path', None):
+            QMessageBox.warning(self, "警告", "请先选择Excel文件")
+            return
+
+        if self.excel_worker and self.excel_worker.isRunning():
+            self.log("Excel文件正在读取，请稍候...")
+            return
+
+        self.log("重新读取Excel文件...")
+        self._load_excel_data(self.current_excel_path)
     
     def open_current_excel(self):
         if hasattr(self, 'current_excel_path') and self.current_excel_path:
@@ -900,72 +1205,110 @@ class TableFilterTab(QWidget):
                 self.log(f"✗ 打开文件失败: {e}")
                 QMessageBox.warning(self, "打开失败", f"无法打开文件: {e}")
     
-    def _load_excel_data(self, file_path):
+    def _set_excel_loading(self, loading):
+        self.excel_btn.setEnabled(not loading)
+        has_file = bool(self.current_excel_path)
+        has_data = bool(self.headers and self.table_data)
+        self.reload_btn.setEnabled(
+            not loading and has_file
+        )
+        self.open_excel_btn.setEnabled(not loading and has_file)
+        self.sheet_combo.setEnabled(
+            not loading and self.sheet_combo.count() > 0
+        )
+        self.name_column_combo.setEnabled(not loading and has_data)
+        self.extract_columns_btn.setEnabled(not loading and has_data)
+        self.wechat_column_combo.setEnabled(not loading and has_data)
+        self.load_data_btn.setEnabled(not loading and has_data)
+        self.save_config_btn.setEnabled(not loading and has_data)
+        self.save_as_config_btn.setEnabled(not loading and has_data)
+        self.load_config_btn.setEnabled(not loading)
+        self.recent_config_list.setEnabled(not loading)
+
+    def _load_excel_data(self, file_path, sheet_name=None):
+        if self.excel_worker and self.excel_worker.isRunning():
+            self.log("Excel文件正在读取，已忽略重复请求")
+            return False
+
         self.log(f"选择Excel文件: {file_path}")
-        
-        self.sheet_combo.setEnabled(False)
-        self.name_column_combo.setEnabled(False)
-        self.extract_columns_btn.setEnabled(False)
-        self.wechat_column_combo.setEnabled(False)
-        self.load_data_btn.setEnabled(False)
-        
-        self.excel_worker = ExcelReadWorker(file_path)
-        self.excel_worker.signals.result.connect(self.on_excel_read_result)
-        self.excel_worker.signals.error.connect(self.on_excel_read_error)
-        self.excel_worker.signals.finished.connect(self.on_excel_read_finished)
-        self.excel_worker.signals.log.connect(self.log)
-        self.excel_worker.start()
-    
-    def on_excel_read_result(self, result):
+        self._set_excel_loading(True)
+
+        worker = ExcelReadWorker(file_path, sheet_name)
+        self.excel_worker = worker
+        worker.signals.result.connect(
+            lambda result, current=worker: self.on_excel_read_result(current, result)
+        )
+        worker.signals.error.connect(
+            lambda error, current=worker: self.on_excel_read_error(current, error)
+        )
+        worker.signals.log.connect(self.log)
+        worker.finished.connect(
+            lambda current=worker: self.on_excel_read_finished(current)
+        )
+        worker.start()
+        return True
+
+    def on_excel_read_result(self, worker, result):
+        if worker is not self.excel_worker:
+            return
+
         self.sheet_names = result['sheet_names']
         self.current_sheet = result['current_sheet']
         self.headers = result['headers']
         self.table_data = result['data']
-        
-        self.sheet_combo.clear()
-        self.sheet_combo.addItems(self.sheet_names)
+        self.current_excel_path = worker.file_path
+
+        self.current_file_label.setText(
+            f"当前文件: {os.path.basename(self.current_excel_path)}"
+        )
+        self.processor = None
+        self.wechat_mapping = {}
+        self.persons_list.clear()
+        self.preview_text.clear()
+        self.send_btn.setEnabled(False)
+        self.start_send_btn.setEnabled(False)
+        self.last_failed_tasks = []
+        self.retry_send_btn.setEnabled(False)
+        self.clear_filter_conditions()
         
         self.sheet_combo.blockSignals(True)
-        self.sheet_combo.setCurrentText(self.current_sheet)
-        self.sheet_combo.blockSignals(False)
+        try:
+            self.sheet_combo.clear()
+            self.sheet_combo.addItems(self.sheet_names)
+            self.sheet_combo.setCurrentText(self.current_sheet)
+        finally:
+            self.sheet_combo.blockSignals(False)
         
-        self.sheet_combo.setEnabled(True)
         self._update_column_combos()
-        self.log("Excel文件读取完成！请选择Sheet和列，然后点击'加载数据'")
+        if not self._apply_pending_config(worker):
+            self.log("Excel文件读取完成！请选择Sheet和列，然后点击'加载数据'")
     
-    def on_excel_read_error(self, error):
+    def on_excel_read_error(self, worker, error):
+        if worker is not self.excel_worker:
+            return
+
+        if self.current_sheet:
+            self.sheet_combo.blockSignals(True)
+            self.sheet_combo.setCurrentText(self.current_sheet)
+            self.sheet_combo.blockSignals(False)
         QMessageBox.warning(self, "读取失败", error)
-        self.excel_btn.setEnabled(True)
     
-    def on_excel_read_finished(self):
-        if hasattr(self, 'excel_worker'):
-            if self.excel_worker.isRunning():
-                self.excel_worker.stop()
-                self.excel_worker.wait()
-            self.excel_worker.deleteLater()
-            del self.excel_worker
+    def on_excel_read_finished(self, worker):
+        if worker is self.excel_worker:
+            self.excel_worker = None
+            self._set_excel_loading(False)
+        worker.deleteLater()
     
     def on_sheet_changed(self, index):
         if index >= 0 and hasattr(self, 'current_excel_path') and self.current_excel_path:
             sheet_name = self.sheet_combo.itemText(index)
             self.log(f"--- 切换到Sheet: {sheet_name} ---")
             
-            self.sheet_combo.setEnabled(False)
-            self.name_column_combo.setEnabled(False)
-            self.extract_columns_btn.setEnabled(False)
-            self.wechat_column_combo.setEnabled(False)
-            self.load_data_btn.setEnabled(False)
-            
-            if hasattr(self, 'excel_worker') and self.excel_worker and self.excel_worker.isRunning():
-                self.excel_worker.stop()
-                self.excel_worker.wait()
-            
-            self.excel_worker = ExcelReadWorker(self.current_excel_path, sheet_name)
-            self.excel_worker.signals.result.connect(self.on_excel_read_result)
-            self.excel_worker.signals.error.connect(self.on_excel_read_error)
-            self.excel_worker.signals.finished.connect(self.on_excel_read_finished)
-            self.excel_worker.signals.log.connect(self.log)
-            self.excel_worker.start()
+            if self.excel_worker and self.excel_worker.isRunning():
+                self.log("Excel文件正在读取，请稍候再切换Sheet")
+                return
+
+            self._load_excel_data(self.current_excel_path, sheet_name)
     
     def _update_column_combos(self):
         self.name_column_combo.clear()
@@ -975,12 +1318,7 @@ class TableFilterTab(QWidget):
         self.wechat_column_combo.addItems([""] + self.headers)
         
         self.selected_columns = []
-        self.selected_columns_label.setText("已选择: 0列")
-        
-        self.name_column_combo.setEnabled(True)
-        self.extract_columns_btn.setEnabled(True)
-        self.wechat_column_combo.setEnabled(True)
-        self.load_data_btn.setEnabled(True)
+        self._update_selected_columns_label()
     
     def load_data(self):
         name_column = self.name_column_combo.currentText()
@@ -1062,7 +1400,13 @@ class TableFilterTab(QWidget):
             if not recipient:
                 recipient = name
             
-            tasks.append((name, person_data, table_data, recipient, custom_msg))
+            tasks.append({
+                "name": name,
+                "person_data": person_data,
+                "table_data": table_data,
+                "recipient": recipient,
+                "custom_msg": custom_msg
+            })
         
         if missing_wechat:
             QMessageBox.warning(self, "警告", f"以下人员缺少微信接收人，已跳过:\n{', '.join(missing_wechat)}")
@@ -1073,11 +1417,11 @@ class TableFilterTab(QWidget):
         
         max_display = 20
         confirm_text = f"即将向以下 {len(tasks)} 人发送消息:\n\n"
-        for i, (name, _, _, recipient, _) in enumerate(tasks):
+        for i, task in enumerate(tasks):
             if i >= max_display:
                 confirm_text += f"  • ... 还有 {len(tasks) - max_display} 人\n"
                 break
-            confirm_text += f"  • {name} → {recipient}\n"
+            confirm_text += f"  • {task['name']} → {task['recipient']}\n"
         confirm_text += f"\n发送间隔: {self.send_interval_spin.value()}秒"
         confirm_text += f"\n数据发送形式: {self.send_mode_combo.currentText()}"
         if custom_msg:
@@ -1101,21 +1445,24 @@ class TableFilterTab(QWidget):
         self.progress_label.setText("正在发送...")
         self.last_send_mode = send_mode
         
-        self.worker = SendWorker(
+        worker = SendWorker(
             tasks=tasks,
             send_interval=self.send_interval_spin.value(),
             chat_delay=self.chat_delay_spin.value(),
             send_mode=send_mode
         )
-        self.worker.signals.result.connect(self.on_send_result)
-        self.worker.signals.error.connect(self.on_send_error)
-        self.worker.signals.finished.connect(self.on_send_finished)
-        self.worker.signals.log.connect(self.log)
-        self.worker.signals.progress.connect(self.on_send_progress)
-        self.worker.start()
+        self.worker = worker
+        worker.signals.result.connect(self.on_send_result)
+        worker.signals.error.connect(self.on_send_error)
+        worker.signals.log.connect(self.log)
+        worker.signals.progress.connect(self.on_send_progress)
+        worker.finished.connect(
+            lambda current=worker: self.on_send_finished(current)
+        )
+        worker.start()
 
     def pause_send(self):
-        if hasattr(self, 'worker') and self.worker.isRunning():
+        if self.worker and self.worker.isRunning():
             if self.worker.is_paused():
                 self.worker.set_paused(False)
                 self.pause_send_btn.setText("⏸ 暂停")
@@ -1126,12 +1473,16 @@ class TableFilterTab(QWidget):
                 self.log("⏸ 发送已暂停")
     
     def stop_send(self):
-        if hasattr(self, 'worker') and self.worker.isRunning():
+        if self.worker and self.worker.isRunning():
             self.worker.set_stopped(True)
             self.worker.set_paused(False)
             self.log("⏹ 正在停止发送，当前操作结束后将清理临时图片...")
 
     def retry_send(self):
+        if self.worker and self.worker.isRunning():
+            self.log("发送线程仍在结束，请稍候再重试")
+            return
+
         if not hasattr(self, 'last_failed_tasks') or not self.last_failed_tasks:
             QMessageBox.warning(self, "警告", "没有可重试的任务")
             return
@@ -1147,30 +1498,31 @@ class TableFilterTab(QWidget):
         self.progress_bar.setValue(0)
         self.progress_label.setText("正在重试发送...")
         
-        self.worker = SendWorker(
+        worker = SendWorker(
             tasks=failed_tasks,
             send_interval=self.send_interval_spin.value(),
             chat_delay=self.chat_delay_spin.value(),
             send_mode=getattr(self, 'last_send_mode', 'text')
         )
-        self.worker.signals.result.connect(self.on_send_result)
-        self.worker.signals.error.connect(self.on_send_error)
-        self.worker.signals.finished.connect(self.on_send_finished)
-        self.worker.signals.log.connect(self.log)
-        self.worker.signals.progress.connect(self.on_send_progress)
-        self.worker.start()
+        self.worker = worker
+        worker.signals.result.connect(self.on_send_result)
+        worker.signals.error.connect(self.on_send_error)
+        worker.signals.log.connect(self.log)
+        worker.signals.progress.connect(self.on_send_progress)
+        worker.finished.connect(
+            lambda current=worker: self.on_send_finished(current)
+        )
+        worker.start()
 
-    def on_send_finished(self):
-        self.send_btn.setEnabled(True)
-        self.start_send_btn.setEnabled(True)
-        self.pause_send_btn.setEnabled(False)
-        self.stop_send_btn.setEnabled(False)
-        self.pause_send_btn.setText("⏸ 暂停")
-        
-        if hasattr(self, 'worker'):
-            self.worker.wait()
-            self.worker.deleteLater()
-            del self.worker
+    def on_send_finished(self, worker):
+        if worker is self.worker:
+            self.worker = None
+            self.send_btn.setEnabled(True)
+            self.start_send_btn.setEnabled(True)
+            self.pause_send_btn.setEnabled(False)
+            self.stop_send_btn.setEnabled(False)
+            self.pause_send_btn.setText("⏸ 暂停")
+        worker.deleteLater()
 
     def on_send_progress(self, value):
         self.progress_bar.setValue(value)
@@ -1252,292 +1604,96 @@ class MultiSelectDialog(QDialog):
         super().accept()
 
 
-class SimpleModeTab(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.extracted_content = None
-        
-        self.init_ui()
-        self.connect_signals()
-
-    def init_ui(self):
-        main_layout = QVBoxLayout()
-        
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        
-        left_panel = QWidget()
-        left_layout = QVBoxLayout(left_panel)
-        
-        url_group = QGroupBox("文档设置")
-        url_layout = QVBoxLayout(url_group)
-        
-        url_layout.addWidget(QLabel("WPS在线文档URL:"))
-        self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("https://www.wps.cn/xxx")
-        url_layout.addWidget(self.url_edit)
-        
-        url_layout.addWidget(QLabel("提取类型:"))
-        self.extract_type_combo = QComboBox()
-        self.extract_type_combo.addItems(["全部文本", "关键词", "表格", "CSS选择器"])
-        url_layout.addWidget(self.extract_type_combo)
-        
-        self.keyword_group = QGroupBox("关键词设置")
-        keyword_layout = QVBoxLayout(self.keyword_group)
-        
-        keyword_layout.addWidget(QLabel("关键词:"))
-        self.keyword_edit = QLineEdit()
-        keyword_layout.addWidget(self.keyword_edit)
-        
-        layout_row = QHBoxLayout()
-        layout_row.addWidget(QLabel("前后字符数:"))
-        self.before_chars = QSpinBox()
-        self.before_chars.setMaximum(500)
-        self.before_chars.setValue(0)
-        layout_row.addWidget(self.before_chars)
-        layout_row.addWidget(QLabel("后:"))
-        self.after_chars = QSpinBox()
-        self.after_chars.setMaximum(2000)
-        self.after_chars.setValue(100)
-        layout_row.addWidget(self.after_chars)
-        keyword_layout.addLayout(layout_row)
-        
-        url_layout.addWidget(self.keyword_group)
-        
-        self.selector_group = QGroupBox("CSS选择器")
-        selector_layout = QVBoxLayout(self.selector_group)
-        selector_layout.addWidget(QLabel("选择器:"))
-        self.selector_edit = QLineEdit()
-        selector_layout.addWidget(self.selector_edit)
-        url_layout.addWidget(self.selector_group)
-        
-        self.extract_btn = QPushButton("提取内容")
-        self.extract_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px;")
-        url_layout.addWidget(self.extract_btn)
-        
-        left_layout.addWidget(url_group)
-        
-        send_group = QGroupBox("发送设置")
-        send_layout = QVBoxLayout(send_group)
-        
-        send_layout.addWidget(QLabel("微信接收人:"))
-        self.recipient_edit = QLineEdit()
-        send_layout.addWidget(self.recipient_edit)
-        
-        self.send_btn = QPushButton("发送到微信")
-        self.send_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 8px;")
-        self.send_btn.setEnabled(False)
-        send_layout.addWidget(self.send_btn)
-        
-        left_layout.addWidget(send_group)
-        
-        left_layout.addStretch()
-        splitter.addWidget(left_panel)
-        
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        
-        preview_group = QGroupBox("提取内容预览")
-        preview_layout = QVBoxLayout(preview_group)
-        
-        self.preview_text = QTextEdit()
-        self.preview_text.setReadOnly(True)
-        preview_layout.addWidget(self.preview_text)
-        
-        right_layout.addWidget(preview_group)
-        
-        log_group = QGroupBox("日志")
-        log_layout = QVBoxLayout(log_group)
-        
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Consolas", 9))
-        log_layout.addWidget(self.log_text)
-        
-        right_layout.addWidget(log_group)
-        
-        right_layout.addStretch()
-        splitter.addWidget(right_panel)
-        
-        splitter.setSizes([350, 650])
-        
-        main_layout.addWidget(splitter)
-        self.setLayout(main_layout)
-        
-        self.update_group_visibility()
-
-    def connect_signals(self):
-        self.extract_btn.clicked.connect(self.extract_content)
-        self.send_btn.clicked.connect(self.send_content)
-        self.extract_type_combo.currentIndexChanged.connect(self.update_group_visibility)
-
-    def update_group_visibility(self):
-        extract_type = self.extract_type_combo.currentText()
-        self.keyword_group.setVisible(extract_type == "关键词")
-        self.selector_group.setVisible(extract_type == "CSS选择器")
-
-    def log(self, message):
-        self.log_text.append(message)
-        self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
-        
-        max_lines = 500
-        if self.log_text.document().blockCount() > max_lines:
-            cursor = self.log_text.textCursor()
-            cursor.movePosition(cursor.MoveOperation.Start)
-            cursor.movePosition(cursor.MoveOperation.NextBlock)
-            cursor.select(cursor.SelectionType.BlockUnderCursor)
-            cursor.removeSelectedText()
-            cursor.deleteChar()
-
-    def extract_content(self):
-        url = self.url_edit.text().strip()
-        if not url:
-            QMessageBox.warning(self, "警告", "请输入文档URL")
-            return
-        
-        extract_type = self.extract_type_combo.currentText()
-        
-        type_map = {
-            "全部文本": "all",
-            "关键词": "keyword",
-            "表格": "table",
-            "CSS选择器": "selector"
-        }
-        
-        extraction_type = type_map.get(extract_type, "all")
-        kwargs = {}
-        
-        if extraction_type == "keyword":
-            keyword = self.keyword_edit.text().strip()
-            if not keyword:
-                QMessageBox.warning(self, "警告", "请输入关键词")
-                return
-            kwargs["keyword"] = keyword
-            kwargs["before_chars"] = self.before_chars.value()
-            kwargs["after_chars"] = self.after_chars.value()
-        
-        if extraction_type == "selector":
-            selector = self.selector_edit.text().strip()
-            if not selector:
-                QMessageBox.warning(self, "警告", "请输入CSS选择器")
-                return
-            kwargs["selector"] = selector
-        
-        self.log(f"正在提取{extract_type}...")
-        self.extract_btn.setEnabled(False)
-        
-        self.worker = ExtractionWorker(
-            document_url=url,
-            extraction_type=extraction_type,
-            **kwargs
-        )
-        self.worker.signals.result.connect(self.on_extract_result)
-        self.worker.signals.error.connect(self.on_extract_error)
-        self.worker.signals.finished.connect(lambda: self.extract_btn.setEnabled(True))
-        self.worker.signals.log.connect(self.log)
-        self.worker.start()
-
-    def on_extract_result(self, result):
-        self.extracted_content = result
-        
-        if not result:
-            QMessageBox.warning(self, "警告", "未提取到内容")
-            return
-        
-        if isinstance(result, list):
-            if isinstance(result[0], list):
-                formatted = "\n".join([" | ".join(row) for table in result for row in table])
-            else:
-                formatted = "\n\n".join(result)
-        else:
-            formatted = str(result)
-        
-        self.preview_text.setPlainText(formatted)
-        self.send_btn.setEnabled(True)
-        self.log(f"提取完成，内容长度: {len(formatted)}")
-
-    def on_extract_error(self, error):
-        QMessageBox.critical(self, "错误", f"提取失败: {error}")
-        self.log(f"提取失败: {error}")
-
-    def send_content(self):
-        if not self.extracted_content:
-            QMessageBox.warning(self, "警告", "请先提取内容")
-            return
-        
-        recipient = self.recipient_edit.text().strip()
-        if not recipient:
-            QMessageBox.warning(self, "警告", "请输入微信接收人")
-            return
-        
-        content = self.preview_text.toPlainText()
-        
-        self.log(f"正在发送消息给 {recipient}...")
-        self.send_btn.setEnabled(False)
-        
-        self.worker = SendWorker([("", content, recipient)], send_interval=0)
-        self.worker.signals.error.connect(self.on_send_error)
-        self.worker.signals.finished.connect(lambda: self.send_btn.setEnabled(True))
-        self.worker.signals.log.connect(self.log)
-        self.worker.start()
-
-    def on_send_error(self, error):
-        QMessageBox.critical(self, "错误", f"发送失败: {error}")
-        self.log(f"发送失败: {error}")
-
-
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("表格自动发送By春风予Lu")
         self.setGeometry(50, 50, 850, 580)
+        self._closing_requested = False
+        self._close_ready = False
+        self._shutdown_poll_count = 0
         
         self.init_ui()
 
     def init_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        
-        layout = QVBoxLayout(central_widget)
-        
-        tab_widget = QTabWidget()
-        
         self.table_filter_tab = TableFilterTab()
-        tab_widget.addTab(self.table_filter_tab, "表格筛选模式")
-        
-        self.simple_tab = SimpleModeTab()
-        tab_widget.addTab(self.simple_tab, "简单提取模式")
-        
-        layout.addWidget(tab_widget)
+        self.setCentralWidget(self.table_filter_tab)
 
     def log(self, message):
-        current_tab_index = self.findChild(QTabWidget).currentIndex()
-        if current_tab_index == 0:
-            self.table_filter_tab.log(message)
-        else:
-            self.simple_tab.log(message)
+        self.table_filter_tab.log(message)
 
     def closeEvent(self, event):
+        if self._close_ready:
+            event.accept()
+            return
+
+        if self._closing_requested:
+            event.ignore()
+            return
+
         reply = QMessageBox.question(
             self, "确认退出", "确定要退出程序吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
-            if hasattr(self, 'table_filter_tab'):
-                if hasattr(self.table_filter_tab, 'worker') and self.table_filter_tab.worker.isRunning():
-                    self.table_filter_tab.worker.set_stopped(True)
-                    self.table_filter_tab.worker.set_paused(False)
-                    self.table_filter_tab.worker.wait()
-                
-                if hasattr(self.table_filter_tab, 'excel_worker') and self.table_filter_tab.excel_worker.isRunning():
-                    self.table_filter_tab.excel_worker.stop()
-                    self.table_filter_tab.excel_worker.wait()
-            
-            event.accept()
+            self._closing_requested = True
+            self._shutdown_poll_count = 0
+            self.setEnabled(False)
+            self.setWindowTitle("正在安全退出，请稍候...")
+            self._request_worker_stop()
+            event.ignore()
+            QTimer.singleShot(100, self._poll_worker_shutdown)
         else:
             event.ignore()
+
+    def _request_worker_stop(self):
+        worker = self.table_filter_tab.worker
+        if worker and worker.isRunning():
+            worker.set_stopped(True)
+            worker.set_paused(False)
+
+        excel_worker = self.table_filter_tab.excel_worker
+        if excel_worker and excel_worker.isRunning():
+            excel_worker.stop()
+
+    def _has_running_workers(self):
+        worker = self.table_filter_tab.worker
+        excel_worker = self.table_filter_tab.excel_worker
+        return bool(
+            (worker and worker.isRunning())
+            or (excel_worker and excel_worker.isRunning())
+        )
+
+    def _poll_worker_shutdown(self):
+        if not self._closing_requested:
+            return
+
+        if not self._has_running_workers():
+            self._close_ready = True
+            self.close()
+            return
+
+        self._shutdown_poll_count += 1
+        if self._shutdown_poll_count >= 150:
+            self.setEnabled(True)
+            reply = QMessageBox.question(
+                self,
+                "后台操作仍在结束",
+                "后台操作尚未结束，是否继续等待安全退出？\n"
+                "选择“否”将返回程序，不会强制终止线程。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.No:
+                self._closing_requested = False
+                self.setWindowTitle("表格自动发送By春风予Lu")
+                return
+
+            self._shutdown_poll_count = 0
+            self.setEnabled(False)
+
+        QTimer.singleShot(100, self._poll_worker_shutdown)
 
 
 def run_gui():

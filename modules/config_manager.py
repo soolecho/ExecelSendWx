@@ -1,0 +1,219 @@
+import json
+import os
+from pathlib import Path
+import tempfile
+from datetime import datetime
+
+
+class ConfigError(ValueError):
+    pass
+
+
+class ConfigManager:
+    PROFILE_VERSION = 1
+    MAX_RECENT = 10
+    VALID_SEND_MODES = {"text", "image", "image_text"}
+
+    def __init__(self, base_dir=None):
+        self.base_dir = self._create_base_dir(base_dir)
+        self.profile_dir = self.base_dir / "profiles"
+        self.profile_dir.mkdir(parents=True, exist_ok=True)
+        self.recent_file = self.base_dir / "recent_profiles.json"
+
+    @staticmethod
+    def _create_base_dir(base_dir):
+        if base_dir:
+            candidates = [Path(base_dir)]
+        else:
+            candidates = []
+            local_app_data = os.environ.get("LOCALAPPDATA")
+            if local_app_data:
+                candidates.append(Path(local_app_data) / "ExcelSendWx")
+            candidates.append(Path(tempfile.gettempdir()) / "ExcelSendWx")
+
+        for candidate in candidates:
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+                return candidate
+            except OSError:
+                continue
+        raise ConfigError("无法创建配置目录")
+
+    @staticmethod
+    def _absolute_path(path):
+        return str(Path(path).expanduser().resolve(strict=False))
+
+    @staticmethod
+    def _write_json(path, data):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                json.dump(data, file, ensure_ascii=False, indent=2)
+                file.write("\n")
+            os.replace(temp_path, path)
+        except Exception:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            raise
+
+    @classmethod
+    def normalize_profile(cls, data):
+        if not isinstance(data, dict):
+            raise ConfigError("配置内容必须是 JSON 对象")
+
+        version = data.get("version", cls.PROFILE_VERSION)
+        if version != cls.PROFILE_VERSION:
+            raise ConfigError(f"不支持的配置版本: {version}")
+
+        excel = data.get("excel")
+        send = data.get("send")
+        if not isinstance(excel, dict) or not isinstance(send, dict):
+            raise ConfigError("配置缺少 excel 或 send 设置")
+
+        excel_path = str(excel.get("path", "")).strip()
+        name_column = str(excel.get("name_column", "")).strip()
+        extract_columns = excel.get("extract_columns", [])
+        if not excel_path:
+            raise ConfigError("配置中没有 Excel 文件路径")
+        if not name_column:
+            raise ConfigError("配置中没有人员列")
+        if not isinstance(extract_columns, list):
+            raise ConfigError("提取列格式不正确")
+
+        extract_columns = [
+            str(column).strip()
+            for column in extract_columns
+            if str(column).strip()
+        ]
+        if not extract_columns:
+            raise ConfigError("配置中没有提取列")
+
+        send_mode = str(send.get("mode", "text")).strip()
+        if send_mode not in cls.VALID_SEND_MODES:
+            raise ConfigError(f"不支持的发送形式: {send_mode}")
+
+        try:
+            send_interval = float(send.get("interval", 0.5))
+            chat_delay = float(send.get("chat_delay", 0.3))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("延迟设置必须是数字") from exc
+
+        return {
+            "version": cls.PROFILE_VERSION,
+            "saved_at": str(data.get("saved_at", "")),
+            "excel": {
+                "path": excel_path,
+                "sheet": str(excel.get("sheet", "")).strip(),
+                "name_column": name_column,
+                "extract_columns": extract_columns,
+                "wechat_column": str(
+                    excel.get("wechat_column", "")
+                ).strip(),
+            },
+            "send": {
+                "manual_recipient": str(
+                    send.get("manual_recipient", "")
+                ).strip(),
+                "mode": send_mode,
+                "interval": max(0.0, min(30.0, send_interval)),
+                "chat_delay": max(0.0, min(10.0, chat_delay)),
+                "custom_message_enabled": bool(
+                    send.get("custom_message_enabled", False)
+                ),
+                "custom_message": str(send.get("custom_message", "")),
+            },
+        }
+
+    def save_profile(self, path, data):
+        profile = self.normalize_profile(data)
+        profile["saved_at"] = datetime.now().isoformat(timespec="seconds")
+        profile_path = Path(path)
+        if profile_path.suffix.lower() != ".json":
+            profile_path = profile_path.with_suffix(".json")
+
+        try:
+            self._write_json(profile_path, profile)
+        except OSError as exc:
+            raise ConfigError(f"配置保存失败: {exc}") from exc
+
+        profile_path = self._absolute_path(profile_path)
+        self.add_recent(profile_path)
+        return profile_path
+
+    def load_profile(self, path):
+        profile_path = Path(path)
+        try:
+            with profile_path.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ConfigError(f"配置读取失败: {exc}") from exc
+
+        profile = self.normalize_profile(data)
+        excel_path = Path(
+            os.path.expandvars(profile["excel"]["path"])
+        ).expanduser()
+        if not excel_path.is_absolute():
+            excel_path = profile_path.parent / excel_path
+        profile["excel"]["path"] = self._absolute_path(excel_path)
+        return profile
+
+    def get_recent_profiles(self):
+        try:
+            with self.recent_file.open("r", encoding="utf-8") as file:
+                data = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            return []
+
+        paths = data.get("paths", []) if isinstance(data, dict) else []
+        if not isinstance(paths, list):
+            return []
+
+        recent = []
+        seen = set()
+        for path in paths:
+            absolute_path = self._absolute_path(str(path))
+            key = os.path.normcase(absolute_path)
+            if key in seen or not os.path.isfile(absolute_path):
+                continue
+            seen.add(key)
+            recent.append(absolute_path)
+            if len(recent) >= self.MAX_RECENT:
+                break
+        return recent
+
+    def add_recent(self, path):
+        absolute_path = self._absolute_path(path)
+        key = os.path.normcase(absolute_path)
+        recent = [
+            item
+            for item in self.get_recent_profiles()
+            if os.path.normcase(item) != key
+        ]
+        recent.insert(0, absolute_path)
+        try:
+            self._write_json(
+                self.recent_file,
+                {"paths": recent[:self.MAX_RECENT]},
+            )
+        except OSError:
+            pass
+
+    def remove_recent(self, path):
+        key = os.path.normcase(self._absolute_path(path))
+        recent = [
+            item
+            for item in self.get_recent_profiles()
+            if os.path.normcase(item) != key
+        ]
+        try:
+            self._write_json(self.recent_file, {"paths": recent})
+        except OSError:
+            pass
