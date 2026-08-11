@@ -48,6 +48,7 @@ configs/
 # Nuitka build files
 nuitka_cache/
 NuitkaCache/
+dist_nuitka*/
 *.build/
 *.dist/
 main.build/

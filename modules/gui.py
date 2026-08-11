@@ -6,14 +6,50 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QTextEdit,
     QComboBox, QListWidget, QListWidgetItem, QGroupBox,
     QCheckBox, QProgressBar, QMessageBox, QSplitter,
-    QDoubleSpinBox, QDialog, QDialogButtonBox, QFileDialog
+    QDoubleSpinBox, QDialog, QDialogButtonBox, QFileDialog,
+    QMenu, QStyle, QSystemTrayIcon
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QThread, QTimer
-from PyQt6.QtGui import QFont, QIcon
+from PyQt6.QtCore import (
+    Qt, pyqtSignal, QObject, QThread, QTimer, QLockFile, QStandardPaths
+)
+from PyQt6.QtGui import QAction, QFont, QIcon
 
 from modules.config_manager import ConfigError, ConfigManager
 from modules.wechat_sender import WeChatSender
 from modules.table_processor import TableProcessor
+
+
+APP_TITLE = "表格自动发送By春风予Lu"
+INSTANCE_LOCK_NAME = "ExcelSendWx.lock"
+
+
+def get_application_icon():
+    icon_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "love.ico")
+    )
+    icon = QIcon(icon_path)
+    if icon.isNull():
+        icon = QIcon(sys.executable)
+    return icon
+
+
+def acquire_instance_lock(lock_path=None):
+    if not lock_path:
+        lock_dir = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.TempLocation
+        )
+        lock_path = os.path.join(lock_dir or os.getcwd(), INSTANCE_LOCK_NAME)
+
+    instance_lock = QLockFile(lock_path)
+    if instance_lock.tryLock(100):
+        return instance_lock
+
+    if (
+        instance_lock.removeStaleLockFile()
+        and instance_lock.tryLock(100)
+    ):
+        return instance_lock
+    return None
 
 
 
@@ -1607,23 +1643,67 @@ class MultiSelectDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("表格自动发送By春风予Lu")
+        self.setWindowTitle(APP_TITLE)
         self.setGeometry(50, 50, 850, 580)
         self._closing_requested = False
         self._close_ready = False
         self._shutdown_poll_count = 0
+        self._tray_hint_shown = False
         
         self.init_ui()
+        self.init_tray()
 
     def init_ui(self):
         self.table_filter_tab = TableFilterTab()
         self.setCentralWidget(self.table_filter_tab)
 
+    def init_tray(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        tray_icon = QApplication.instance().windowIcon()
+        if tray_icon.isNull():
+            tray_icon = self.style().standardIcon(
+                QStyle.StandardPixmap.SP_ComputerIcon
+            )
+        self.setWindowIcon(tray_icon)
+        self.tray_icon.setIcon(tray_icon)
+        self.tray_icon.setToolTip(APP_TITLE)
+
+        self.tray_menu = QMenu(self)
+        self.show_window_action = QAction("显示主界面", self)
+        self.show_window_action.triggered.connect(self.show_main_window)
+        self.tray_menu.addAction(self.show_window_action)
+        self.tray_menu.addSeparator()
+
+        self.exit_action = QAction("退出程序", self)
+        self.exit_action.triggered.connect(self.request_exit)
+        self.tray_menu.addAction(self.exit_action)
+
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self._tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+        if self._tray_available:
+            self.tray_icon.show()
+
     def log(self, message):
         self.table_filter_tab.log(message)
 
+    def show_main_window(self):
+        if self._closing_requested:
+            return
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def on_tray_activated(self, reason):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.show_main_window()
+
     def closeEvent(self, event):
         if self._close_ready:
+            self.tray_icon.hide()
             event.accept()
             return
 
@@ -1631,10 +1711,32 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
 
+        if self._tray_available:
+            event.ignore()
+            self.hide()
+            if not self._tray_hint_shown:
+                self.tray_icon.showMessage(
+                    "程序仍在运行",
+                    "程序已隐藏到系统托盘。右键托盘图标可退出程序。",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000,
+                )
+                self._tray_hint_shown = True
+            return
+
+        event.ignore()
+        self.request_exit()
+
+    def request_exit(self):
+        if self._closing_requested:
+            return
+
         reply = QMessageBox.question(
-            self, "确认退出", "确定要退出程序吗？",
+            None,
+            "确认退出",
+            "确定要退出程序吗？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
+            QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
             self._closing_requested = True
@@ -1642,10 +1744,7 @@ class MainWindow(QMainWindow):
             self.setEnabled(False)
             self.setWindowTitle("正在安全退出，请稍候...")
             self._request_worker_stop()
-            event.ignore()
             QTimer.singleShot(100, self._poll_worker_shutdown)
-        else:
-            event.ignore()
 
     def _request_worker_stop(self):
         worker = self.table_filter_tab.worker
@@ -1672,6 +1771,7 @@ class MainWindow(QMainWindow):
         if not self._has_running_workers():
             self._close_ready = True
             self.close()
+            QApplication.instance().quit()
             return
 
         self._shutdown_poll_count += 1
@@ -1687,7 +1787,8 @@ class MainWindow(QMainWindow):
             )
             if reply == QMessageBox.StandardButton.No:
                 self._closing_requested = False
-                self.setWindowTitle("表格自动发送By春风予Lu")
+                self.setWindowTitle(APP_TITLE)
+                self.show_main_window()
                 return
 
             self._shutdown_poll_count = 0
@@ -1698,12 +1799,23 @@ class MainWindow(QMainWindow):
 
 def run_gui():
     app = QApplication(sys.argv)
+    app.setApplicationName(APP_TITLE)
+    app.setQuitOnLastWindowClosed(False)
     app.setStyle("Fusion")
     
-    import os
-    icon_path = os.path.join(os.path.dirname(__file__), "..", "love.ico")
-    if os.path.exists(icon_path):
-        app.setWindowIcon(QIcon(icon_path))
+    app_icon = get_application_icon()
+    if not app_icon.isNull():
+        app.setWindowIcon(app_icon)
+
+    instance_lock = acquire_instance_lock()
+    if instance_lock is None:
+        QMessageBox.information(
+            None,
+            "程序正在运行",
+            f"{APP_TITLE} 已经在运行，请从系统托盘打开。",
+        )
+        return
+    app.instance_lock = instance_lock
     
     window = MainWindow()
     window.show()
