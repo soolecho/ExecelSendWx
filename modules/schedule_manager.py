@@ -54,6 +54,8 @@ class ScheduleTask:
     chat_delay: float = 0.3
     # 每个接收人发送完成后间隔
     send_interval: float = 0.5
+    # 任务级默认城市：{{weather}} 不带参时用此；为空则 fallback 到全局配置
+    default_city: str = ""
     # 已触发记录：{ "YYYY-MM-DD": ["08:30", ...] }
     fired_log: Dict[str, List[str]] = field(default_factory=dict)
     created_at: str = ""
@@ -112,6 +114,7 @@ class ScheduleTask:
             message=str(data.get("message", "")),
             chat_delay=safe_float(data.get("chat_delay"), 0.3),
             send_interval=safe_float(data.get("send_interval"), 0.5),
+            default_city=str(data.get("default_city", "") or ""),
             fired_log=_normalize_fired_log(data.get("fired_log")),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),

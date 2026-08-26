@@ -244,9 +244,20 @@ class SendWorker(QThread):
                 result_emitted = True
                 return
             self.signals.log.emit("微信客户端初始化成功")
-            # 让 sender.log 通过信号线程安全地回写到 GUI 日志
+            # 让 sender.log 通过信号线程安全地回写到 GUI 日志，同时也落 logging 便于 app.log 排查
             try:
-                sender.log = lambda m: self.signals.log.emit(str(m))
+                import logging as _logging
+                _py_logger = _logging.getLogger("wechat_sender")
+                def _send_log_hook(m, _cb=self.signals.log.emit, _lg=_py_logger.info):
+                    try:
+                        _lg(str(m))
+                    except Exception:
+                        pass
+                    try:
+                        _cb(str(m))
+                    except Exception:
+                        pass
+                sender.log = _send_log_hook
             except Exception:
                 pass
             
@@ -421,12 +432,14 @@ class ScheduleSendWorker(QThread):
         chat_delay=0.3,
         send_interval=0.5,
         log_callback=None,
+        default_city="",
     ):
         super().__init__()
         self.recipients = list(recipients or [])
         self.message = message or ""
         self.chat_delay = max(0.0, min(10.0, float(chat_delay)))
         self.send_interval = max(0.0, min(30.0, float(send_interval)))
+        self.default_city = str(default_city or "")
         self._log_cb = log_callback
         self.stopped_event = threading.Event()
         self._sender = None
@@ -453,15 +466,50 @@ class ScheduleSendWorker(QThread):
             self.log("[定时] 接收人为空，跳过发送")
             self.finished_with_result.emit(0, 0, [])
             return
+
+        # 天气占位符渲染：消息里若含 {{weather}}/{{temp}} 等占位符，调用
+        # weather_fetcher 替换为真实值；无 API key 时跳过渲染保留原文
+        try:
+            from modules import weather_fetcher
+            cfg = weather_fetcher.load_weather_config()
+            placeholders = weather_fetcher.find_placeholders(self.message)
+            if placeholders:
+                self.log(f"[定时] 检测到天气占位符: {', '.join(placeholders)}")
+                rendered = weather_fetcher.render_message(
+                    self.message,
+                    task_default_city=self.default_city,
+                    api_key=cfg.get("api_key", ""),
+                    base_url=cfg.get("base_url", ""),
+                    global_default_city=cfg.get("default_city", ""),
+                )
+                if rendered != self.message:
+                    self.log("[定时] 天气占位符渲染完成")
+                    self.message = rendered
+                else:
+                    self.log("[定时] 天气渲染未生效（检查 API key/城市/网络）")
+        except Exception as exc:
+            self.log(f"[定时] 天气渲染异常: {exc}")
+
         self.log("[定时] 初始化微信客户端...")
         try:
             self._sender = WeChatSender.shared_instance()
-            # 复用现有日志通道
-            if self._log_cb:
-                try:
-                    self._sender.log = lambda m: self._log_cb(m)
-                except Exception:
-                    pass
+            # 复用现有日志通道；同时落 logging 以便 app.log 排查定时任务发送过程
+            try:
+                import logging as _logging
+                _py_logger = _logging.getLogger("wechat_sender")
+                def _sched_log_hook(m, _cb=self._log_cb, _lg=_py_logger.info):
+                    try:
+                        _lg(str(m))
+                    except Exception:
+                        pass
+                    try:
+                        _cb(m)
+                    except Exception:
+                        pass
+                if self._log_cb:
+                    self._sender.log = _sched_log_hook
+            except Exception:
+                pass
             if not self._sender.initialize():
                 WeChatSender.reset_shared_instance()
                 self.log("[定时] 微信初始化失败，本次任务失败")
@@ -1803,6 +1851,12 @@ class ScheduleTab(QWidget):
         left_btn3.addWidget(self.stop_send_btn)
         left_layout.addLayout(left_btn3)
 
+        left_btn4 = QHBoxLayout()
+        self.weather_settings_btn = QPushButton("🌤 天气设置")
+        left_btn4.addWidget(self.weather_settings_btn)
+        left_btn4.addStretch()
+        left_layout.addLayout(left_btn4)
+
         self.dispatcher_status_label = QLabel("调度器状态: 未启动")
         self.dispatcher_status_label.setStyleSheet("color:#666; font-size:11px;")
         left_layout.addWidget(self.dispatcher_status_label)
@@ -1882,8 +1936,19 @@ class ScheduleTab(QWidget):
         send_layout.addWidget(QLabel("自定义文字消息:"))
         self.message_edit = QTextEdit()
         self.message_edit.setMinimumHeight(110)
-        self.message_edit.setPlaceholderText("早安！今天记得填写日报。")
+        self.message_edit.setPlaceholderText(
+            "早安！今天记得填写日报。\n"
+            "支持占位符：{{weather}} {{weather:北京}} {{temp}} {{wind}} "
+            "{{date}} {{weekday}}（在「天气设置」配置 API key 后生效）"
+        )
         send_layout.addWidget(self.message_edit)
+
+        city_row = QHBoxLayout()
+        city_row.addWidget(QLabel("默认城市(天气占位符不带参时用此):"))
+        self.default_city_edit = QLineEdit()
+        self.default_city_edit.setPlaceholderText("如：北京；留空则用「天气设置」里的全局默认城市")
+        city_row.addWidget(self.default_city_edit, 1)
+        send_layout.addLayout(city_row)
 
         delay_row = QHBoxLayout()
         delay_row.addWidget(QLabel("聊天窗口切换延迟(秒):"))
@@ -1942,6 +2007,7 @@ class ScheduleTab(QWidget):
         self.load_config_btn.clicked.connect(self._on_load_all)
         self.run_now_btn.clicked.connect(self._on_run_now)
         self.stop_send_btn.clicked.connect(self._on_stop_send)
+        self.weather_settings_btn.clicked.connect(self._on_open_weather_settings)
 
     # ------------------------- 日志 -------------------------
     # 最大日志行数（交给 QTextDocument 原生裁剪，CPU/内存都更省）
@@ -2045,6 +2111,7 @@ class ScheduleTab(QWidget):
         self.message_edit.setPlainText(task.message)
         self.chat_delay_spin.setValue(task.chat_delay)
         self.send_interval_spin.setValue(task.send_interval)
+        self.default_city_edit.setText(task.default_city or "")
         self._on_repeat_mode_changed(idx)
 
     def _reset_form(self):
@@ -2060,6 +2127,7 @@ class ScheduleTab(QWidget):
         self.message_edit.clear()
         self.chat_delay_spin.setValue(0.3)
         self.send_interval_spin.setValue(0.5)
+        self.default_city_edit.clear()
 
     # ------------------------- 增删改 -------------------------
     def _on_new_task(self):
@@ -2148,6 +2216,7 @@ class ScheduleTab(QWidget):
             message=message,
             chat_delay=float(self.chat_delay_spin.value()),
             send_interval=float(self.send_interval_spin.value()),
+            default_city=self.default_city_edit.text().strip(),
         )
         return task
 
@@ -2270,6 +2339,7 @@ class ScheduleTab(QWidget):
             chat_delay=current.chat_delay,
             send_interval=current.send_interval,
             log_callback=self._post_log_from_worker,
+            default_city=current.default_city,
         )
         worker.finished_with_result.connect(self._on_send_finished)
         # 让 QThread 自动回收 C++ 对象，避免反复启动后 Qt 对象堆积
@@ -2311,6 +2381,73 @@ class ScheduleTab(QWidget):
                 msg += f"…等{len(failed_recipients)}人"
             msg += "）"
         self.log(msg)
+
+    # ------------------------- 天气设置 -------------------------
+    def _on_open_weather_settings(self):
+        from modules import weather_fetcher
+        dlg = QDialog(self)
+        dlg.setWindowTitle("天气设置 - 和风天气 API")
+        dlg.setMinimumWidth(480)
+        layout = QVBoxLayout(dlg)
+
+        cfg = weather_fetcher.load_weather_config()
+
+        layout.addWidget(QLabel("和风天气 API Key:"))
+        key_edit = QLineEdit(cfg.get("api_key", ""))
+        key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        key_edit.setPlaceholderText("在和风天气控制台 https://console.qweather.com 获取")
+        layout.addWidget(key_edit)
+
+        layout.addWidget(QLabel("接入域名(免费版 devapi.qweather.com，商业版 api.qweather.com):"))
+        url_edit = QLineEdit(cfg.get("base_url", weather_fetcher.DEFAULT_BASE_URL))
+        url_edit.setPlaceholderText(weather_fetcher.DEFAULT_BASE_URL)
+        layout.addWidget(url_edit)
+
+        layout.addWidget(QLabel("全局默认城市(任务表单里没填默认城市时用此):"))
+        city_edit = QLineEdit(cfg.get("default_city", ""))
+        city_edit.setPlaceholderText("如：北京 / 上海 / 杭州")
+        layout.addWidget(city_edit)
+
+        result_label = QLabel("")
+        result_label.setWordWrap(True)
+        layout.addWidget(result_label)
+
+        btn_row = QHBoxLayout()
+        test_btn = QPushButton("测试连接")
+        save_btn = QPushButton("💾 保存")
+        cancel_btn = QPushButton("取消")
+        btn_row.addWidget(test_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(save_btn)
+        btn_row.addWidget(cancel_btn)
+        layout.addLayout(btn_row)
+
+        def on_test():
+            ok, m = weather_fetcher.test_connection(
+                key_edit.text().strip(),
+                url_edit.text().strip(),
+                city_edit.text().strip() or "北京",
+            )
+            color = "#2e7d32" if ok else "#c62828"
+            result_label.setText(f'<span style="color:{color}">{m}</span>')
+            result_label.setTextFormat(Qt.TextFormat.RichText)
+
+        def on_save():
+            try:
+                weather_fetcher.save_weather_config(
+                    api_key=key_edit.text().strip(),
+                    base_url=url_edit.text().strip(),
+                    default_city=city_edit.text().strip(),
+                )
+                self.log("[定时] 天气配置已保存")
+                dlg.accept()
+            except Exception as exc:
+                QMessageBox.critical(self, "保存失败", str(exc))
+
+        test_btn.clicked.connect(on_test)
+        save_btn.clicked.connect(on_save)
+        cancel_btn.clicked.connect(dlg.reject)
+        dlg.exec()
 
 
 def _parse_recipients(text: str) -> List[str]:
@@ -2391,6 +2528,7 @@ class MainWindow(QMainWindow):
                 chat_delay=task.chat_delay,
                 send_interval=task.send_interval,
                 log_callback=self._post_schedule_log_from_worker,
+                default_city=task.default_city,
             )
 
             finished = threading.Event()
