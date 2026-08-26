@@ -175,6 +175,139 @@ def lookup_city_id(city: str, base_url: str, api_key: str,
     return str(locations[0].get("id") or "") or None
 
 
+def fetch_3d_forecast(location_id: str, base_url: str, api_key: str,
+                      log_fn=None) -> Optional[Dict]:
+    """3 天天气预报。含最高/最低温、白天/夜间天气、风力、紫外线。"""
+    def _log(msg):
+        try:
+            logger.info(msg)
+            if log_fn: log_fn(msg)
+        except Exception:
+            pass
+    if not (location_id and base_url and api_key):
+        return None
+    url = (f"{base_url}/v7/weather/3d?"
+           f"location={location_id}&key={api_key}")
+    try:
+        data = _http_get_json(url)
+    except Exception as exc:
+        _log(f"❌ 3天预报请求失败: {exc}")
+        return None
+    if data.get("code") != "200":
+        _log(f"❌ 3天预报返回 code={data.get('code')}")
+        return None
+    daily_arr = data.get("daily") or []
+    if not daily_arr:
+        return None
+    d = daily_arr[0]
+    return {
+        "max_temp": str(d.get("tempMax") or ""),
+        "min_temp": str(d.get("tempMin") or ""),
+        "day_text": str(d.get("textDay") or ""),
+        "night_text": str(d.get("textNight") or ""),
+        "day_wind_dir": str(d.get("windDirDay") or ""),
+        "day_wind_scale": str(d.get("windScaleDay") or ""),
+        "night_wind_dir": str(d.get("windDirNight") or ""),
+        "night_wind_scale": str(d.get("windScaleNight") or ""),
+        "uv_index": str(d.get("uvIndex") or ""),
+        "humidity": str(d.get("humidity") or ""),
+        "pressure": str(d.get("pressure") or ""),
+        "sunrise": str(d.get("sunrise") or ""),
+        "sunset": str(d.get("sunset") or ""),
+    }
+
+
+def fetch_indices(location_id: str, base_url: str, api_key: str,
+                  log_fn=None) -> List[Dict]:
+    """生活指数: 穿衣/紫外线/感冒/运动等建议。返回 List[{name, category, text}]。"""
+    def _log(msg):
+        try:
+            logger.info(msg)
+            if log_fn: log_fn(msg)
+        except Exception:
+            pass
+    if not (location_id and base_url and api_key):
+        return []
+    url = (f"{base_url}/v7/indices/1d?"
+           f"type=0&location={location_id}&key={api_key}")
+    try:
+        data = _http_get_json(url)
+    except Exception as exc:
+        _log(f"❌ 生活指数请求失败: {exc}")
+        return []
+    if data.get("code") != "200":
+        _log(f"❌ 生活指数返回 code={data.get('code')}")
+        return []
+    daily_arr = data.get("daily") or []
+    out = []
+    for d in daily_arr:
+        out.append({
+            "name": str(d.get("name") or ""),
+            "category": str(d.get("category") or ""),
+            "text": str(d.get("text") or ""),
+        })
+    return out
+
+
+def _format_advice(indices: List[Dict]) -> str:
+    """把生活指数拼成多行建议文本。"""
+    if not indices:
+        return ""
+    lines = []
+    for idx in indices[:6]:  # 最多 6 条避免消息太长
+        name = idx.get("name") or ""
+        category = idx.get("category") or ""
+        text = idx.get("text") or ""
+        if not text:
+            continue
+        if category:
+            lines.append(f"· {name}({category}): {text}")
+        else:
+            lines.append(f"· {name}: {text}")
+    return "\n".join(lines)
+
+
+def _format_full(data: Dict) -> str:
+    """把 fetch_weather 返回的完整 dict 拼成多行天气简报。"""
+    if not data:
+        return ""
+    lines = []
+    city = data.get("city") or ""
+    text = data.get("text") or ""
+    temp = data.get("temp") or ""
+    feels = data.get("feels_like") or ""
+    humidity = data.get("humidity") or ""
+    wind = data.get("wind") or ""
+    if city or text:
+        head = f"📍 {city}"
+        if text:
+            head += f" {text}"
+        if temp:
+            head += f" {temp}°C"
+        if feels:
+            head += f" (体感{feels}°C)"
+        lines.append(head)
+    max_t = data.get("max_temp") or ""
+    min_t = data.get("min_temp") or ""
+    day_t = data.get("day_text") or ""
+    night_t = data.get("night_text") or ""
+    if max_t or min_t:
+        rng = f"今日 {min_t}~{max_t}°C"
+        if day_t or night_t:
+            rng += f" 白天{day_t} 夜间{night_t}"
+        lines.append(rng)
+    if wind:
+        lines.append(f"风: {wind}")
+    if humidity:
+        lines.append(f"湿度: {humidity}%")
+    advice = data.get("advice") or ""
+    if advice:
+        lines.append("")
+        lines.append("💡 生活建议")
+        lines.append(advice)
+    return "\n".join(lines)
+
+
 def fetch_weather(city: str, base_url: str = "",
                   api_key: str = "", log_fn=None) -> Optional[Dict]:
     """
@@ -241,6 +374,24 @@ def fetch_weather(city: str, base_url: str = "",
     }
     result["wind"] = _format_wind(result["wind_dir"], result["wind_scale"])
     result["summary"] = _format_summary(result)
+    # 合并 3 天预报 (含最高/最低温、白天/夜间天气、风力)
+    forecast = fetch_3d_forecast(location_id, base_url, api_key, log_fn=log_fn)
+    if forecast:
+        result.update({
+            "max_temp": forecast["max_temp"],
+            "min_temp": forecast["min_temp"],
+            "day_text": forecast["day_text"],
+            "night_text": forecast["night_text"],
+            "uv_index": forecast["uv_index"],
+            "sunrise": forecast["sunrise"],
+            "sunset": forecast["sunset"],
+        })
+    # 合并生活指数 (穿衣/紫外线/感冒等建议)
+    indices = fetch_indices(location_id, base_url, api_key, log_fn=log_fn)
+    if indices:
+        result["indices"] = indices
+        result["advice"] = _format_advice(indices)
+    result["full"] = _format_full(result)
     with _CACHE_LOCK:
         _CACHE[cache_k] = (now, result)
     return result
@@ -324,7 +475,11 @@ def render_message(text: str, task_default_city: str = "",
     def replacer(match: re.Match) -> str:
         key = match.group(1).lower()
         arg = match.group(2)
-        if key in ("weather", "temp", "wind", "humidity", "feels_like",
+        if key in ("weather", "weather_full", "weather_max", "weather_min",
+                   "weather_day", "weather_night", "weather_advice",
+                   "weather_wind", "weather_humidity", "weather_uv",
+                   "weather_feels", "weather_sunrise", "weather_sunset",
+                   "temp", "wind", "humidity", "feels_like",
                    "summary", "city"):
             if not api_key:
                 logger.info("天气占位符 %s 但 API key 为空，保留原文", key)
@@ -337,6 +492,30 @@ def render_message(text: str, task_default_city: str = "",
                 return match.group(0)
             if key == "weather":
                 return data.get("summary") or data.get("text") or ""
+            if key == "weather_full":
+                return data.get("full") or data.get("summary") or ""
+            if key == "weather_max":
+                return data.get("max_temp") or ""
+            if key == "weather_min":
+                return data.get("min_temp") or ""
+            if key == "weather_day":
+                return data.get("day_text") or ""
+            if key == "weather_night":
+                return data.get("night_text") or ""
+            if key == "weather_advice":
+                return data.get("advice") or ""
+            if key == "weather_wind":
+                return data.get("wind") or ""
+            if key == "weather_humidity":
+                return data.get("humidity") or ""
+            if key == "weather_uv":
+                return data.get("uv_index") or ""
+            if key == "weather_feels":
+                return data.get("feels_like") or ""
+            if key == "weather_sunrise":
+                return data.get("sunrise") or ""
+            if key == "weather_sunset":
+                return data.get("sunset") or ""
             if key == "city":
                 return data.get("city") or city
             return data.get({

@@ -1940,7 +1940,13 @@ class ScheduleTab(QWidget):
         self.message_edit.setPlaceholderText(
             "早安！今天记得填写日报。\n"
             "支持占位符：\n"
-            "  天气(需在「天气设置」配置 API key)：{{weather}} {{weather:北京}} {{temp}} {{wind}}\n"
+            "  天气(需在「天气设置」配置 API key)：\n"
+            "    {{weather}}        简洁：多云 30°C\n"
+            "    {{weather_full}}   完整：实时+最高最低+白天夜间+风力+建议\n"
+            "    {{weather:北京}}   指定城市\n"
+            "    {{weather_max}} {{weather_min}}  最高/最低温\n"
+            "    {{weather_day}} {{weather_night}} 白天/夜间天气\n"
+            "    {{weather_wind}} {{weather_advice}} 风力/生活建议\n"
             "  热搜(无 key)：{{news}} {{news:zhihu}} {{news:toutiao}} {{news:bilibili}} {{news:5}}\n"
             "  时间：{{date}} {{weekday}} {{time}}"
         )
