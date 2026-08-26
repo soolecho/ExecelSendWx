@@ -120,12 +120,13 @@ def _http_get_json(url: str, timeout: float = 8.0) -> Dict:
 def _geo_base_for(base_url: str) -> str:
     """根据用户填的 base_url 决定 GeoAPI 域名。
 
-    - 老版共享域名 (devapi/api.qweather.com) → geo 走 geoapi.qweather.com
-      (和风规定 GeoAPI 必须用 geoapi 子域名)
-    - 新版专属子域名 (xxx-api.qweather.com) → geo 和 weather 都走这个域名
+    - 新版专属域名 (*.qweatherapi.com, 如 xxx.re.qweatherapi.com) →
+      所有 API（含 GeoAPI）都走这个域名，和风 2024+ 推荐
+    - 老版共享域名 (devapi.qweather.com / api.qweather.com) →
+      GeoAPI 必须走 geoapi.qweather.com 子域名
     """
     host = (urllib.parse.urlparse(base_url).hostname or "").lower()
-    if host.endswith("-api.qweather.com"):
+    if host.endswith(".qweatherapi.com"):
         return base_url.rstrip("/")
     return "https://geoapi.qweather.com"
 
@@ -289,15 +290,12 @@ def _resolve_city(arg: Optional[str], task_default_city: str,
 def render_message(text: str, task_default_city: str = "",
                    api_key: str = "", base_url: str = "",
                    global_default_city: str = "") -> str:
-    """把 {{weather}}/{{temp}}/{{wind}}/{{date}}/{{weekday}} 等占位符替换成真实值。
-    无城市可解析时保留原占位符字符串，避免误发。
+    """把 {{weather}}/{{temp}}/{{wind}}/{{date}}/{{weekday}}/{{news}} 等占位符
+    替换成真实值。无城市/网络失败时保留原占位符字符串，避免误发。
     """
     if not text:
         return text
     if "{{" not in text:
-        return text
-    if not api_key:
-        logger.info("消息含天气占位符但 API key 为空，跳过渲染")
         return text
 
     cache_for_render: Dict[str, Optional[Dict]] = {}
@@ -316,6 +314,9 @@ def render_message(text: str, task_default_city: str = "",
         arg = match.group(2)
         if key in ("weather", "temp", "wind", "humidity", "feels_like",
                    "summary", "city"):
+            if not api_key:
+                logger.info("天气占位符 %s 但 API key 为空，保留原文", key)
+                return match.group(0)
             city = _resolve_city(arg, task_default_city, global_default_city)
             if not city:
                 return match.group(0)
@@ -333,6 +334,17 @@ def render_message(text: str, task_default_city: str = "",
                 "feels_like": "feels_like",
                 "summary": "summary",
             }.get(key, "")) or ""
+        if key in ("news", "hotsearch", "hot", "热搜"):
+            try:
+                from modules import news_fetcher
+                platform, limit = news_fetcher.parse_news_arg(arg)
+                items = news_fetcher.fetch_top(platform=platform, limit=limit)
+                if not items:
+                    return match.group(0)
+                return news_fetcher.format_items(items, platform=platform)
+            except Exception as exc:
+                logger.warning("新闻占位符渲染失败: %s", exc)
+                return match.group(0)
         if key == "date":
             return datetime.now().strftime("%Y-%m-%d")
         if key == "weekday":

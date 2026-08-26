@@ -474,7 +474,8 @@ class ScheduleSendWorker(QThread):
             cfg = weather_fetcher.load_weather_config()
             placeholders = weather_fetcher.find_placeholders(self.message)
             if placeholders:
-                self.log(f"[定时] 检测到天气占位符: {', '.join(placeholders)}")
+                self.log(f"[定时] 检测到消息占位符: {', '.join(placeholders)}")
+                # 不需要天气 key 的占位符（news/date/weekday/time）也会被渲染
                 rendered = weather_fetcher.render_message(
                     self.message,
                     task_default_city=self.default_city,
@@ -483,10 +484,10 @@ class ScheduleSendWorker(QThread):
                     global_default_city=cfg.get("default_city", ""),
                 )
                 if rendered != self.message:
-                    self.log("[定时] 天气占位符渲染完成")
+                    self.log("[定时] 占位符渲染完成")
                     self.message = rendered
                 else:
-                    self.log("[定时] 天气渲染未生效（检查 API key/城市/网络）")
+                    self.log("[定时] 占位符未生效（检查天气 API key/城市/网络）")
         except Exception as exc:
             self.log(f"[定时] 天气渲染异常: {exc}")
 
@@ -1938,8 +1939,10 @@ class ScheduleTab(QWidget):
         self.message_edit.setMinimumHeight(110)
         self.message_edit.setPlaceholderText(
             "早安！今天记得填写日报。\n"
-            "支持占位符：{{weather}} {{weather:北京}} {{temp}} {{wind}} "
-            "{{date}} {{weekday}}（在「天气设置」配置 API key 后生效）"
+            "支持占位符：\n"
+            "  天气(需在「天气设置」配置 API key)：{{weather}} {{weather:北京}} {{temp}} {{wind}}\n"
+            "  热搜(无 key)：{{news}} {{news:zhihu}} {{news:toutiao}} {{news:bilibili}} {{news:5}}\n"
+            "  时间：{{date}} {{weekday}} {{time}}"
         )
         send_layout.addWidget(self.message_edit)
 
