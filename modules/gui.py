@@ -2423,11 +2423,18 @@ class ScheduleTab(QWidget):
         layout.addLayout(btn_row)
 
         def on_test():
-            ok, m = weather_fetcher.test_connection(
-                key_edit.text().strip(),
-                url_edit.text().strip(),
-                city_edit.text().strip() or "北京",
-            )
+            test_city = city_edit.text().strip() or "北京"
+            self.log(f"[天气] 开始测试连接：city={test_city} url={url_edit.text().strip()}")
+            try:
+                ok, m = weather_fetcher.test_connection(
+                    key_edit.text().strip(),
+                    url_edit.text().strip(),
+                    test_city,
+                    log_fn=lambda msg: self.log(f"[天气] {msg}"),
+                )
+            except Exception as exc:
+                ok, m = False, f"测试异常: {exc}"
+                self.log(f"[天气] ❌ {m}")
             color = "#2e7d32" if ok else "#c62828"
             result_label.setText(f'<span style="color:{color}">{m}</span>')
             result_label.setTextFormat(Qt.TextFormat.RichText)
@@ -2464,6 +2471,9 @@ def _parse_recipients(text: str) -> List[str]:
 
 
 class MainWindow(QMainWindow):
+    # 跨线程日志投递：子线程 emit -> 主线程 slot 写 UI
+    _schedule_log_signal = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
@@ -2480,6 +2490,10 @@ class MainWindow(QMainWindow):
         # 定时触发时并发串行化（避免同时多个任务抢微信窗口）
         self._schedule_running_lock = threading.Lock()
         self._schedule_worker = None
+
+        # 关键：跨线程日志用 pyqtSignal 投递，不能用 QTimer.singleShot(0,...)
+        # 因为子线程没有 Qt event loop，singleShot 永远不会触发
+        self._schedule_log_signal.connect(self._on_schedule_log_signal)
 
         self.init_ui()
         self.init_tray()
@@ -2521,7 +2535,12 @@ class MainWindow(QMainWindow):
 
     def _run_schedule_task_serialized(self, task: ScheduleTask, slot: str):
         with self._schedule_running_lock:
-            # 主线程读取 UI 可能还在变化，直接用 store 里的任务信息
+            self._post_schedule_log_from_worker(
+                f"[定时] 开始执行任务「{task.name}」 时间点 {slot} 接收人数 {len(task.recipients)}"
+            )
+            # 在 ScheduleRun Python 子线程构造 QThread；affinity 是本子线程。
+            # 关键修复：connect 时显式用 DirectConnection，避免 AutoConnection
+            # 因 worker.affinity 线程没有 Qt event loop 而导致 finished 信号永远不触发。
             worker = ScheduleSendWorker(
                 recipients=list(task.recipients),
                 message=task.message,
@@ -2540,29 +2559,47 @@ class MainWindow(QMainWindow):
                 result["failed_list"] = list(failed_list or [])
                 finished.set()
 
-            def start_worker():
-                self._schedule_worker = worker
-                # 一次性语义：结果回调 + 释放 QThread C++ 对象
-                worker.finished_with_result.connect(on_finished)
-                worker.finished.connect(
-                    lambda: self._cleanup_main_schedule_worker_after(worker)
-                )
-                worker.start()
+            self._schedule_worker = worker
+            worker.finished_with_result.connect(
+                on_finished, Qt.ConnectionType.DirectConnection)
+            worker.finished.connect(
+                lambda: self._cleanup_main_schedule_worker_after(worker),
+                Qt.ConnectionType.DirectConnection,
+            )
+            # QThread.start() 是线程安全的，可以从任何线程调用，
+            # 它会启动一个新的 OS 线程跑 run()，不再依赖当前线程的 event loop
+            worker.start()
 
-            # 切到主线程启动 QThread 子对象
-            QTimer.singleShot(0, start_worker)
             total_timeout = max(60.0, 60.0 * (len(task.recipients) or 1) * 10.0)
             total_timeout = min(total_timeout, 12 * 3600.0)
             finished.wait(timeout=total_timeout)
+            if not finished.is_set():
+                self._post_schedule_log_from_worker(
+                    f"[定时] ⚠ 任务「{task.name}」执行超时（{int(total_timeout)}秒）"
+                )
             self._post_schedule_log_from_worker(
                 f"[定时] 任务「{task.name}」时间点 {slot} 完成："
                 f"成功{result['success']}，失败{result['failed']}"
             )
 
     def _post_schedule_log_from_worker(self, message):
-        # 后台线程/调度线程统一切到主线程再写日志，避免跨线程操作 QWidget。
+        # 关键修复：用 pyqtSignal 跨线程投递，不要用 QTimer.singleShot(0,...)
+        # 因为 ScheduleSendWorker.run() 所在的 QThread 没有 Qt event loop，
+        # singleShot 注册的 timer 永远不会触发；signal.emit 会通过 QueuedConnection
+        # 自动投递到 receiver (MainWindow) 所在的主线程 event loop。
         try:
-            QTimer.singleShot(0, lambda m=message: self._schedule_log_to_ui(m))
+            self._schedule_log_signal.emit(str(message))
+        except Exception:
+            pass
+
+    def _on_schedule_log_signal(self, message):
+        # 主线程 slot：把日志同时写到定时 Tab 主面板 + 数据发送 Tab 面板
+        try:
+            self.schedule_tab.log(message)
+        except Exception:
+            pass
+        try:
+            self.table_filter_tab.log(message)
         except Exception:
             pass
 

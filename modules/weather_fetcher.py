@@ -117,19 +117,44 @@ def _http_get_json(url: str, timeout: float = 8.0) -> Dict:
     return json.loads(raw)
 
 
-def lookup_city_id(city: str, base_url: str, api_key: str) -> Optional[str]:
+def _geo_base_for(base_url: str) -> str:
+    """根据用户填的 base_url 决定 GeoAPI 域名。
+
+    - 老版共享域名 (devapi/api.qweather.com) → geo 走 geoapi.qweather.com
+      (和风规定 GeoAPI 必须用 geoapi 子域名)
+    - 新版专属子域名 (xxx-api.qweather.com) → geo 和 weather 都走这个域名
+    """
+    host = (urllib.parse.urlparse(base_url).hostname or "").lower()
+    if host.endswith("-api.qweather.com"):
+        return base_url.rstrip("/")
+    return "https://geoapi.qweather.com"
+
+
+def lookup_city_id(city: str, base_url: str, api_key: str,
+                   log_fn=None) -> Optional[str]:
     """城市名 -> 和风 LocationID。失败返回 None。"""
+    def _log(msg):
+        try:
+            logger.info(msg)
+            if log_fn:
+                log_fn(msg)
+        except Exception:
+            pass
+
     if not (city and base_url and api_key):
+        _log(f"城市查询跳过：city={city!r} base_url={base_url!r} key_len={len(api_key)}")
         return None
-    url = (f"{base_url}/geo/v2/city/lookup?"
+    geo_base = _geo_base_for(base_url)
+    url = (f"{geo_base}/v2/city/lookup?"
            f"location={urllib.parse.quote(city)}&key={api_key}")
+    _log(f"GET {geo_base}/v2/city/lookup?location={city}&key=***")
     try:
         data = _http_get_json(url)
     except Exception as exc:
-        logger.warning("和风城市查询失败 %s: %s", city, exc)
+        _log(f"❌ 城市查询请求失败 {city}: {exc}")
         return None
     if data.get("code") != "200":
-        logger.warning("和风城市查询返回非 200: %s -> %s", city, data)
+        _log(f"❌ 城市查询返回 code={data.get('code')} msg={data.get('message','')} (city={city})")
         return None
     locations = data.get("location") or []
     if not locations:
@@ -138,7 +163,7 @@ def lookup_city_id(city: str, base_url: str, api_key: str) -> Optional[str]:
 
 
 def fetch_weather(city: str, base_url: str = "",
-                  api_key: str = "") -> Optional[Dict]:
+                  api_key: str = "", log_fn=None) -> Optional[Dict]:
     """
     拉取实时天气。返回 dict:
       {
@@ -151,11 +176,19 @@ def fetch_weather(city: str, base_url: str = "",
       }
     失败返回 None。
     """
+    def _log(msg):
+        try:
+            logger.info(msg)
+            if log_fn:
+                log_fn(msg)
+        except Exception:
+            pass
+
     if not city:
         return None
     base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
     if not api_key:
-        logger.warning("和风 API key 为空，跳过天气拉取")
+        _log("❌ 和风 API key 为空，跳过天气拉取")
         return None
 
     cache_k = _cache_key(city, base_url, api_key)
@@ -163,20 +196,23 @@ def fetch_weather(city: str, base_url: str = "",
     with _CACHE_LOCK:
         hit = _CACHE.get(cache_k)
         if hit and (now - hit[0]) < _CACHE_TTL:
+            _log(f"命中缓存（{int(_CACHE_TTL - (now - hit[0]))}s 后过期）：{city}")
             return hit[1]
 
-    location_id = lookup_city_id(city, base_url, api_key)
+    location_id = lookup_city_id(city, base_url, api_key, log_fn=log_fn)
     if not location_id:
+        _log(f"❌ 未找到城市 LocationID：{city}")
         return None
+    _log(f"LocationID={location_id}，开始拉取实时天气...")
     url = (f"{base_url}/v7/weather/now?"
            f"location={location_id}&key={api_key}")
     try:
         data = _http_get_json(url)
     except Exception as exc:
-        logger.warning("和风实时天气拉取失败 %s: %s", city, exc)
+        _log(f"❌ 实时天气请求失败 {city}: {exc}")
         return None
     if data.get("code") != "200":
-        logger.warning("和风实时天气返回非 200: %s", data)
+        _log(f"❌ 实时天气返回 code={data.get('code')} msg={data.get('message','')}")
         return None
     now_obj = data.get("now") or {}
     result = {
@@ -215,15 +251,21 @@ def _format_summary(data: Dict) -> str:
 
 
 def test_connection(api_key: str, base_url: str,
-                    city: str = "北京") -> tuple[bool, str]:
+                    city: str = "北京", log_fn=None) -> tuple[bool, str]:
     """UI 测试连接按钮用。返回 (ok, message)。"""
     if not api_key:
+        if log_fn: log_fn("❌ API key 为空")
         return False, "API key 为空"
     base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
-    data = fetch_weather(city, base_url, api_key)
+    if log_fn: log_fn(f"=== 测试连接开始 city={city} base_url={base_url} ===")
+    data = fetch_weather(city, base_url, api_key, log_fn=log_fn)
     if data:
-        return True, f"连接成功：{data.get('city','')} {data.get('summary','')}"
-    return False, f"连接失败：请检查 key/域名/网络（测试城市：{city}）"
+        msg = f"✅ 连接成功：{data.get('city','')} {data.get('summary','')}"
+        if log_fn: log_fn(msg)
+        return True, msg
+    msg = f"❌ 连接失败：请检查 key/域名/网络（测试城市：{city}）"
+    if log_fn: log_fn(msg)
+    return False, msg
 
 
 # ----------------------------- 模板渲染 -----------------------------
