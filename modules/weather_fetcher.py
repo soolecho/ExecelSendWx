@@ -110,11 +110,17 @@ def _http_get_json(url: str, timeout: float = 8.0) -> Dict:
     req = urllib.request.Request(url, headers={
         "User-Agent": "ExcelSendWx/1.0 (Python urllib)",
         "Accept": "application/json",
+        "Accept-Encoding": "gzip, identity",
     })
     with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read()
+        # 和风服务器默认返回 gzip 压缩数据, 不解压会拿到二进制乱码导致 JSON 解析失败
+        if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
+            import gzip
+            raw = gzip.decompress(raw)
         charset = resp.headers.get_content_charset() or "utf-8"
-        raw = resp.read().decode(charset, errors="replace")
-    return json.loads(raw)
+        text = raw.decode(charset, errors="replace")
+    return json.loads(text)
 
 
 def _geo_base_for(base_url: str) -> str:
@@ -146,9 +152,15 @@ def lookup_city_id(city: str, base_url: str, api_key: str,
         _log(f"城市查询跳过：city={city!r} base_url={base_url!r} key_len={len(api_key)}")
         return None
     geo_base = _geo_base_for(base_url)
-    url = (f"{geo_base}/v2/city/lookup?"
+    # 新版专属域名 (*.qweatherapi.com) GeoAPI 路径要 /geo/v2 前缀;
+    # 老版共享域名 (geoapi.qweather.com) 路径就是 /v2 (子域名本身已含 geo)
+    if geo_base.endswith(".qweatherapi.com"):
+        path = "/geo/v2/city/lookup"
+    else:
+        path = "/v2/city/lookup"
+    url = (f"{geo_base}{path}?"
            f"location={urllib.parse.quote(city)}&key={api_key}")
-    _log(f"GET {geo_base}/v2/city/lookup?location={city}&key=***")
+    _log(f"GET {geo_base}{path}?location={city}&key=***")
     try:
         data = _http_get_json(url)
     except Exception as exc:
