@@ -49,6 +49,7 @@ configs/
 nuitka_cache/
 NuitkaCache/
 dist_nuitka*/
+installer_output/
 *.build/
 *.dist/
 main.build/
@@ -61,6 +62,10 @@ build_pyinstaller.py
 test_*.py
 debug_*.py
 manual_extract.py
+tmp_*.py
+test.py
+generate_icon.py
+NUL
 
 # Browser storage
 browser_storage.json

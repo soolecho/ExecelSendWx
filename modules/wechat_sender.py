@@ -2,6 +2,7 @@ from wxauto4 import WeChat
 import logging
 import os
 import tempfile
+import threading
 import time
 
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter
@@ -10,8 +11,38 @@ logger = logging.getLogger(__name__)
 
 
 class WeChatSender:
+    """
+    微信发送器。
+
+    稳定性优化（v2）：
+    1. 进程级共享同一个 WeChatSender 实例（shared_instance），避免每次任务
+       都重新创建 WeChat 句柄、重复查找微信窗口，降低 CPU 与句柄开销。
+    2. 当 ChatWith/ChatInfo 抛异常或返回无效值时，判定为「微信窗口句柄失效 / 微信重启 /
+       切换账号」，自动调用 reconnect() 重新初始化 WeChat 并再给一次重试机会。
+    """
+
+    _shared_lock = threading.Lock()
+    _shared_instance: "WeChatSender | None" = None
+
     def __init__(self):
         self.wx = None
+        # 最近一次确认句柄可用的时间戳；超时会先做一次轻量探活
+        self._last_healthy_ts = 0.0
+        self._own_initialize_called = False
+
+    @classmethod
+    def shared_instance(cls) -> "WeChatSender":
+        """进程级单例：所有 ScheduleSendWorker / SendWorker 共用同一份 WeChat 句柄。"""
+        with cls._shared_lock:
+            if cls._shared_instance is None:
+                cls._shared_instance = cls()
+            return cls._shared_instance
+
+    @classmethod
+    def reset_shared_instance(cls) -> None:
+        """极少数情况下（例如用户要求彻底重启）用于强制回收单例。"""
+        with cls._shared_lock:
+            cls._shared_instance = None
 
     @staticmethod
     def _is_target_chat(current_chat, recipient):
@@ -23,10 +54,74 @@ class WeChatSender:
         logger.info("Initializing WeChat client...")
         try:
             self.wx = WeChat(ads=False)
-            logger.info(f"WeChat client initialized successfully: {self.wx.nickname}")
+            # 读一次 nickname 确认句柄真实可用
+            _ = getattr(self.wx, "nickname", None)
+            self._last_healthy_ts = time.time()
+            self._own_initialize_called = True
+            logger.info("WeChat client initialized successfully.")
             return True
         except Exception as e:
             logger.error(f"Failed to initialize WeChat: {e}")
+            self.wx = None
+            self._own_initialize_called = False
+            return False
+
+    def reconnect(self, log_fn=None) -> bool:
+        """当检测到微信句柄失效时重新初始化。失败会写日志但不抛异常。"""
+        try:
+            # 解除旧引用，便于 GC 回收句柄相关资源
+            self.wx = None
+            if log_fn:
+                try:
+                    log_fn("🔄 微信句柄失效，正在重新连接微信...")
+                except Exception:
+                    pass
+            ok = self.initialize()
+            if ok and log_fn:
+                try:
+                    log_fn("✅ 微信重连成功")
+                except Exception:
+                    pass
+            return ok
+        except Exception as exc:
+            logger.error(f"Reconnect failed: {exc}")
+            if log_fn:
+                try:
+                    log_fn(f"❌ 微信重连失败: {exc}")
+                except Exception:
+                    pass
+            return False
+
+    def _safe_chatinfo(self) -> tuple[bool, dict | None]:
+        """
+        安全读取 ChatInfo。
+        返回 (is_healthy, chatinfo)。
+        is_healthy=False 意味着句柄已失效，调用方应主动 reconnect 再试一次。
+        """
+        if not self.wx:
+            return False, None
+        try:
+            chatinfo = self.wx.ChatInfo()
+        except Exception:
+            return False, None
+        # wxauto4 正常时会返回 dict；异常状态下可能返回 None / {} / '无' 等异常值
+        if not isinstance(chatinfo, dict):
+            return False, None
+        # chat_name 不存在或者为空字符串，通常也表明当前无法读取会话，需要重连
+        name = chatinfo.get("chat_name")
+        # 注意：刚打开微信、没有任何聊天被选中时，chat_name 可能是空，这并不意味着句柄坏，
+        # 所以这里只判断"调用没抛异常且是 dict"就算健康，chat_name 缺省由上层再处理。
+        _ = name
+        self._last_healthy_ts = time.time()
+        return True, chatinfo
+
+    def _safe_chatwith(self, recipient: str, exact: bool = False) -> bool:
+        if not self.wx:
+            return False
+        try:
+            self.wx.ChatWith(recipient, exact=exact)
+            return True
+        except Exception:
             return False
 
     @staticmethod
@@ -57,75 +152,113 @@ class WeChatSender:
             if not self.initialize():
                 self.log(f"❌ 微信初始化失败")
                 return False
-        
-        self.log(f"发送消息给 {recipient}")
-        try:
-            if first_send:
-                self.log(f"首次发送，确保微信窗口激活...")
-                if self._wait_or_stopped(0.5, stop_event):
-                    return False
-            
-            if fast_mode:
-                if self._stop_requested(stop_event):
-                    return False
-                chatinfo = self.wx.ChatInfo()
-                current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
-                if self._is_target_chat(current_chat, recipient):
-                    self.log(f"当前窗口正确，直接发送")
-                    self.wx.SendMsg(content)
-                    
-                    message_length = len(content)
-                    if message_length > 500:
-                        time.sleep(1)
-                    elif message_length > 100:
-                        time.sleep(0.5)
-                    else:
-                        time.sleep(0.2)
-                    
-                    self.log(f"✅ 快速发送成功")
-                    return True
-                else:
-                    self.log(f"当前窗口不正确({current_chat})，需要重新切换")
-            
-            max_retries = 3
-            for attempt in range(max_retries):
-                if self._stop_requested(stop_event):
-                    return False
 
-                self.log(f"尝试切换窗口 ({attempt+1}/{max_retries}): {recipient}")
-                self.wx.ChatWith(recipient, exact=False)
-                if self._wait_or_stopped(chat_delay, stop_event):
-                    return False
-                
-                chatinfo = self.wx.ChatInfo()
-                current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
-                self.log(f"当前窗口: {current_chat}")
-                
-                if self._is_target_chat(current_chat, recipient):
-                    self.wx.SendMsg(content)
-                    
-                    message_length = len(content)
-                    if message_length > 500:
-                        self.log(f"消息较长({message_length}字符)，等待发送完成...")
-                        time.sleep(1)
-                    elif message_length > 100:
-                        time.sleep(0.5)
+        # 轻量探活：距离上次健康超过 60 秒，做一次 ChatInfo 预检
+        now = time.time()
+        if now - self._last_healthy_ts > 60.0:
+            ok, _ = self._safe_chatinfo()
+            if not ok and not self.reconnect(self.log):
+                self.log("❌ 微信探活失败且重连未成功")
+                return False
+
+        self.log(f"发送消息给 {recipient}")
+
+        def attempt_once(allow_reconnect: bool) -> bool:
+            try:
+                if first_send:
+                    self.log(f"首次发送，确保微信窗口激活...")
+                    if self._wait_or_stopped(0.5, stop_event):
+                        return False
+
+                if fast_mode:
+                    if self._stop_requested(stop_event):
+                        return False
+                    ok, chatinfo = self._safe_chatinfo()
+                    if not ok:
+                        if allow_reconnect and self.reconnect(self.log):
+                            ok, chatinfo = self._safe_chatinfo()
+                    if not ok:
+                        return False
+                    current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
+                    if self._is_target_chat(current_chat, recipient):
+                        self.log(f"当前窗口正确，直接发送")
+                        self.wx.SendMsg(content)
+
+                        message_length = len(content)
+                        if message_length > 500:
+                            time.sleep(1)
+                        elif message_length > 100:
+                            time.sleep(0.5)
+                        else:
+                            time.sleep(0.2)
+
+                        self.log(f"✅ 快速发送成功")
+                        return True
                     else:
-                        time.sleep(0.2)
-                    
-                    self.log(f"✅ 消息发送成功")
-                    return True
-                else:
-                    if attempt < max_retries - 1:
-                        self.log(f"窗口切换失败，尝试重新搜索 ({attempt+1}/{max_retries})")
-                        if self._wait_or_stopped(0.2, stop_event):
-                            return False
-            
-            self.log(f"❌ 窗口切换失败，当前: {current_chat}，目标: {recipient}")
-            return False
-        except Exception as e:
-            self.log(f"❌ 发送消息失败: {e}")
-            return False
+                        self.log(f"当前窗口不正确({current_chat})，需要重新切换")
+
+                max_retries = 3
+                for attempt in range(max_retries):
+                    if self._stop_requested(stop_event):
+                        return False
+
+                    self.log(f"尝试切换窗口 ({attempt+1}/{max_retries}): {recipient}")
+                    switched = self._safe_chatwith(recipient, exact=False)
+                    if not switched:
+                        if allow_reconnect and self.reconnect(self.log):
+                            switched = self._safe_chatwith(recipient, exact=False)
+                    if not switched:
+                        # 切换直接失败（句柄坏）
+                        if attempt < max_retries - 1:
+                            if self._wait_or_stopped(0.2, stop_event):
+                                return False
+                        continue
+                    if self._wait_or_stopped(chat_delay, stop_event):
+                        return False
+
+                    ok, chatinfo = self._safe_chatinfo()
+                    if not ok:
+                        if allow_reconnect and self.reconnect(self.log):
+                            # 重连后重新 ChatWith 再读一次
+                            if self._safe_chatwith(recipient, exact=False):
+                                self._wait_or_stopped(chat_delay, stop_event)
+                                ok, chatinfo = self._safe_chatinfo()
+                    current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
+                    self.log(f"当前窗口: {current_chat}")
+
+                    if self._is_target_chat(current_chat, recipient):
+                        self.wx.SendMsg(content)
+
+                        message_length = len(content)
+                        if message_length > 500:
+                            self.log(f"消息较长({message_length}字符)，等待发送完成...")
+                            time.sleep(1)
+                        elif message_length > 100:
+                            time.sleep(0.5)
+                        else:
+                            time.sleep(0.2)
+
+                        self.log(f"✅ 消息发送成功")
+                        return True
+                    else:
+                        if attempt < max_retries - 1:
+                            self.log(f"窗口切换失败，尝试重新搜索 ({attempt+1}/{max_retries})")
+                            if self._wait_or_stopped(0.2, stop_event):
+                                return False
+
+                self.log(f"❌ 窗口切换失败，当前: {current_chat}，目标: {recipient}")
+                return False
+            except Exception as e:
+                self.log(f"❌ 发送消息失败: {e}")
+                return False
+
+        # 第一次尝试：失败若是句柄异常，会在内部 reconnect 一次；
+        # 第二次再失败就不再重连，避免"微信没登录"情况下无限重连。
+        current_chat = ""
+        ok = attempt_once(allow_reconnect=True)
+        if ok:
+            return True
+        return attempt_once(allow_reconnect=False)
 
     def send_file(
         self,
@@ -141,50 +274,80 @@ class WeChatSender:
         if not self.wx:
             if not self.initialize():
                 return False
-        
+
+        # 探活
+        if time.time() - self._last_healthy_ts > 60.0:
+            ok, _ = self._safe_chatinfo()
+            if not ok and not self.reconnect(self.log):
+                return False
+
         self.log(f"发送文件 {file_path} 给 {recipient}")
-        try:
-            if fast_mode:
-                if self._stop_requested(stop_event):
-                    return False
-                chatinfo = self.wx.ChatInfo()
-                current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
-                if self._is_target_chat(current_chat, recipient):
-                    self.wx.SendFiles(file_path)
-                    time.sleep(0.3)
-                    self.log(f"✅ 图片发送成功")
-                    return True
 
-            max_retries = 3
-            current_chat = ""
-            for attempt in range(max_retries):
-                if self._stop_requested(stop_event):
-                    return False
+        def attempt_once(allow_reconnect: bool) -> bool:
+            try:
+                if fast_mode:
+                    if self._stop_requested(stop_event):
+                        return False
+                    ok, chatinfo = self._safe_chatinfo()
+                    if not ok:
+                        if allow_reconnect and self.reconnect(self.log):
+                            ok, chatinfo = self._safe_chatinfo()
+                    if not ok:
+                        return False
+                    current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
+                    if self._is_target_chat(current_chat, recipient):
+                        self.wx.SendFiles(file_path)
+                        time.sleep(0.3)
+                        self.log(f"✅ 图片发送成功")
+                        return True
 
-                self.log(f"尝试切换窗口 ({attempt + 1}/{max_retries}): {recipient}")
-                self.wx.ChatWith(recipient, exact=False)
-                if self._wait_or_stopped(chat_delay, stop_event):
-                    return False
-
-                chatinfo = self.wx.ChatInfo()
-                current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
-                self.log(f"当前窗口: {current_chat}")
-                if self._is_target_chat(current_chat, recipient):
-                    self.wx.SendFiles(file_path)
-                    time.sleep(0.3)
-                    self.log(f"✅ 图片发送成功")
-                    return True
-
-                if attempt < max_retries - 1:
-                    self.log(f"窗口切换失败，尝试重新搜索 ({attempt + 1}/{max_retries})")
-                    if self._wait_or_stopped(0.2, stop_event):
+                max_retries = 3
+                current_chat = ""
+                for attempt in range(max_retries):
+                    if self._stop_requested(stop_event):
                         return False
 
-            self.log(f"❌ 窗口切换失败，当前: {current_chat}，目标: {recipient}")
-            return False
-        except Exception as e:
-            self.log(f"❌ 发送文件失败: {e}")
-            return False
+                    self.log(f"尝试切换窗口 ({attempt + 1}/{max_retries}): {recipient}")
+                    switched = self._safe_chatwith(recipient, exact=False)
+                    if not switched:
+                        if allow_reconnect and self.reconnect(self.log):
+                            switched = self._safe_chatwith(recipient, exact=False)
+                    if not switched:
+                        if attempt < max_retries - 1:
+                            if self._wait_or_stopped(0.2, stop_event):
+                                return False
+                        continue
+                    if self._wait_or_stopped(chat_delay, stop_event):
+                        return False
+
+                    ok, chatinfo = self._safe_chatinfo()
+                    if not ok:
+                        if allow_reconnect and self.reconnect(self.log):
+                            if self._safe_chatwith(recipient, exact=False):
+                                self._wait_or_stopped(chat_delay, stop_event)
+                                ok, chatinfo = self._safe_chatinfo()
+                    current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
+                    self.log(f"当前窗口: {current_chat}")
+                    if self._is_target_chat(current_chat, recipient):
+                        self.wx.SendFiles(file_path)
+                        time.sleep(0.3)
+                        self.log(f"✅ 图片发送成功")
+                        return True
+
+                    if attempt < max_retries - 1:
+                        self.log(f"窗口切换失败，尝试重新搜索 ({attempt + 1}/{max_retries})")
+                        if self._wait_or_stopped(0.2, stop_event):
+                            return False
+
+                self.log(f"❌ 窗口切换失败，当前: {current_chat}，目标: {recipient}")
+                return False
+            except Exception as e:
+                self.log(f"❌ 发送文件失败: {e}")
+                return False
+
+        if attempt_once(allow_reconnect=True):
+            return True
+        return attempt_once(allow_reconnect=False)
 
     @classmethod
     def get_temp_image_dir(cls):

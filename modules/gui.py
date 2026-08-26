@@ -1,22 +1,32 @@
 import sys
 import os
 import threading
+from typing import List, Optional, Set, Dict, Tuple, Any
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QTextEdit,
     QComboBox, QListWidget, QListWidgetItem, QGroupBox,
-    QCheckBox, QProgressBar, QMessageBox, QSplitter,
+    QCheckBox, QProgressBar, QMessageBox, QSplitter, QTabWidget,
     QDoubleSpinBox, QDialog, QDialogButtonBox, QFileDialog,
-    QMenu, QStyle, QSystemTrayIcon
+    QMenu, QStyle, QSystemTrayIcon, QSpinBox, QTimeEdit
 )
 from PyQt6.QtCore import (
-    Qt, pyqtSignal, QObject, QThread, QTimer, QLockFile, QStandardPaths
+    Qt, pyqtSignal, QObject, QThread, QTimer, QLockFile, QStandardPaths,
+    QTime
 )
 from PyQt6.QtGui import QAction, QFont, QIcon
 
 from modules.config_manager import ConfigError, ConfigManager
 from modules.wechat_sender import WeChatSender
 from modules.table_processor import TableProcessor
+from modules.schedule_manager import (
+    ScheduleStore,
+    ScheduleDispatcher,
+    ScheduleTask,
+    _new_task_id,
+    _normalize_time,
+    WEEKDAY_NAMES,
+)
 
 
 APP_TITLE = "表格自动发送By春风予Lu"
@@ -223,15 +233,22 @@ class SendWorker(QThread):
         try:
             self.tasks = [self._normalize_task(task) for task in self.tasks]
             self.signals.log.emit("初始化微信客户端...")
-            sender = WeChatSender()
+            sender = WeChatSender.shared_instance()
             sender.cleanup_temp_images()
             if not sender.initialize():
+                # 单例失败不影响下次，清空让后续尝试重新 new WeChat
+                WeChatSender.reset_shared_instance()
                 self.signals.error.emit("微信未登录或未打开")
                 failed_tasks = list(self.tasks)
                 self.signals.result.emit((0, total_count, total_count, failed_tasks))
                 result_emitted = True
                 return
             self.signals.log.emit("微信客户端初始化成功")
+            # 让 sender.log 通过信号线程安全地回写到 GUI 日志
+            try:
+                sender.log = lambda m: self.signals.log.emit(str(m))
+            except Exception:
+                pass
             
             for i, task in enumerate(self.tasks):
                 if self.stopped_event.is_set():
@@ -390,6 +407,102 @@ class SendWorker(QThread):
 
     def is_stopped(self):
         return self.stopped_event.is_set()
+
+
+class ScheduleSendWorker(QThread):
+    """定时消息发送 Worker：为多个接收人逐条发送自定义文字，含3次重试+模糊匹配。"""
+
+    finished_with_result = pyqtSignal(int, int, list)  # success, failed, failed_recipients
+
+    def __init__(
+        self,
+        recipients,
+        message,
+        chat_delay=0.3,
+        send_interval=0.5,
+        log_callback=None,
+    ):
+        super().__init__()
+        self.recipients = list(recipients or [])
+        self.message = message or ""
+        self.chat_delay = max(0.0, min(10.0, float(chat_delay)))
+        self.send_interval = max(0.0, min(30.0, float(send_interval)))
+        self._log_cb = log_callback
+        self.stopped_event = threading.Event()
+        self._sender = None
+        self._first_send = True
+
+    def stop(self):
+        self.stopped_event.set()
+
+    def log(self, msg):
+        if self._log_cb:
+            try:
+                self._log_cb(msg)
+            except Exception:
+                pass
+
+    def run(self):
+        success = 0
+        failed_recipients = []
+        if not self.message.strip():
+            self.log("[定时] 消息为空，跳过发送")
+            self.finished_with_result.emit(0, len(self.recipients), list(self.recipients))
+            return
+        if not self.recipients:
+            self.log("[定时] 接收人为空，跳过发送")
+            self.finished_with_result.emit(0, 0, [])
+            return
+        self.log("[定时] 初始化微信客户端...")
+        try:
+            self._sender = WeChatSender.shared_instance()
+            # 复用现有日志通道
+            if self._log_cb:
+                try:
+                    self._sender.log = lambda m: self._log_cb(m)
+                except Exception:
+                    pass
+            if not self._sender.initialize():
+                WeChatSender.reset_shared_instance()
+                self.log("[定时] 微信初始化失败，本次任务失败")
+                self.finished_with_result.emit(0, len(self.recipients), list(self.recipients))
+                return
+            self.log("[定时] 微信客户端初始化成功")
+        except Exception as exc:
+            self.log(f"[定时] 初始化异常: {exc}")
+            WeChatSender.reset_shared_instance()
+            self.finished_with_result.emit(0, len(self.recipients), list(self.recipients))
+            return
+
+        total = len(self.recipients)
+        for idx, recipient in enumerate(self.recipients):
+            if self.stopped_event.is_set():
+                self.log("[定时] 已手动停止")
+                failed_recipients.extend(self.recipients[idx:])
+                break
+            if idx > 0 and self.send_interval > 0:
+                if self.stopped_event.wait(self.send_interval):
+                    failed_recipients.extend(self.recipients[idx:])
+                    break
+            recipient = str(recipient).strip()
+            if not recipient:
+                continue
+            self.log(f"[定时] [{idx+1}/{total}] 发送到 {recipient}")
+            ok = self._sender.send_message(
+                content=self.message,
+                recipient=recipient,
+                first_send=self._first_send,
+                chat_delay=self.chat_delay,
+                fast_mode=False,
+                stop_event=self.stopped_event,
+            )
+            self._first_send = False
+            if ok:
+                success += 1
+            else:
+                failed_recipients.append(recipient)
+                self.log(f"[定时] ✗ 发送失败: {recipient}")
+        self.finished_with_result.emit(success, len(failed_recipients), failed_recipients)
 
 
 class TableFilterTab(QWidget):
@@ -1385,14 +1498,10 @@ class TableFilterTab(QWidget):
         self.log_text.append(message)
         self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
         
-        max_lines = 500
-        if self.log_text.document().blockCount() > max_lines:
-            cursor = self.log_text.textCursor()
-            cursor.movePosition(cursor.MoveOperation.Start)
-            cursor.movePosition(cursor.MoveOperation.NextBlock)
-            cursor.select(cursor.SelectionType.BlockUnderCursor)
-            cursor.removeSelectedText()
-            cursor.deleteChar()
+        # 用 QTextDocument 原生上限做裁剪，CPU 比手动逐块删除更低
+        if not hasattr(self, "_log_max_lines_applied"):
+            self.log_text.document().setMaximumBlockCount(1200)
+            self._log_max_lines_applied = True
 
     def send_data(self):
         selected_items = self.persons_list.selectedItems()
@@ -1640,6 +1749,583 @@ class MultiSelectDialog(QDialog):
         super().accept()
 
 
+class ScheduleTab(QWidget):
+    """定时发送标签页：任务列表、编辑表单、保存/加载配置、手动立即发送。"""
+
+    def __init__(self, store: ScheduleStore, dispatcher: ScheduleDispatcher, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.dispatcher = dispatcher
+        self.tasks: Dict[str, ScheduleTask] = {}
+        self.current_task_id: Optional[str] = None
+        self.send_worker: Optional[ScheduleSendWorker] = None
+        # 接收 MainWindow 的统一日志回调，外部赋值
+        self.log_callback = None
+        self.init_ui()
+        self.connect_signals()
+        self.reload_tasks()
+
+    # ----------------------------- UI -----------------------------
+    def init_ui(self):
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
+
+        # --- 左侧：任务列表 + 通用按钮 ---
+        left_group = QGroupBox("定时任务列表")
+        left_layout = QVBoxLayout(left_group)
+
+        self.task_list = QListWidget()
+        self.task_list.setMinimumWidth(240)
+        left_layout.addWidget(self.task_list)
+
+        left_btn1 = QHBoxLayout()
+        self.add_task_btn = QPushButton("新建任务")
+        self.clone_task_btn = QPushButton("复制任务")
+        self.delete_task_btn = QPushButton("删除任务")
+        left_btn1.addWidget(self.add_task_btn)
+        left_btn1.addWidget(self.clone_task_btn)
+        left_btn1.addWidget(self.delete_task_btn)
+        left_layout.addLayout(left_btn1)
+
+        left_btn2 = QHBoxLayout()
+        self.save_all_btn = QPushButton("保存为定时配置")
+        self.load_config_btn = QPushButton("加载定时配置")
+        left_btn2.addWidget(self.save_all_btn)
+        left_btn2.addWidget(self.load_config_btn)
+        left_layout.addLayout(left_btn2)
+
+        left_btn3 = QHBoxLayout()
+        self.run_now_btn = QPushButton("立即执行所选任务")
+        self.stop_send_btn = QPushButton("停止当前发送")
+        self.stop_send_btn.setEnabled(False)
+        left_btn3.addWidget(self.run_now_btn)
+        left_btn3.addWidget(self.stop_send_btn)
+        left_layout.addLayout(left_btn3)
+
+        self.dispatcher_status_label = QLabel("调度器状态: 未启动")
+        self.dispatcher_status_label.setStyleSheet("color:#666; font-size:11px;")
+        left_layout.addWidget(self.dispatcher_status_label)
+
+        left_layout.addStretch()
+        main_layout.addWidget(left_group, 0)
+
+        # --- 右侧：编辑表单 ---
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+
+        # 基本
+        base_group = QGroupBox("任务基础")
+        base_layout = QVBoxLayout(base_group)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("任务名称:"))
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("例如：周一早会提醒")
+        row.addWidget(self.name_edit, 1)
+        self.enabled_check = QCheckBox("启用")
+        self.enabled_check.setChecked(True)
+        row.addWidget(self.enabled_check)
+        base_layout.addLayout(row)
+        right_layout.addWidget(base_group)
+
+        # 重复规则
+        repeat_group = QGroupBox("重复规则")
+        repeat_layout = QVBoxLayout(repeat_group)
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("模式:"))
+        self.repeat_mode_combo = QComboBox()
+        self.repeat_mode_combo.addItem("每天", "daily")
+        self.repeat_mode_combo.addItem("每周指定日期", "weekly")
+        row1.addWidget(self.repeat_mode_combo, 1)
+        repeat_layout.addLayout(row1)
+
+        self.weekday_group_box = QGroupBox("选择周几(每周模式生效):")
+        weekday_layout = QHBoxLayout(self.weekday_group_box)
+        self.weekday_checks: Dict[int, QCheckBox] = {}
+        for idx, name in enumerate(WEEKDAY_NAMES, start=1):
+            cb = QCheckBox(name)
+            self.weekday_checks[idx] = cb
+            weekday_layout.addWidget(cb)
+        repeat_layout.addWidget(self.weekday_group_box)
+        self._on_repeat_mode_changed(self.repeat_mode_combo.currentIndex())
+
+        time_group = QGroupBox("发送时间点(HH:MM)，点击右侧按钮新增/删除:")
+        time_layout = QVBoxLayout(time_group)
+        self.time_list = QListWidget()
+        self.time_list.setMaximumHeight(72)
+        time_layout.addWidget(self.time_list)
+        time_row = QHBoxLayout()
+        self.time_edit = QTimeEdit()
+        self.time_edit.setDisplayFormat("HH:mm")
+        self.time_edit.setTime(QTime(9, 0))
+        time_row.addWidget(self.time_edit)
+        self.add_time_btn = QPushButton("添加")
+        self.del_time_btn = QPushButton("删除选中")
+        time_row.addWidget(self.add_time_btn)
+        time_row.addWidget(self.del_time_btn)
+        time_layout.addLayout(time_row)
+        repeat_layout.addWidget(time_group)
+        right_layout.addWidget(repeat_group)
+
+        # 发送内容
+        send_group = QGroupBox("发送内容")
+        send_layout = QVBoxLayout(send_group)
+
+        send_layout.addWidget(QLabel("接收人(好友/群名，支持模糊匹配，每行一个或英文逗号分隔):"))
+        self.recipients_edit = QTextEdit()
+        self.recipients_edit.setMaximumHeight(70)
+        self.recipients_edit.setPlaceholderText("张三\n文件传输助手\n工作群A")
+        send_layout.addWidget(self.recipients_edit)
+
+        send_layout.addWidget(QLabel("自定义文字消息:"))
+        self.message_edit = QTextEdit()
+        self.message_edit.setMinimumHeight(110)
+        self.message_edit.setPlaceholderText("早安！今天记得填写日报。")
+        send_layout.addWidget(self.message_edit)
+
+        delay_row = QHBoxLayout()
+        delay_row.addWidget(QLabel("聊天窗口切换延迟(秒):"))
+        self.chat_delay_spin = QDoubleSpinBox()
+        self.chat_delay_spin.setRange(0.0, 10.0)
+        self.chat_delay_spin.setSingleStep(0.1)
+        self.chat_delay_spin.setValue(0.3)
+        delay_row.addWidget(self.chat_delay_spin)
+        delay_row.addWidget(QLabel("每人发送间隔(秒):"))
+        self.send_interval_spin = QDoubleSpinBox()
+        self.send_interval_spin.setRange(0.0, 30.0)
+        self.send_interval_spin.setSingleStep(0.1)
+        self.send_interval_spin.setValue(0.5)
+        delay_row.addWidget(self.send_interval_spin)
+        delay_row.addStretch()
+        send_layout.addLayout(delay_row)
+
+        right_layout.addWidget(send_group)
+
+        # 操作区 + 保存
+        action_row = QHBoxLayout()
+        self.save_task_btn = QPushButton("💾 保存当前任务")
+        self.save_task_btn.setStyleSheet(
+            "background-color:#2196F3; color:white; padding:6px;"
+        )
+        self.reset_form_btn = QPushButton("重置表单")
+        action_row.addWidget(self.save_task_btn)
+        action_row.addWidget(self.reset_form_btn)
+        action_row.addStretch()
+        right_layout.addLayout(action_row)
+
+        # 日志（共享主日志的回调，这里也放只读面板，方便查看）
+        log_group = QGroupBox("定时发送日志")
+        log_layout = QVBoxLayout(log_group)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMinimumHeight(140)
+        log_layout.addWidget(self.log_text)
+        right_layout.addWidget(log_group, 1)
+
+        main_layout.addWidget(right, 1)
+
+    # ------------------------- 信号绑定 -------------------------
+    def connect_signals(self):
+        self.task_list.currentItemChanged.connect(self._on_task_selected)
+        self.task_list.itemChanged.connect(self._on_task_item_changed)
+        self.add_task_btn.clicked.connect(self._on_new_task)
+        self.clone_task_btn.clicked.connect(self._on_clone_task)
+        self.delete_task_btn.clicked.connect(self._on_delete_task)
+        self.save_task_btn.clicked.connect(self._on_save_current_task)
+        self.reset_form_btn.clicked.connect(self._reset_form)
+        self.add_time_btn.clicked.connect(self._on_add_time)
+        self.del_time_btn.clicked.connect(self._on_del_time)
+        self.repeat_mode_combo.currentIndexChanged.connect(self._on_repeat_mode_changed)
+        self.save_all_btn.clicked.connect(self._on_save_all)
+        self.load_config_btn.clicked.connect(self._on_load_all)
+        self.run_now_btn.clicked.connect(self._on_run_now)
+        self.stop_send_btn.clicked.connect(self._on_stop_send)
+
+    # ------------------------- 日志 -------------------------
+    # 最大日志行数（交给 QTextDocument 原生裁剪，CPU/内存都更省）
+    _MAX_LOG_LINES = 1200
+
+    def log(self, message: str) -> None:
+        # 本地追加
+        if hasattr(self, "log_text") and self.log_text is not None:
+            from datetime import datetime
+            ts = datetime.now().strftime("%H:%M:%S")
+            self.log_text.append(f"[{ts}] {message}")
+            # 只设置一次即可，后续由 QTextDocument 原生自动裁剪
+            if not getattr(self, "_log_max_applied", False):
+                self.log_text.document().setMaximumBlockCount(self._MAX_LOG_LINES)
+                self._log_max_applied = True
+        # 同时推送给 MainWindow，用于主界面统一日志面板
+        if self.log_callback:
+            try:
+                self.log_callback(message)
+            except Exception:
+                pass
+
+    # ------------------------- 任务列表 -------------------------
+    def reload_tasks(self):
+        self.task_list.blockSignals(True)
+        self.task_list.clear()
+        tasks = self.store.load_all()
+        self.tasks = {t.id: t for t in tasks}
+        for t in tasks:
+            item = QListWidgetItem(self._format_task_label(t))
+            item.setData(Qt.ItemDataRole.UserRole, t.id)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if t.enabled else Qt.CheckState.Unchecked
+            )
+            self.task_list.addItem(item)
+        self.task_list.blockSignals(False)
+        if tasks:
+            self.task_list.setCurrentRow(0)
+        else:
+            self._reset_form()
+
+    def _format_task_label(self, task: ScheduleTask) -> str:
+        mark = "●" if task.enabled else "○"
+        if task.repeat_mode == "daily":
+            rule = "每天"
+        else:
+            days = ",".join(WEEKDAY_NAMES[d - 1] for d in task.days) if task.days else "未选"
+            rule = f"每周: {days}"
+        times = "、".join(task.times) if task.times else "(无时间点)"
+        count = len(task.recipients)
+        return f"{mark} {task.name}  | {rule} | {times} | 人数:{count}"
+
+    def _current_task_id_from_list(self) -> Optional[str]:
+        item = self.task_list.currentItem()
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def _on_task_selected(self, current, previous):
+        tid = None
+        if current:
+            tid = current.data(Qt.ItemDataRole.UserRole)
+        if not tid or tid not in self.tasks:
+            self.current_task_id = None
+            return
+        self.current_task_id = tid
+        self._load_task_to_form(self.tasks[tid])
+
+    def _on_task_item_changed(self, item):
+        tid = item.data(Qt.ItemDataRole.UserRole)
+        if not tid:
+            return
+        task = self.tasks.get(tid)
+        if not task:
+            return
+        new_enabled = item.checkState() == Qt.CheckState.Checked
+        if task.enabled == new_enabled:
+            return
+        task.enabled = new_enabled
+        self.store.save(task)
+        self.tasks[tid] = task
+        self.task_list.blockSignals(True)
+        try:
+            item.setText(self._format_task_label(task))
+        finally:
+            self.task_list.blockSignals(False)
+        self.log(f"[定时] {task.name} 已{'启用' if new_enabled else '禁用'}")
+
+    def _load_task_to_form(self, task: ScheduleTask):
+        self.name_edit.setText(task.name)
+        self.enabled_check.setChecked(task.enabled)
+        idx = 0 if task.repeat_mode == "daily" else 1
+        self.repeat_mode_combo.setCurrentIndex(idx)
+        for d, cb in self.weekday_checks.items():
+            cb.setChecked(d in set(task.days))
+        self.time_list.clear()
+        for slot in task.times:
+            self.time_list.addItem(slot)
+        self.recipients_edit.setPlainText("\n".join(task.recipients))
+        self.message_edit.setPlainText(task.message)
+        self.chat_delay_spin.setValue(task.chat_delay)
+        self.send_interval_spin.setValue(task.send_interval)
+        self._on_repeat_mode_changed(idx)
+
+    def _reset_form(self):
+        self.current_task_id = None
+        self.name_edit.clear()
+        self.enabled_check.setChecked(True)
+        self.repeat_mode_combo.setCurrentIndex(0)
+        for cb in self.weekday_checks.values():
+            cb.setChecked(False)
+        self.time_list.clear()
+        self.time_edit.setTime(QTime(9, 0))
+        self.recipients_edit.clear()
+        self.message_edit.clear()
+        self.chat_delay_spin.setValue(0.3)
+        self.send_interval_spin.setValue(0.5)
+
+    # ------------------------- 增删改 -------------------------
+    def _on_new_task(self):
+        self._reset_form()
+        self.name_edit.setFocus()
+
+    def _on_clone_task(self):
+        task = self._form_to_task(new_id=True)
+        task.name = f"{task.name} - 副本"
+        self.store.save(task)
+        self.reload_tasks()
+        self._select_task_by_id(task.id)
+        self.log(f"[定时] 已复制任务: {task.name}")
+
+    def _on_delete_task(self):
+        tid = self._current_task_id_from_list()
+        if not tid:
+            QMessageBox.information(self, "提示", "请先选择要删除的任务")
+            return
+        task = self.tasks.get(tid)
+        name = task.name if task else tid
+        ans = QMessageBox.question(
+            self,
+            "删除确认",
+            f"确定要删除任务「{name}」吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        if self.store.delete(tid):
+            self.log(f"[定时] 已删除任务: {name}")
+            self.reload_tasks()
+
+    def _on_save_current_task(self):
+        try:
+            task = self._form_to_task(new_id=self.current_task_id is None)
+        except ValueError as exc:
+            QMessageBox.warning(self, "任务信息不完整", str(exc))
+            return
+        if self.current_task_id:
+            task.id = self.current_task_id
+        self.store.save(task)
+        self.current_task_id = task.id
+        self.log(f"[定时] 已保存任务: {task.name}")
+        self.reload_tasks()
+        self._select_task_by_id(task.id)
+
+    def _select_task_by_id(self, task_id):
+        for i in range(self.task_list.count()):
+            item = self.task_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == task_id:
+                self.task_list.setCurrentRow(i)
+                return
+
+    def _form_to_task(self, new_id: bool = True) -> ScheduleTask:
+        name = self.name_edit.text().strip() or "未命名任务"
+        repeat_mode = self.repeat_mode_combo.currentData()
+        days: List[int] = []
+        if repeat_mode == "weekly":
+            days = sorted([d for d, cb in self.weekday_checks.items() if cb.isChecked()])
+            if not days:
+                raise ValueError("每周模式请至少选择一个周几")
+        times: List[str] = []
+        for i in range(self.time_list.count()):
+            slot = _normalize_time(self.time_list.item(i).text())
+            if slot and slot not in times:
+                times.append(slot)
+        if not times:
+            raise ValueError("请至少添加一个发送时间点")
+        recipients_raw = self.recipients_edit.toPlainText()
+        recipients = _parse_recipients(recipients_raw)
+        if not recipients:
+            raise ValueError("请至少填写一个接收人(好友名/群名)")
+        message = self.message_edit.toPlainText()
+        if not message.strip():
+            raise ValueError("请填写自定义文字消息")
+        task = ScheduleTask(
+            id=_new_task_id() if new_id else (self.current_task_id or _new_task_id()),
+            name=name,
+            enabled=self.enabled_check.isChecked(),
+            repeat_mode=repeat_mode,
+            days=days,
+            times=times,
+            recipients=recipients,
+            message=message,
+            chat_delay=float(self.chat_delay_spin.value()),
+            send_interval=float(self.send_interval_spin.value()),
+        )
+        return task
+
+    # ------------------------- 重复模式/时间点 -------------------------
+    def _on_repeat_mode_changed(self, index):
+        weekly = self.repeat_mode_combo.currentData() == "weekly"
+        self.weekday_group_box.setEnabled(weekly)
+
+    def _on_add_time(self):
+        t = self.time_edit.time().toString("HH:mm")
+        slot = _normalize_time(t)
+        if not slot:
+            return
+        for i in range(self.time_list.count()):
+            if self.time_list.item(i).text() == slot:
+                return
+        self.time_list.addItem(slot)
+
+    def _on_del_time(self):
+        for item in list(self.time_list.selectedItems()):
+            self.time_list.takeItem(self.time_list.row(item))
+
+    # ------------------------- 配置保存/加载（独立 JSON 文件）-------------------------
+    def _collect_all_tasks(self):
+        # 先把当前编辑中的任务表单保存到内存中再导出？不，只导出已保存的列表
+        return self.store.load_all()
+
+    def _on_save_all(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存定时发送配置",
+            os.path.join(os.path.expanduser("~"), "定时发送配置.json"),
+            "JSON 配置 (*.json)",
+        )
+        if not path:
+            return
+        tasks = self._collect_all_tasks()
+        data = {
+            "version": 1,
+            "type": "schedule_profile",
+            "saved_at": "",
+            "tasks": [t.to_dict() for t in tasks],
+        }
+        try:
+            from modules.schedule_manager import _write_json
+            from datetime import datetime
+            data["saved_at"] = datetime.now().isoformat(timespec="seconds")
+            _write_json(path, data)
+        except Exception as exc:
+            QMessageBox.critical(self, "保存失败", str(exc))
+            return
+        self.log(f"[定时] 配置已保存到: {path}")
+        QMessageBox.information(self, "保存成功", f"已保存 {len(tasks)} 个定时任务配置")
+
+    def _on_load_all(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "加载定时发送配置", "", "JSON 配置 (*.json)"
+        )
+        if not path:
+            return
+        try:
+            import json
+            with open(path, "r", encoding="utf-8") as fp:
+                raw = json.load(fp)
+            items = raw.get("tasks") if isinstance(raw, dict) else None
+            if not isinstance(items, list):
+                raise ValueError("配置文件中没有 tasks 列表")
+            loaded = [ScheduleTask.from_dict(it) for it in items]
+        except Exception as exc:
+            QMessageBox.critical(self, "加载失败", f"读取配置失败: {exc}")
+            return
+        ans = QMessageBox.question(
+            self,
+            "导入方式",
+            "是否覆盖现有定时任务？\n选择【是】=覆盖；【否】=追加。",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if ans == QMessageBox.StandardButton.Cancel:
+            return
+        overwrite = ans == QMessageBox.StandardButton.Yes
+        if overwrite:
+            for old in self.store.load_all():
+                self.store.delete(old.id)
+        for t in loaded:
+            # 避免 ID 冲突时覆盖，统一生成新 ID
+            t.id = _new_task_id()
+            self.store.save(t)
+        self.reload_tasks()
+        self.log(f"[定时] 已导入 {len(loaded)} 个任务配置: {os.path.basename(path)}")
+        QMessageBox.information(self, "导入成功", f"已导入 {len(loaded)} 个定时任务")
+
+    # ------------------------- 立即执行 -------------------------
+    def _on_run_now(self):
+        if self.send_worker and self.send_worker.isRunning():
+            QMessageBox.information(self, "提示", "已有定时发送正在进行中")
+            return
+        tid = self._current_task_id_from_list()
+        if not tid:
+            QMessageBox.information(self, "提示", "请先选择要执行的任务")
+            return
+        task = self.tasks.get(tid)
+        if not task:
+            return
+        # 保存当前表单到任务（保留用户临时修改）
+        try:
+            current = self._form_to_task(new_id=False)
+            current.id = task.id
+        except ValueError as exc:
+            QMessageBox.warning(self, "任务信息不完整", str(exc))
+            return
+
+        # 关键：ScheduleSendWorker 在子线程里调用 log_callback，不能直接碰 QWidget。
+        # 这里把日志投递切回主线程，避免跨线程访问控件导致的偶发崩溃/挂起。
+        worker = ScheduleSendWorker(
+            recipients=current.recipients,
+            message=current.message,
+            chat_delay=current.chat_delay,
+            send_interval=current.send_interval,
+            log_callback=self._post_log_from_worker,
+        )
+        worker.finished_with_result.connect(self._on_send_finished)
+        # 让 QThread 自动回收 C++ 对象，避免反复启动后 Qt 对象堆积
+        worker.finished.connect(lambda: self._cleanup_schedule_worker_after(worker))
+        self.send_worker = worker
+        self.stop_send_btn.setEnabled(True)
+        self.run_now_btn.setEnabled(False)
+        self.log(f"[定时] 手动立即执行任务: {current.name}")
+        worker.start()
+
+    def _post_log_from_worker(self, message: str):
+        # 从非 GUI 线程安全切换到主线程再写日志。
+        # 如果当前就在主线程，singleShot(0, ...) 也只是下一轮事件循环再执行，无副作用。
+        QTimer.singleShot(0, lambda m=message: self.log(m))
+
+    def _cleanup_schedule_worker_after(self, worker):
+        try:
+            if worker is self.send_worker:
+                # finished 之后已经 isRunning() == False，可以安全解除引用
+                self.send_worker = None
+        finally:
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+
+    def _on_stop_send(self):
+        if self.send_worker and self.send_worker.isRunning():
+            self.send_worker.stop()
+            self.log("[定时] 已请求停止当前发送")
+
+    def _on_send_finished(self, success: int, failed: int, failed_recipients: list):
+        self.stop_send_btn.setEnabled(False)
+        self.run_now_btn.setEnabled(True)
+        msg = f"[定时] 本轮完成，成功: {success}，失败: {failed}"
+        if failed_recipients:
+            msg += f"（{'、'.join(str(r) for r in failed_recipients[:5])}"
+            if len(failed_recipients) > 5:
+                msg += f"…等{len(failed_recipients)}人"
+            msg += "）"
+        self.log(msg)
+
+
+def _parse_recipients(text: str) -> List[str]:
+    recipients: List[str] = []
+    if not text:
+        return recipients
+    raw = str(text).replace("，", ",").replace(";", ",").replace("；", ",")
+    for line in raw.splitlines():
+        for part in line.split(","):
+            name = part.strip()
+            if name and name not in recipients:
+                recipients.append(name)
+    return recipients
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1649,13 +2335,114 @@ class MainWindow(QMainWindow):
         self._close_ready = False
         self._shutdown_poll_count = 0
         self._tray_hint_shown = False
-        
+
+        self.schedule_store = ScheduleStore()
+        self.schedule_dispatcher = ScheduleDispatcher(self.schedule_store)
+        self.schedule_dispatcher.add_log_handler(self._schedule_dispatch_log)
+        self.schedule_dispatcher.add_handler(self._on_schedule_triggered)
+        # 定时触发时并发串行化（避免同时多个任务抢微信窗口）
+        self._schedule_running_lock = threading.Lock()
+        self._schedule_worker = None
+
         self.init_ui()
         self.init_tray()
+        self.schedule_dispatcher.start()
+        self.schedule_tab.dispatcher_status_label.setText("调度器状态: 运行中")
 
     def init_ui(self):
         self.table_filter_tab = TableFilterTab()
-        self.setCentralWidget(self.table_filter_tab)
+        self.schedule_tab = ScheduleTab(self.schedule_store, self.schedule_dispatcher)
+        # 让 ScheduleTab 日志同时写入原表格发送主界面的日志面板，保持统一查看
+        self.schedule_tab.log_callback = self._schedule_log_to_main
+
+        self.tab_widget = QTabWidget()
+        self.tab_widget.addTab(self.table_filter_tab, "📊 数据发送")
+        self.tab_widget.addTab(self.schedule_tab, "⏰ 定时发送")
+        self.setCentralWidget(self.tab_widget)
+
+    def _schedule_log_to_main(self, message):
+        try:
+            self.table_filter_tab.log(message)
+        except Exception:
+            pass
+
+    def _schedule_dispatch_log(self, message):
+        try:
+            self.schedule_tab.log(message)
+        except Exception:
+            pass
+
+    def _on_schedule_triggered(self, task: ScheduleTask, slot: str):
+        # 如果已有定时发送在跑，跳过本轮，等待下一次也会重复（不过已被 mark_fired，
+        # 所以我们改为并发队列：同一时刻后续任务串行排队）
+        threading.Thread(
+            target=self._run_schedule_task_serialized,
+            args=(task, slot),
+            daemon=True,
+            name=f"ScheduleRun-{task.id[:8]}",
+        ).start()
+
+    def _run_schedule_task_serialized(self, task: ScheduleTask, slot: str):
+        with self._schedule_running_lock:
+            # 主线程读取 UI 可能还在变化，直接用 store 里的任务信息
+            worker = ScheduleSendWorker(
+                recipients=list(task.recipients),
+                message=task.message,
+                chat_delay=task.chat_delay,
+                send_interval=task.send_interval,
+                log_callback=self._post_schedule_log_from_worker,
+            )
+
+            finished = threading.Event()
+            result = {"success": 0, "failed": 0, "failed_list": []}
+
+            def on_finished(success, failed, failed_list):
+                result["success"] = success
+                result["failed"] = failed
+                result["failed_list"] = list(failed_list or [])
+                finished.set()
+
+            def start_worker():
+                self._schedule_worker = worker
+                # 一次性语义：结果回调 + 释放 QThread C++ 对象
+                worker.finished_with_result.connect(on_finished)
+                worker.finished.connect(
+                    lambda: self._cleanup_main_schedule_worker_after(worker)
+                )
+                worker.start()
+
+            # 切到主线程启动 QThread 子对象
+            QTimer.singleShot(0, start_worker)
+            total_timeout = max(60.0, 60.0 * (len(task.recipients) or 1) * 10.0)
+            total_timeout = min(total_timeout, 12 * 3600.0)
+            finished.wait(timeout=total_timeout)
+            self._post_schedule_log_from_worker(
+                f"[定时] 任务「{task.name}」时间点 {slot} 完成："
+                f"成功{result['success']}，失败{result['failed']}"
+            )
+
+    def _post_schedule_log_from_worker(self, message):
+        # 后台线程/调度线程统一切到主线程再写日志，避免跨线程操作 QWidget。
+        try:
+            QTimer.singleShot(0, lambda m=message: self._schedule_log_to_ui(m))
+        except Exception:
+            pass
+
+    def _cleanup_main_schedule_worker_after(self, worker):
+        try:
+            if worker is self._schedule_worker:
+                self._schedule_worker = None
+        finally:
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+
+    def _schedule_log_to_ui(self, message):
+        try:
+            self.schedule_tab.log(message)
+        except Exception:
+            pass
 
     def init_tray(self):
         self.tray_icon = QSystemTrayIcon(self)
@@ -1756,13 +2543,36 @@ class MainWindow(QMainWindow):
         if excel_worker and excel_worker.isRunning():
             excel_worker.stop()
 
+        schedule_worker = getattr(self, "_schedule_worker", None)
+        if schedule_worker and isinstance(schedule_worker, QThread):
+            try:
+                if schedule_worker.isRunning():
+                    schedule_worker.stop()
+            except Exception:
+                pass
+
+        dispatcher = getattr(self, "schedule_dispatcher", None)
+        if dispatcher is not None:
+            try:
+                dispatcher.stop()
+            except Exception:
+                pass
+
     def _has_running_workers(self):
         worker = self.table_filter_tab.worker
         excel_worker = self.table_filter_tab.excel_worker
-        return bool(
+        schedule_worker = getattr(self, "_schedule_worker", None)
+        running = bool(
             (worker and worker.isRunning())
             or (excel_worker and excel_worker.isRunning())
         )
+        if not running and schedule_worker is not None:
+            try:
+                if isinstance(schedule_worker, QThread) and schedule_worker.isRunning():
+                    running = True
+            except Exception:
+                pass
+        return running
 
     def _poll_worker_shutdown(self):
         if not self._closing_requested:
