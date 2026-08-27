@@ -156,26 +156,29 @@ class ExcelReadWorker(QThread):
             
             try:
                 from openpyxl import load_workbook
-                
+
                 wb = load_workbook(file_path, read_only=True, data_only=True)
                 try:
                     ws = wb[sheet_name]
                     data = []
                     for row in ws.iter_rows(values_only=True):
+                        # 保留原始 cell 类型（datetime.time/datetime 等），
+                        # 由 TableProcessor._format_cell_value 统一规范化显示
                         data.append([
-                            str(cell) if cell is not None else ""
+                            cell if cell is not None else ""
                             for cell in row
                         ])
                 finally:
                     wb.close()
-                
+
                 if len(data) > 0:
-                    headers = [h if str(h).strip() != "" else f"列{i+1}" for i, h in enumerate(data[0])]
+                    headers = [str(h) if h is not None else "" for h in data[0]]
+                    headers = [h if h.strip() != "" else f"列{i+1}" for i, h in enumerate(headers)]
                     self.signals.log.emit(f"表头(openpyxl): {headers}")
                     return headers, data
                 else:
                     raise Exception("Sheet为空")
-                    
+
             except Exception as e2:
                 raise Exception(f"openpyxl读取也失败: {e2}")
 

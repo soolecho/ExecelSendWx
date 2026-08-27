@@ -1,6 +1,42 @@
 import logging
+import datetime as _dt
 
 logger = logging.getLogger(__name__)
+
+
+# pandas 读取 Excel 时可能返回 Timestamp 对象；导入失败则按 datetime 处理
+try:
+    import pandas as _pd
+    _Timestamp = _pd.Timestamp
+except Exception:
+    _Timestamp = ()
+
+
+def _format_cell_value(value):
+    """规范化单元格值的字符串显示，特别是时间类型。
+
+    Excel 时间列经过 pandas/openpyxl 读取后，可能得到 datetime.time /
+    datetime.datetime / pandas.Timestamp 对象。默认 str() 会显示到秒甚至带
+    毫秒，但用户希望显示到分钟；秒非零时保留秒，方便核对。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        # 布尔值在 Python 中是 int 的子类，需先于 int 判断
+        return str(value)
+    if isinstance(value, _dt.time):
+        if value.second == 0 and value.microsecond == 0:
+            return value.strftime("%H:%M")
+        return value.strftime("%H:%M:%S")
+    if isinstance(value, _dt.datetime):
+        if value.second == 0 and value.microsecond == 0:
+            return value.strftime("%Y-%m-%d %H:%M")
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if _Timestamp and isinstance(value, _Timestamp):
+        if value.second == 0 and value.microsecond == 0:
+            return value.strftime("%Y-%m-%d %H:%M")
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)
 
 
 class FilterCondition:
@@ -163,11 +199,13 @@ class TableProcessor:
         
         result = []
         for i, (name, value) in enumerate(zip(column_names, row)):
+            # 规范化时间类型显示（datetime.time/Timestamp 显示到分钟，秒非零保留）
+            value_str = _format_cell_value(value)
             if column_indices is not None and i < len(column_indices):
-                result.append(f"{name}: {value}")
+                result.append(f"{name}: {value_str}")
             else:
-                result.append(f"{name}: {value}")
-        
+                result.append(f"{name}: {value_str}")
+
         return "\n".join(result)
 
     def get_person_table_data(self, name, name_column, extract_columns, conditions=None):

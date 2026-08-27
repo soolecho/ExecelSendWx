@@ -4,10 +4,44 @@ import os
 import tempfile
 import threading
 import time
+import datetime as _dt
 
 from PyQt6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter
 
 logger = logging.getLogger(__name__)
+
+
+# pandas 在某些路径下读取 Excel 会得到 Timestamp；导入失败时按 datetime 处理
+try:
+    import pandas as _pd
+    _Timestamp = _pd.Timestamp
+except Exception:
+    _Timestamp = ()
+
+
+def format_cell_value(value):
+    """规范化单元格值的字符串显示，特别是 datetime.time / datetime.datetime / pandas.Timestamp。
+    
+    pandas/openpyxl 读取 Excel 时间列时，可能得到 datetime.time 或 Timestamp 对象，
+    默认 str() 会显示到秒甚至带毫秒，但用户希望显示到分钟；如果秒非零则保留秒。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, _dt.time):
+        if value.second == 0 and value.microsecond == 0:
+            return value.strftime("%H:%M")
+        return value.strftime("%H:%M:%S")
+    if isinstance(value, _dt.datetime):
+        if value.second == 0 and value.microsecond == 0:
+            return value.strftime("%Y-%m-%d %H:%M")
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if _Timestamp and isinstance(value, _Timestamp):
+        if value.second == 0 and value.microsecond == 0:
+            return value.strftime("%Y-%m-%d %H:%M")
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)
 
 
 class WeChatSender:
@@ -50,8 +84,91 @@ class WeChatSender:
         recipient = str(recipient or "").strip()
         return bool(recipient and recipient in current_chat)
 
+    @staticmethod
+    def _activate_wechat_window(log_fn=None):
+        """在初始化 WeChat 句柄前激活微信主窗口。
+
+        微信窗口最小化到系统托盘时，wxauto4 找不到主窗口句柄，会导致
+        WeChatSender.initialize() 失败（定时任务最常见的失败原因）。
+        用 Win32 API 把微信主窗口恢复并置前，确保 wxauto4 能正常 attach。
+
+        新版微信 4.0 主窗口类名为 "Qt51514QWindowIcon"，标题为"微信"。
+        旧版微信 3.x 主窗口类名为 "WeChatMainWndForPC"。
+        """
+        try:
+            import win32gui
+            import win32con
+            import ctypes
+        except ImportError as exc:
+            if log_fn:
+                try:
+                    log_fn(f"⚠ win32gui 不可用，跳过微信窗口激活: {exc}")
+                except Exception:
+                    pass
+            return False
+
+        candidates = [
+            ("Qt51514QWindowIcon", "微信"),      # 微信 4.0 (Weixin.exe)
+            ("WeChatMainWndForPC", "微信"),      # 微信 3.x (WeChat.exe)
+        ]
+        hwnd = 0
+        for cls_name, title in candidates:
+            try:
+                hwnd = win32gui.FindWindow(cls_name, title)
+            except Exception:
+                hwnd = 0
+            if hwnd:
+                break
+
+        if not hwnd:
+            if log_fn:
+                try:
+                    log_fn("⚠ 未找到微信主窗口（微信可能未登录或未启动）")
+                except Exception:
+                    pass
+            return False
+
+        try:
+            was_visible = bool(win32gui.IsWindowVisible(hwnd))
+            was_minimized = False
+            if not was_visible:
+                # 从系统托盘恢复：SW_RESTORE=9
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                was_minimized = True
+            # 解除 Windows 前台锁定（SystemParametersInfo, SPI_SETFOREGROUNDLOCKTIMEOUT=0x2001）
+            try:
+                user32 = ctypes.windll.user32
+                user32.SystemParametersInfoW(0x2001, 0, 0, 0)
+            except Exception:
+                pass
+            # 置前；偶尔会因前台锁定抛 OSError，重试一次
+            for _ in range(2):
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                    break
+                except Exception:
+                    time.sleep(0.15)
+            # 给 wxauto 一点时间稳定 UIA 树
+            time.sleep(0.4)
+            if log_fn and was_minimized:
+                try:
+                    log_fn("✅ 已激活微信主窗口（之前最小化到托盘）")
+                except Exception:
+                    pass
+            return True
+        except Exception as exc:
+            if log_fn:
+                try:
+                    log_fn(f"⚠ 激活微信窗口失败: {exc}")
+                except Exception:
+                    pass
+            return False
+
     def initialize(self):
         logger.info("Initializing WeChat client...")
+        # 先激活微信主窗口，避免窗口最小化到托盘导致 wxauto 找不到句柄
+        # （这是定时任务"初始化微信失败"的主要根因）
+        self._activate_wechat_window(self.log)
         try:
             self.wx = WeChat(ads=False)
             # 读一次 nickname 确认句柄真实可用
@@ -408,7 +525,7 @@ class WeChatSender:
 
     def _create_table_images(self, table_data):
         headers = [
-            "" if value is None else str(value)
+            "" if value is None else format_cell_value(value)
             for value in table_data.get("headers", [])
         ]
         rows = table_data.get("rows", [])
@@ -419,7 +536,7 @@ class WeChatSender:
         normalized_rows = []
         for row in rows:
             values = [
-                "" if value is None else str(value)
+                "" if value is None else format_cell_value(value)
                 for value in list(row)[:column_count]
             ]
             values.extend([""] * (column_count - len(values)))
