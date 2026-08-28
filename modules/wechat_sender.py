@@ -168,6 +168,89 @@ class WeChatSender:
                     pass
             return False
 
+    @staticmethod
+    def _ensure_window_on_screen(log_fn=None) -> bool:
+        """发送失败重试前的兜底：若微信主窗口大部分在屏幕外/最小化，拉回主屏内。
+
+        窗口位置正常时不做任何操作（保持用户窗口原样，位置不影响发送——
+        UIA 定位基于控件实际屏幕坐标，窗口在屏幕哪个位置都能正常发送）。
+        但窗口一半以上移出屏幕/最小化时，控件坐标会落在屏幕外或不可见，
+        鼠标点击无效，这类失败只有纠正位置才能恢复，故仅在重试路径调用。
+        返回 True 表示做了纠正。
+        """
+        try:
+            import win32gui
+            import win32con
+            import win32api
+        except ImportError:
+            return False
+
+        candidates = [
+            ("Qt51514QWindowIcon", "微信"),      # 微信 4.0 (Weixin.exe)
+            ("WeChatMainWndForPC", "微信"),      # 微信 3.x (WeChat.exe)
+        ]
+        hwnd = 0
+        for cls_name, title in candidates:
+            try:
+                hwnd = win32gui.FindWindow(cls_name, title)
+            except Exception:
+                hwnd = 0
+            if hwnd:
+                break
+        if not hwnd:
+            return False
+
+        try:
+            fixed = False
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                fixed = True
+                if log_fn:
+                    try:
+                        log_fn("⚠ 微信窗口处于最小化，已恢复后重试")
+                    except Exception:
+                        pass
+
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            w, h = right - left, bottom - top
+            if w <= 0 or h <= 0:
+                return fixed
+
+            # 虚拟屏幕（所有显示器整体范围），GetSystemMetrics 索引 76-79
+            vx = win32api.GetSystemMetrics(76)
+            vy = win32api.GetSystemMetrics(77)
+            vw = win32api.GetSystemMetrics(78)
+            vh = win32api.GetSystemMetrics(79)
+
+            ix = max(0, min(right, vx + vw) - max(left, vx))
+            iy = max(0, min(bottom, vy + vh) - max(top, vy))
+            visible_ratio = (ix * iy) / float(w * h)
+
+            if visible_ratio < 0.5:
+                # 一半以上在屏幕外：保持原尺寸移到主屏工作区中央
+                mw = win32api.GetSystemMetrics(0)
+                mh = win32api.GetSystemMetrics(1)
+                nx = max(0, (mw - w) // 2)
+                ny = max(0, (mh - h) // 2)
+                win32gui.MoveWindow(hwnd, nx, ny, w, h, True)
+                fixed = True
+                if log_fn:
+                    try:
+                        log_fn(
+                            f"⚠ 微信窗口大部分在屏幕外(可见{int(visible_ratio * 100)}%)，"
+                            f"已自动移回屏幕中央后重试"
+                        )
+                    except Exception:
+                        pass
+            return fixed
+        except Exception as exc:
+            if log_fn:
+                try:
+                    log_fn(f"⚠ 检查微信窗口位置失败: {exc}")
+                except Exception:
+                    pass
+            return False
+
     def initialize(self):
         logger.info("Initializing WeChat client...")
         # 先激活微信主窗口，避免窗口最小化到托盘导致 wxauto 找不到句柄
@@ -432,6 +515,8 @@ class WeChatSender:
                     if not switched:
                         # 切换直接失败（句柄坏）
                         if attempt < max_retries - 1:
+                            # 兜底：窗口若移出屏幕/最小化，ChatWith 点击会无效
+                            self._ensure_window_on_screen(self.log)
                             if self._wait_or_stopped(0.2, stop_event):
                                 return False
                         continue
@@ -468,6 +553,8 @@ class WeChatSender:
                             # ChatWith 可能点到了搜索下拉（视频号/搜一搜入口），
                             # 先恢复主界面再重试，避免在错误页面上连环失败
                             self._press_esc_on_wechat()
+                            # 兜底：窗口若移出屏幕/最小化，重试仍会点击无效
+                            self._ensure_window_on_screen(self.log)
                             if self._wait_or_stopped(0.2, stop_event):
                                 return False
 
@@ -483,6 +570,8 @@ class WeChatSender:
         ok = attempt_once(allow_reconnect=True)
         if ok:
             return True
+        # 第二次整体重试前：最后兜底检查窗口位置（移出屏幕/最小化则纠正）
+        self._ensure_window_on_screen(self.log)
         return attempt_once(allow_reconnect=False)
 
     def send_file(
@@ -539,6 +628,8 @@ class WeChatSender:
                             switched = self._safe_chatwith(recipient, exact=False)
                     if not switched:
                         if attempt < max_retries - 1:
+                            # 兜底：窗口若移出屏幕/最小化，ChatWith 点击会无效
+                            self._ensure_window_on_screen(self.log)
                             if self._wait_or_stopped(0.2, stop_event):
                                 return False
                         continue
@@ -564,6 +655,8 @@ class WeChatSender:
                         # ChatWith 可能点到了搜索下拉（视频号/搜一搜入口），
                         # 先恢复主界面再重试
                         self._press_esc_on_wechat()
+                        # 兜底：窗口若移出屏幕/最小化，重试仍会点击无效
+                        self._ensure_window_on_screen(self.log)
                         if self._wait_or_stopped(0.2, stop_event):
                             return False
 
