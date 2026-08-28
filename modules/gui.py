@@ -2669,6 +2669,8 @@ def _parse_recipients(text: str) -> List[str]:
 class MainWindow(QMainWindow):
     # 跨线程日志投递：子线程 emit -> 主线程 slot 写 UI
     _schedule_log_signal = pyqtSignal(str)
+    # 跨线程触发投递：调度器线程 emit -> 主线程创建 QThread（确保 affinity 正确）
+    _schedule_trigger_signal = pyqtSignal(object, str)
 
     def __init__(self):
         super().__init__()
@@ -2690,6 +2692,7 @@ class MainWindow(QMainWindow):
         # 关键：跨线程日志用 pyqtSignal 投递，不能用 QTimer.singleShot(0,...)
         # 因为子线程没有 Qt event loop，singleShot 永远不会触发
         self._schedule_log_signal.connect(self._on_schedule_log_signal)
+        self._schedule_trigger_signal.connect(self._on_schedule_trigger_in_main)
 
         # 电脑锁定守护：阻止定时发送期间电脑自动锁定，任务完成后自动锁回
         self.workstation_guard = WorkstationGuard(
@@ -2726,16 +2729,32 @@ class MainWindow(QMainWindow):
         self._post_schedule_log_from_worker(message)
 
     def _on_schedule_triggered(self, task: ScheduleTask, slot: str):
-        # 如果已有定时发送在跑，跳过本轮，等待下一次也会重复（不过已被 mark_fired，
-        # 所以我们改为并发队列：同一时刻后续任务串行排队）
+        # 调度器在子线程触发，通过信号投递到主线程创建 QThread。
+        # 关键：QThread 对象必须在主线程创建（affinity = 主线程），
+        # 否则 finished 信号和 deleteLater 无法被主线程事件循环处理，
+        # 导致 QThread C++ 资源泄漏甚至主线程事件循环卡死。
+        self._schedule_trigger_signal.emit(task, slot)
+
+    def _on_schedule_trigger_in_main(self, task: ScheduleTask, slot: str):
+        """主线程 slot：创建 ScheduleSendWorker（affinity = 主线程），再交给 ScheduleRun 线程执行。"""
+        worker = ScheduleSendWorker(
+            recipients=list(task.recipients),
+            message=task.message,
+            chat_delay=task.chat_delay,
+            send_interval=task.send_interval,
+            log_callback=self._post_schedule_log_from_worker,
+            default_city=task.default_city,
+            minimize_after=getattr(task, "minimize_after", True),
+        )
+        self._schedule_worker = worker
         threading.Thread(
             target=self._run_schedule_task_serialized,
-            args=(task, slot),
+            args=(task, slot, worker),
             daemon=True,
             name=f"ScheduleRun-{task.id[:8]}",
         ).start()
 
-    def _run_schedule_task_serialized(self, task: ScheduleTask, slot: str):
+    def _run_schedule_task_serialized(self, task: ScheduleTask, slot: str, worker: "ScheduleSendWorker"):
         with self._schedule_running_lock:
             # 按任务配置启动防锁定守护
             if getattr(task, "keep_unlocked", False):
@@ -2747,15 +2766,7 @@ class MainWindow(QMainWindow):
             self._post_schedule_log_from_worker(
                 f"[定时] 开始执行任务「{task.name}」 时间点 {slot} 接收人数 {len(task.recipients)}"
             )
-            worker = ScheduleSendWorker(
-                recipients=list(task.recipients),
-                message=task.message,
-                chat_delay=task.chat_delay,
-                send_interval=task.send_interval,
-                log_callback=self._post_schedule_log_from_worker,
-                default_city=task.default_city,
-                minimize_after=getattr(task, "minimize_after", True),
-            )
+            # worker 已在主线程创建（affinity = 主线程），这里只负责启动和等待
 
             finished = threading.Event()
             result = {"success": 0, "failed": 0, "failed_list": []}
@@ -2771,18 +2782,18 @@ class MainWindow(QMainWindow):
                 result["failed_list"] = list(failed_list or [])
                 finished.set()
 
-            self._schedule_worker = worker
-            # 必须用 DirectConnection：
-            # 1) on_finished 只做 dict 赋值 + Event.set()，不碰任何 GUI，
-            #    在 worker 线程内同步执行是安全的；
-            # 2) QueuedConnection 会把调用投递到"连接建立时所在线程"
-            #    （ScheduleRun 子线程）的事件队列，而该线程没有 Qt event loop，
-            #    排队的事件永远不会执行 → result 永远是 0/0，统计全错。
+            # finished_with_result 用 DirectConnection：
+            #   on_finished 只做 dict 赋值 + Event.set()，不碰 GUI，
+            #   在 worker 线程内同步执行，不依赖任何线程的事件循环。
             worker.finished_with_result.connect(
                 on_finished, Qt.ConnectionType.DirectConnection)
+            # finished 用默认连接（AutoConnection）：
+            #   worker affinity = 主线程 → emit 在 worker 线程，receiver 在主线程
+            #   → Qt 自动用 QueuedConnection → cleanup + deleteLater 在主线程事件循环执行。
+            #   不再使用 DirectConnection（在正在退出的 worker 线程里 deleteLater
+            #   是 Qt 明确警告的危险模式，会导致 QThread 内部状态混乱、主线程卡死）。
             worker.finished.connect(
-                lambda: self._cleanup_main_schedule_worker_after(worker),
-                Qt.ConnectionType.DirectConnection,
+                lambda: self._cleanup_main_schedule_worker_after(worker)
             )
             worker.start()
 
