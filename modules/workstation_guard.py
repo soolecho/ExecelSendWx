@@ -29,6 +29,22 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Win32 DLL 句柄：模块级预绑定，避免在子线程里用 ctypes.windll 动态查找。
+#   ctypes.windll 是惰性加载且会缓存失败状态，某些 Python 版本 / 沙箱里
+#   在守护线程内首次查函数会报 "function 'XXX' not found"，进程级预绑定最稳。
+#   另外：SetThreadExecutionState 属于 kernel32.dll，**不是** user32.dll，
+#   之前错写为 windll.user32.SetThreadExecutionState，偶发找不到就崩。
+# ---------------------------------------------------------------------------
+try:
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+except Exception as _exc:
+    logger.error("ctypes WinDLL 加载失败, 守护功能不可用: %s", _exc)
+    _user32 = None
+    _kernel32 = None
+
+
 # SetThreadExecutionState 标志
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
@@ -48,6 +64,17 @@ _RELOCK_WINDOW_SECONDS = 15 * 60
 
 _GPO_KEY_PATH = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
 _GPO_VALUE_NAME = "InactivityTimeoutSecs"
+
+
+def _call(fn, *args, default=None):
+    """以 try/except 调用 DLL 函数，失败返回 default，不抛异常。"""
+    if fn is None:
+        return default
+    try:
+        return fn(*args)
+    except Exception as exc:
+        logger.warning("Win32 API 调用失败 %s: %s", getattr(fn, "__name__", fn), exc)
+        return default
 
 
 def _base_dir() -> Path:
@@ -92,13 +119,14 @@ def is_workstation_locked() -> bool:
     锁定时输入桌面是 Winlogon，普通进程没有权限打开它；
     未锁定时 OpenInputDesktop 成功返回桌面句柄。
     """
+    if _user32 is None:
+        return False
     try:
-        user32 = ctypes.windll.user32
         # DESKTOP_SWITCHDESKTOP = 0x0100
-        hdesk = user32.OpenInputDesktop(0, False, 0x0100)
+        hdesk = _call(_user32.OpenInputDesktop, 0, False, 0x0100, default=None)
         if not hdesk:
             return True
-        user32.CloseDesktop(hdesk)
+        _call(_user32.CloseDesktop, hdesk)
         return False
     except Exception:
         # 探测失败按未锁定处理，避免误报
@@ -107,8 +135,10 @@ def is_workstation_locked() -> bool:
 
 def lock_workstation() -> bool:
     """锁定工作站，等价于按下 Win+L。"""
+    if _user32 is None:
+        return False
     try:
-        return bool(ctypes.windll.user32.LockWorkStation())
+        return bool(_call(_user32.LockWorkStation, default=0))
     except Exception as exc:
         logger.warning("LockWorkStation 失败: %s", exc)
         return False
@@ -144,18 +174,29 @@ def _write_inactivity_timeout(seconds) -> bool:
 
 
 def _spi_get_bool(spi_get):
+    if _user32 is None:
+        return None
     try:
         value = ctypes.c_int(0)
-        ok = ctypes.windll.user32.SystemParametersInfoW(spi_get, 0, ctypes.byref(value), 0)
+        ok = _call(
+            _user32.SystemParametersInfoW,
+            spi_get, 0, ctypes.byref(value), 0,
+            default=0,
+        )
         return bool(value.value) if ok else None
     except Exception:
         return None
 
 
 def _spi_set_bool(spi_set, value) -> bool:
+    if _user32 is None:
+        return False
     try:
-        ok = ctypes.windll.user32.SystemParametersInfoW(
-            spi_set, int(bool(value)), None, _SPIF_UPDATEINIFILE | _SPIF_SENDCHANGE
+        ok = _call(
+            _user32.SystemParametersInfoW,
+            spi_set, int(bool(value)), None,
+            _SPIF_UPDATEINIFILE | _SPIF_SENDCHANGE,
+            default=0,
         )
         return bool(ok)
     except Exception:
@@ -245,23 +286,24 @@ class WorkstationGuard:
 
     def _run(self) -> None:
         try:
-            user32 = ctypes.windll.user32
             self._snapshot_and_disable_lock_sources()
             while not self._stop_event.wait(self._poll_interval):
                 # SetThreadExecutionState 是线程级状态，由守护线程持续刷新。
+                # 注意：该 API 在 kernel32.dll（之前误写 user32 导致偶发 not found）。
                 # ES_DISPLAY_REQUIRED 防止屏幕熄灭/屏保启动（仅 ES_SYSTEM_REQUIRED
-                # 只防睡眠，不防屏保——这是"操作中也进屏保"的根因）
-                user32.SetThreadExecutionState(
-                    ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+                # 只防睡眠，不防屏保——这是"操作中也进屏保"的根因）。
+                _call(
+                    _kernel32.SetThreadExecutionState if _kernel32 else None,
+                    ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED,
                 )
                 # 屏保/策略可能被用户或其他程序改回，周期性重申
                 self._snapshot_and_disable_lock_sources()
         finally:
             # ES_CONTINUOUS 不带其它标志 = 清除本线程的阻止状态
-            try:
-                ctypes.windll.user32.SetThreadExecutionState(ES_CONTINUOUS)
-            except Exception:
-                pass
+            _call(
+                _kernel32.SetThreadExecutionState if _kernel32 else None,
+                ES_CONTINUOUS,
+            )
             self._restore_lock_sources()
 
     # ------------------------------------------------------------------
