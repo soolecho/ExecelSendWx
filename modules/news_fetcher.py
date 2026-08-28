@@ -12,6 +12,8 @@
 
 微博采用三级兜底源: 官方ajax -> 60s API(viki.moe) -> codelife(tophub聚合)。
 所有平台条目均带可点击链接 (微博为搜索页链接, 点开直接搜索)。
+微博链接保留中文原文（仅编码 # 等结构字符），约 40 字符，短且可读；
+浏览器/微信打开时会自动完成 percent-encode。
 内存缓存 5 分钟。失败时返回 None, 调用方保留原占位符不误发。
 """
 from __future__ import annotations
@@ -181,7 +183,18 @@ def _parse_hot_text(value) -> int:
 
 
 def _weibo_search_url(word: str) -> str:
-    return "https://s.weibo.com/weibo?q=" + urllib.parse.quote(f"#{word}#")
+    """构造微博搜索链接。
+
+    中文保留原文（浏览器/微信点击时会自动 percent-encode），
+    仅编码会破坏 URL 结构的字符（% # & ? + 空格）。
+    完全 percent-encode 会让链接超过 100 字符，在消息里非常难看；
+    保留中文后典型长度约 40 字符，短且可读。
+    """
+    w = str(word or "").strip()
+    for src, dst in (("%", "%25"), (" ", "%20"), ("#", "%23"),
+                     ("&", "%26"), ("?", "%3F"), ("+", "%2B")):
+        w = w.replace(src, dst)
+    return f"https://s.weibo.com/weibo?q=%23{w}%23"
 
 
 def fetch_weibo(limit: int = 10, log_fn=None) -> List[Dict]:
@@ -227,7 +240,7 @@ def fetch_weibo(limit: int = 10, log_fn=None) -> List[Dict]:
             items.append({
                 "title": title,
                 "hot": _parse_hot_text(x.get("hot_value")),
-                "url": x.get("link") or _weibo_search_url(title),
+                "url": _weibo_search_url(title),
             })
         if items:
             if log_fn:
@@ -249,7 +262,7 @@ def fetch_weibo(limit: int = 10, log_fn=None) -> List[Dict]:
             items.append({
                 "title": title,
                 "hot": _parse_hot_text(x.get("hotValue")),
-                "url": x.get("link") or _weibo_search_url(title),
+                "url": _weibo_search_url(title),
             })
         if items:
             if log_fn:
