@@ -174,7 +174,11 @@ class WeChatSender:
         # （这是定时任务"初始化微信失败"的主要根因）
         self._activate_wechat_window(self.log)
         try:
-            self.wx = WeChat(ads=False)
+            # resize=False：不让 wxauto4 自动把聊天窗口拉大到 800x6000 并移到屏幕左侧。
+            # 拉大窗口是为了显示更多消息提高 UIA 识别容错（主要影响读取消息功能），
+            # 本程序只用发送链路（搜索+输入框），不依赖大窗口；保持用户窗口原样不跳动。
+            # ads=False：关闭 wxauto4 启动时的广告横幅输出。
+            self.wx = WeChat(ads=False, resize=False)
             # 读一次 nickname 确认句柄真实可用
             _ = getattr(self.wx, "nickname", None)
             self._last_healthy_ts = time.time()
