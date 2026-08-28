@@ -132,10 +132,14 @@ def fetch_toutiao(limit: int = 10, log_fn=None) -> List[Dict]:
             hot = int(x.get("HotValue") or 0)
         except (TypeError, ValueError):
             hot = 0
+        raw_url = x.get("Url") or ""
+        # 头条 Url 字段常带 800+ 字符追踪参数（category_name/event_type/log_extra 等），
+        # 截断后仍能正常打开目标页面；一般能从 800 降到 50 字符左右。
+        short_url = _strip_heavy_query_params(raw_url)
         items.append({
             "title": title,
             "hot": hot,
-            "url": x.get("Url") or "",
+            "url": short_url,
         })
     return _normalize(items[:limit], "toutiao")
 
@@ -195,6 +199,39 @@ def _weibo_search_url(word: str) -> str:
                      ("&", "%26"), ("?", "%3F"), ("+", "%2B")):
         w = w.replace(src, dst)
     return f"https://s.weibo.com/weibo?q=%23{w}%23"
+
+
+def _strip_heavy_query_params(url: str) -> str:
+    """剥离 URL 的追踪/冗余 query 字符串，返回短链接。
+
+    头条 trending 链接的 query 多为 log_extra / event_type / a_bogus 等
+    点击埋点参数，总长达 800+ 字符，去掉后依然能正常打开目标页。
+    若 URL 本身没 query 或 query 很简短（<=40 字符），原样返回。
+    """
+    u = (url or "").strip()
+    if not u:
+        return u
+    # 保留 fragment（#hash），把路径到 query 切开
+    # scheme://host/path?query#fragment  -->  scheme://host/path  ? query  # fragment
+    hash_idx = u.find("#")
+    if hash_idx >= 0:
+        main_part = u[:hash_idx]
+        frag = u[hash_idx:]
+    else:
+        main_part = u
+        frag = ""
+
+    q_idx = main_part.find("?")
+    if q_idx < 0:
+        return u  # 无 query
+
+    base = main_part[:q_idx]
+    query = main_part[q_idx + 1:]
+    if len(query) <= 40:
+        return u  # 较短则保持原样（少数业务必需参数可能还在）
+
+    # query 超 40 字符：全部剥离（追踪参数占绝大多数，不影响页面打开）
+    return base + frag
 
 
 def fetch_weibo(limit: int = 10, log_fn=None) -> List[Dict]:
@@ -343,6 +380,10 @@ def format_items(items: List[Dict], platform: str = "weibo") -> str:
         lines.append(f"{it['rank']}. {it['title']}{hot_str}")
         url = (it.get("url") or "").strip()
         if url:
+            # 最后一层兜底：如果链接仍超过 80 字符（例如未来数据源变更），
+            # 再剥一次 query 参数（对头条/知乎/B 站等纯展示页面都能正常打开）。
+            if len(url) > 80:
+                url = _strip_heavy_query_params(url)
             lines.append(f"   🔗 {url}")
     return "\n".join(lines)
 
