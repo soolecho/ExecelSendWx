@@ -456,6 +456,11 @@ class SendWorker(QThread):
                 )
         finally:
             if sender:
+                # 整个发送任务结束后统一最小化微信窗口（隐私保护，任务级一次）
+                try:
+                    sender.minimize_window()
+                except Exception:
+                    pass
                 # 还原 sender.log，避免共享单例的 log 回调指向已销毁的 QThread 信号
                 try:
                     sender.log = _orig_sender_log
@@ -637,12 +642,18 @@ class ScheduleSendWorker(QThread):
                     failed_recipients.append(recipient)
                     self.log(f"[定时] ✗ 发送失败: {recipient}")
         finally:
-            # 还原 sender.log，避免共享单例的 log 回调指向已结束的 worker
-            if _orig_sender_log is not None and self._sender is not None:
+            if self._sender is not None:
+                # 整个定时任务结束后统一最小化微信窗口（任务级一次）
                 try:
-                    self._sender.log = _orig_sender_log
+                    self._sender.minimize_window()
                 except Exception:
                     pass
+                # 还原 sender.log，避免共享单例的 log 回调指向已结束的 worker
+                if _orig_sender_log is not None:
+                    try:
+                        self._sender.log = _orig_sender_log
+                    except Exception:
+                        pass
         self.finished_with_result.emit(success, len(failed_recipients), failed_recipients)
 
 
@@ -1416,7 +1427,11 @@ class TableFilterTab(QWidget):
         self.persons_list.clear()
         for person in persons:
             self.persons_list.addItem(person)
-        
+
+        # 列表重建会丢失选中项：只要还有人员就保持"开始发送"可点击，
+        # 未选中人员时点击会弹提示，避免禁用按钮导致"点击毫无反应"
+        self.start_send_btn.setEnabled(self.persons_list.count() > 0)
+
         self.log(f"筛选后找到 {len(persons)} 个人")
 
     def on_person_selection(self):
@@ -1427,7 +1442,8 @@ class TableFilterTab(QWidget):
             self.preview_selected_data()
         else:
             self.send_btn.setEnabled(False)
-            self.start_send_btn.setEnabled(False)
+            # 列表还有人员时保持"开始发送"可点击（未选中时点击会弹提示）
+            self.start_send_btn.setEnabled(self.persons_list.count() > 0)
 
     def preview_selected_data(self):
         if not self.processor:
@@ -1893,12 +1909,17 @@ class MultiSelectDialog(QDialog):
 class ScheduleTab(QWidget):
     """定时发送标签页：任务列表、编辑表单、保存/加载配置、手动立即发送。"""
 
+    # worker 线程日志 → 信号投递回主线程再写入日志面板（QThread 无 event loop，
+    # QTimer.singleShot 不会触发；signal.emit 走 QueuedConnection 自动排队到主线程）
+    _worker_log_signal = pyqtSignal(str)
+
     def __init__(self, store: ScheduleStore, dispatcher: ScheduleDispatcher, parent=None):
         super().__init__(parent)
         self.store = store
         self.dispatcher = dispatcher
         self.tasks: Dict[str, ScheduleTask] = {}
         self.current_task_id: Optional[str] = None
+        self._worker_log_signal.connect(self._on_worker_log)
         self.send_worker: Optional[ScheduleSendWorker] = None
         # 接收 MainWindow 的统一日志回调，外部赋值
         self.log_callback = None
@@ -2131,6 +2152,10 @@ class ScheduleTab(QWidget):
     # ------------------------- 日志 -------------------------
     # 最大日志行数（交给 QTextDocument 原生裁剪，CPU/内存都更省）
     _MAX_LOG_LINES = 1200
+
+    def _on_worker_log(self, message: str) -> None:
+        # 主线程槽：接收 worker 线程通过 _worker_log_signal 投递的日志
+        self.log(message)
 
     def log(self, message: str) -> None:
         # 本地追加
@@ -2463,7 +2488,7 @@ class ScheduleTab(QWidget):
             message=current.message,
             chat_delay=current.chat_delay,
             send_interval=current.send_interval,
-            log_callback=self._post_schedule_log_from_worker,
+            log_callback=self._worker_log_signal.emit,
             default_city=current.default_city,
         )
 

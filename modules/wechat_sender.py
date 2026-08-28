@@ -187,6 +187,22 @@ class WeChatSender:
             self._own_initialize_called = False
             return False
 
+    def minimize_window(self):
+        """整个发送任务结束后最小化微信窗口（隐私保护，任务级一次），失败静默忽略。"""
+        try:
+            import win32gui
+            import win32con
+            for cls_name in ("Qt51514QWindowIcon", "WeChatMainWndForPC"):
+                try:
+                    hwnd = win32gui.FindWindow(cls_name, "微信")
+                except Exception:
+                    hwnd = 0
+                if hwnd:
+                    win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+                    return
+        except Exception:
+            pass
+
     def reconnect(self, log_fn=None) -> bool:
         """当检测到微信句柄失效时重新初始化。失败会写日志但不抛异常。"""
         try:
@@ -247,6 +263,71 @@ class WeChatSender:
         """ChatWith 切换了聊天窗口后调用，清除缓存的 ChatInfo。"""
         self._chatinfo_cache = None
 
+    def _press_esc_on_wechat(self):
+        """按 Esc 关闭微信搜索面板 / 退出误点进入的页面（视频号、搜一搜等）。
+
+        ChatWith 搜不到联系人时，wxauto4 仍可能点击搜索下拉里的
+        "搜索: xxx / 视频号" 等入口，把主界面切走；不清理的话，
+        后续重试会在错误页面上连环失败。Esc 将微信恢复到主界面。
+        """
+        try:
+            import win32gui
+            import ctypes
+
+            hwnd = 0
+            for cls_name in ("Qt51514QWindowIcon", "WeChatMainWndForPC"):
+                try:
+                    hwnd = win32gui.FindWindow(cls_name, "微信")
+                except Exception:
+                    hwnd = 0
+                if hwnd:
+                    break
+            if not hwnd:
+                return
+            # Esc 只作用于前台窗口，先确保微信在前台
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+            VK_ESC = 0x1B
+            KEYEVENTF_KEYUP = 0x0002
+            INPUT_KEYBOARD = 1
+
+            class KEYBDINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("wVk", ctypes.c_ushort),
+                    ("wScan", ctypes.c_ushort),
+                    ("dwFlags", ctypes.c_ulong),
+                    ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", ctypes.c_void_p),
+                ]
+
+            class INPUT(ctypes.Structure):
+                class _IU(ctypes.Union):
+                    _fields_ = [("ki", KEYBDINPUT)]
+                _anonymous_ = ("iu",)
+                _fields_ = [("type", ctypes.c_ulong), ("iu", _IU)]
+
+            def _send_key(vk, key_up=False):
+                inp = INPUT()
+                inp.type = INPUT_KEYBOARD
+                inp.ki = KEYBDINPUT(
+                    vk, 0, KEYEVENTF_KEYUP if key_up else 0, 0, None
+                )
+                ctypes.windll.user32.SendInput(
+                    1, ctypes.byref(inp), ctypes.sizeof(INPUT)
+                )
+
+            _send_key(VK_ESC)
+            time.sleep(0.05)
+            _send_key(VK_ESC, key_up=True)
+            time.sleep(0.15)
+            self._invalidate_chatinfo_cache()
+        except Exception:
+            pass
+
     def _safe_chatwith(self, recipient: str, exact: bool = False) -> bool:
         if not self.wx:
             return False
@@ -256,6 +337,9 @@ class WeChatSender:
             self._invalidate_chatinfo_cache()
             return True
         except Exception:
+            # 搜不到目标时 ChatWith 内部可能已把界面切到搜索结果/视频号页，
+            # 按 Esc 恢复主界面，避免后续重试在错误页面上连环失败
+            self._press_esc_on_wechat()
             return False
 
     @staticmethod
@@ -376,7 +460,10 @@ class WeChatSender:
                         return True
                     else:
                         if attempt < max_retries - 1:
-                            self.log(f"窗口切换失败，尝试重新搜索 ({attempt+1}/{max_retries})")
+                            self.log(f"窗口切换失败，按 Esc 恢复主界面后重新搜索 ({attempt+1}/{max_retries})")
+                            # ChatWith 可能点到了搜索下拉（视频号/搜一搜入口），
+                            # 先恢复主界面再重试，避免在错误页面上连环失败
+                            self._press_esc_on_wechat()
                             if self._wait_or_stopped(0.2, stop_event):
                                 return False
 
@@ -469,7 +556,10 @@ class WeChatSender:
                         return True
 
                     if attempt < max_retries - 1:
-                        self.log(f"窗口切换失败，尝试重新搜索 ({attempt + 1}/{max_retries})")
+                        self.log(f"窗口切换失败，按 Esc 恢复主界面后重新搜索 ({attempt + 1}/{max_retries})")
+                        # ChatWith 可能点到了搜索下拉（视频号/搜一搜入口），
+                        # 先恢复主界面再重试
+                        self._press_esc_on_wechat()
                         if self._wait_or_stopped(0.2, stop_event):
                             return False
 
