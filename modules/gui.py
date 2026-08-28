@@ -241,13 +241,15 @@ class SendWorker(QThread):
         tasks,
         send_interval=2,
         chat_delay=0.8,
-        send_mode="text"
+        send_mode="text",
+        minimize_after=True
     ):
         super().__init__()
         self.tasks = tasks
         self.send_interval = send_interval
         self.chat_delay = chat_delay
         self.send_mode = send_mode
+        self.minimize_after = bool(minimize_after)
         self.signals = WorkerSignals()
         self.paused_event = threading.Event()
         self.stopped_event = threading.Event()
@@ -457,10 +459,11 @@ class SendWorker(QThread):
         finally:
             if sender:
                 # 整个发送任务结束后统一最小化微信窗口（隐私保护，任务级一次）
-                try:
-                    sender.minimize_window()
-                except Exception:
-                    pass
+                if self.minimize_after:
+                    try:
+                        sender.minimize_window()
+                    except Exception:
+                        pass
                 # 还原 sender.log，避免共享单例的 log 回调指向已销毁的 QThread 信号
                 try:
                     sender.log = _orig_sender_log
@@ -525,6 +528,7 @@ class ScheduleSendWorker(QThread):
         send_interval=0.5,
         log_callback=None,
         default_city="",
+        minimize_after=True,
     ):
         super().__init__()
         self.recipients = list(recipients or [])
@@ -532,6 +536,7 @@ class ScheduleSendWorker(QThread):
         self.chat_delay = max(0.0, min(10.0, float(chat_delay)))
         self.send_interval = max(0.0, min(30.0, float(send_interval)))
         self.default_city = str(default_city or "")
+        self.minimize_after = bool(minimize_after)
         self._log_cb = log_callback
         self.stopped_event = threading.Event()
         self._sender = None
@@ -643,11 +648,12 @@ class ScheduleSendWorker(QThread):
                     self.log(f"[定时] ✗ 发送失败: {recipient}")
         finally:
             if self._sender is not None:
-                # 整个定时任务结束后统一最小化微信窗口（任务级一次）
-                try:
-                    self._sender.minimize_window()
-                except Exception:
-                    pass
+                # 整个定时任务结束后统一最小化微信窗口（任务级一次，按任务开关）
+                if self.minimize_after:
+                    try:
+                        self._sender.minimize_window()
+                    except Exception:
+                        pass
                 # 还原 sender.log，避免共享单例的 log 回调指向已结束的 worker
                 if _orig_sender_log is not None:
                     try:
@@ -941,6 +947,16 @@ class TableFilterTab(QWidget):
         self.retry_send_btn.setStyleSheet("background-color: #00BCD4; color: white; padding: 8px; font-size: 14px;")
         self.retry_send_btn.setEnabled(False)
         control_layout.addWidget(self.retry_send_btn)
+
+        self.minimize_check = QCheckBox("发送后最小化微信")
+        self.minimize_check.setToolTip(
+            "开启后：整个发送任务完成后把微信窗口最小化一次（保护隐私）。\n"
+            "关闭后微信窗口保持原样，不会被最小化。"
+        )
+        self.minimize_check.setChecked(True)
+        control_layout.addWidget(self.minimize_check)
+
+        control_layout.addStretch()
         
         right_layout.addWidget(control_group)
         
@@ -1751,7 +1767,8 @@ class TableFilterTab(QWidget):
             tasks=tasks,
             send_interval=self.send_interval_spin.value(),
             chat_delay=self.chat_delay_spin.value(),
-            send_mode=send_mode
+            send_mode=send_mode,
+            minimize_after=self.minimize_check.isChecked()
         )
         self.worker = worker
         worker.signals.result.connect(self.on_send_result)
@@ -1804,7 +1821,8 @@ class TableFilterTab(QWidget):
             tasks=failed_tasks,
             send_interval=self.send_interval_spin.value(),
             chat_delay=self.chat_delay_spin.value(),
-            send_mode=getattr(self, 'last_send_mode', 'text')
+            send_mode=getattr(self, 'last_send_mode', 'text'),
+            minimize_after=self.minimize_check.isChecked()
         )
         self.worker = worker
         worker.signals.result.connect(self.on_send_result)
@@ -2090,8 +2108,8 @@ class ScheduleTab(QWidget):
 
         right_layout.addWidget(send_group)
 
-        # 电脑锁定配置（任务级，每个任务可单独设置）
-        lock_group = QGroupBox("电脑锁定")
+        # 电脑锁定/完成后行为配置（任务级，每个任务可单独设置）
+        lock_group = QGroupBox("电脑锁定 / 完成后行为")
         lock_layout = QHBoxLayout(lock_group)
         self.keep_unlock_check = QCheckBox("执行期间防自动锁定")
         self.keep_unlock_check.setToolTip(
@@ -2103,8 +2121,15 @@ class ScheduleTab(QWidget):
             "开启后：任务发送完成后自动锁定电脑（等同 Win+L）。\n"
             "若近期 15 分钟内还有其他定时任务，会等最后一个任务完成后再锁定。"
         )
+        self.minimize_check = QCheckBox("发送后最小化微信")
+        self.minimize_check.setToolTip(
+            "开启后：整个任务发送完成后把微信窗口最小化一次（保护隐私）。\n"
+            "关闭后微信窗口保持原样，不会被最小化。"
+        )
+        self.minimize_check.setChecked(True)
         lock_layout.addWidget(self.keep_unlock_check)
         lock_layout.addWidget(self.relock_check)
+        lock_layout.addWidget(self.minimize_check)
         lock_layout.addStretch()
         right_layout.addWidget(lock_group)
 
@@ -2258,6 +2283,7 @@ class ScheduleTab(QWidget):
         self.default_city_edit.setText(task.default_city or "")
         self.keep_unlock_check.setChecked(bool(getattr(task, "keep_unlocked", False)))
         self.relock_check.setChecked(bool(getattr(task, "relock_after", False)))
+        self.minimize_check.setChecked(bool(getattr(task, "minimize_after", True)))
         self._on_repeat_mode_changed(idx)
 
     def _reset_form(self):
@@ -2276,6 +2302,7 @@ class ScheduleTab(QWidget):
         self.default_city_edit.clear()
         self.keep_unlock_check.setChecked(False)
         self.relock_check.setChecked(False)
+        self.minimize_check.setChecked(True)
 
     # ------------------------- 增删改 -------------------------
     def _on_new_task(self):
@@ -2367,6 +2394,7 @@ class ScheduleTab(QWidget):
             default_city=self.default_city_edit.text().strip(),
             keep_unlocked=self.keep_unlock_check.isChecked(),
             relock_after=self.relock_check.isChecked(),
+            minimize_after=self.minimize_check.isChecked(),
         )
         return task
 
@@ -2490,6 +2518,7 @@ class ScheduleTab(QWidget):
             send_interval=current.send_interval,
             log_callback=self._worker_log_signal.emit,
             default_city=current.default_city,
+            minimize_after=getattr(current, "minimize_after", True),
         )
 
         # 保存任务配置供完成回调使用
@@ -2725,6 +2754,7 @@ class MainWindow(QMainWindow):
                 send_interval=task.send_interval,
                 log_callback=self._post_schedule_log_from_worker,
                 default_city=task.default_city,
+                minimize_after=getattr(task, "minimize_after", True),
             )
 
             finished = threading.Event()

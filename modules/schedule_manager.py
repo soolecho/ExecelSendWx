@@ -59,6 +59,8 @@ class ScheduleTask:
     # 任务级电脑锁定配置（覆盖全局开关）
     keep_unlocked: bool = False  # 执行期间阻止电脑自动锁定
     relock_after: bool = False   # 发送完成后自动锁定电脑
+    # 发送完成后最小化微信窗口（任务级开关）
+    minimize_after: bool = True
     # 已触发记录：{ "YYYY-MM-DD": ["08:30", ...] }
     fired_log: Dict[str, List[str]] = field(default_factory=dict)
     created_at: str = ""
@@ -120,6 +122,7 @@ class ScheduleTask:
             default_city=str(data.get("default_city", "") or ""),
             keep_unlocked=bool(data.get("keep_unlocked", False)),
             relock_after=bool(data.get("relock_after", False)),
+            minimize_after=bool(data.get("minimize_after", True)),
             fired_log=_normalize_fired_log(data.get("fired_log")),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
