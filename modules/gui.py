@@ -27,10 +27,62 @@ from modules.schedule_manager import (
     _normalize_time,
     WEEKDAY_NAMES,
 )
+from modules.workstation_guard import (
+    WorkstationGuard,
+    is_workstation_locked,
+)
 
 
 APP_TITLE = "表格自动发送By春风予Lu"
 INSTANCE_LOCK_NAME = "ExcelSendWx.lock"
+# 与 installer.iss 的 Run 键值名一致，确保安装器勾选和托盘菜单勾选操作同一注册表项
+_AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_REG_NAME = "ExcelSendWx"
+
+
+def _get_autostart_command() -> str:
+    """获取用于注册表 Run 键的启动命令。
+
+    打包后：直接用 exe 路径；
+    开发模式：用 pythonw.exe + main.py。
+    """
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    if not os.path.exists(pythonw):
+        pythonw = sys.executable
+    main_py = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "main.py"))
+    return f'"{pythonw}" "{main_py}"'
+
+
+def is_autostart_enabled() -> bool:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_PATH, 0, winreg.KEY_READ) as key:
+            winreg.QueryValueEx(key, _AUTOSTART_REG_NAME)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
+def set_autostart(enabled: bool) -> bool:
+    try:
+        import winreg
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _AUTOSTART_REG_PATH, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            if enabled:
+                winreg.SetValueEx(key, _AUTOSTART_REG_NAME, 0, winreg.REG_SZ, _get_autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(key, _AUTOSTART_REG_NAME)
+                except FileNotFoundError:
+                    pass
+        return True
+    except OSError:
+        return False
 
 
 def get_application_icon():
@@ -248,6 +300,8 @@ class SendWorker(QThread):
                 return
             self.signals.log.emit("微信客户端初始化成功")
             # 让 sender.log 通过信号线程安全地回写到 GUI 日志，同时也落 logging 便于 app.log 排查
+            # 保存原始 log 方法，在 finally 中还原，避免共享单例的 log 指向已销毁的 QThread 信号
+            _orig_sender_log = sender.log
             try:
                 import logging as _logging
                 _py_logger = _logging.getLogger("wechat_sender")
@@ -402,6 +456,11 @@ class SendWorker(QThread):
                 )
         finally:
             if sender:
+                # 还原 sender.log，避免共享单例的 log 回调指向已销毁的 QThread 信号
+                try:
+                    sender.log = _orig_sender_log
+                except Exception:
+                    pass
                 sender.cleanup_temp_images()
 
     def set_paused(self, value):
@@ -421,6 +480,31 @@ class SendWorker(QThread):
 
     def is_stopped(self):
         return self.stopped_event.is_set()
+
+
+class _SenderLogCb:
+    """把 WeChatSender.log 映射到定时任务的 GUI 日志面板。
+
+    设计成类 + 闭包是因为：
+    1) 需要可 pickle 弱引用（sender.log 可能被反复设置），lambda 容易循环引用；
+    2) 吞掉所有异常，避免 wxauto4 调用链在 GUI 面板写入异常时被连带中断。
+    3) 只写入 GUI 面板，**不再**额外调用 logging。
+       WeChatSender 内部会自己再调 logger.info 写 app.log，两者分离、不重复。
+    """
+    __slots__ = ("_cb",)
+
+    def __init__(self, cb):
+        self._cb = cb
+
+    def log(self, message):
+        cb = self._cb
+        if cb is None:
+            return
+        try:
+            cb(str(message))
+        except Exception:
+            # 面板写入失败（控件销毁/UI线程异常）只吞掉，不能阻断微信发送链路。
+            pass
 
 
 class ScheduleSendWorker(QThread):
@@ -461,6 +545,15 @@ class ScheduleSendWorker(QThread):
     def run(self):
         success = 0
         failed_recipients = []
+        # 锁屏预警：Windows 安全桌面限制导致程序无法对已锁定的会话自动解锁
+        try:
+            if is_workstation_locked():
+                self.log(
+                    "[定时] ⚠ 电脑处于锁定状态且无法自动解锁，本次发送很可能失败；"
+                    "请保持电脑解锁或开启'定时期间保持电脑解锁'"
+                )
+        except Exception:
+            pass
         if not self.message.strip():
             self.log("[定时] 消息为空，跳过发送")
             self.finished_with_result.emit(0, len(self.recipients), list(self.recipients))
@@ -495,25 +588,13 @@ class ScheduleSendWorker(QThread):
             self.log(f"[定时] 天气渲染异常: {exc}")
 
         self.log("[定时] 初始化微信客户端...")
+        _orig_sender_log = None
         try:
             self._sender = WeChatSender.shared_instance()
-            # 复用现有日志通道；同时落 logging 以便 app.log 排查定时任务发送过程
-            try:
-                import logging as _logging
-                _py_logger = _logging.getLogger("wechat_sender")
-                def _sched_log_hook(m, _cb=self._log_cb, _lg=_py_logger.info):
-                    try:
-                        _lg(str(m))
-                    except Exception:
-                        pass
-                    try:
-                        _cb(m)
-                    except Exception:
-                        pass
-                if self._log_cb:
-                    self._sender.log = _sched_log_hook
-            except Exception:
-                pass
+            # 保存原始 log 方法，在结束时还原，避免共享单例的 log 指向已销毁的 QThread
+            _orig_sender_log = self._sender.log
+            if self._log_cb:
+                self._sender.log = _SenderLogCb(self._log_cb).log
             if not self._sender.initialize():
                 WeChatSender.reset_shared_instance()
                 self.log("[定时] 微信初始化失败，本次任务失败")
@@ -527,33 +608,41 @@ class ScheduleSendWorker(QThread):
             return
 
         total = len(self.recipients)
-        for idx, recipient in enumerate(self.recipients):
-            if self.stopped_event.is_set():
-                self.log("[定时] 已手动停止")
-                failed_recipients.extend(self.recipients[idx:])
-                break
-            if idx > 0 and self.send_interval > 0:
-                if self.stopped_event.wait(self.send_interval):
+        try:
+            for idx, recipient in enumerate(self.recipients):
+                if self.stopped_event.is_set():
+                    self.log("[定时] 已手动停止")
                     failed_recipients.extend(self.recipients[idx:])
                     break
-            recipient = str(recipient).strip()
-            if not recipient:
-                continue
-            self.log(f"[定时] [{idx+1}/{total}] 发送到 {recipient}")
-            ok = self._sender.send_message(
-                content=self.message,
-                recipient=recipient,
-                first_send=self._first_send,
-                chat_delay=self.chat_delay,
-                fast_mode=False,
-                stop_event=self.stopped_event,
-            )
-            self._first_send = False
-            if ok:
-                success += 1
-            else:
-                failed_recipients.append(recipient)
-                self.log(f"[定时] ✗ 发送失败: {recipient}")
+                if idx > 0 and self.send_interval > 0:
+                    if self.stopped_event.wait(self.send_interval):
+                        failed_recipients.extend(self.recipients[idx:])
+                        break
+                recipient = str(recipient).strip()
+                if not recipient:
+                    continue
+                self.log(f"[定时] [{idx+1}/{total}] 发送到 {recipient}")
+                ok = self._sender.send_message(
+                    content=self.message,
+                    recipient=recipient,
+                    first_send=self._first_send,
+                    chat_delay=self.chat_delay,
+                    fast_mode=False,
+                    stop_event=self.stopped_event,
+                )
+                self._first_send = False
+                if ok:
+                    success += 1
+                else:
+                    failed_recipients.append(recipient)
+                    self.log(f"[定时] ✗ 发送失败: {recipient}")
+        finally:
+            # 还原 sender.log，避免共享单例的 log 回调指向已结束的 worker
+            if _orig_sender_log is not None and self._sender is not None:
+                try:
+                    self._sender.log = _orig_sender_log
+                except Exception:
+                    pass
         self.finished_with_result.emit(success, len(failed_recipients), failed_recipients)
 
 
@@ -1980,6 +2069,24 @@ class ScheduleTab(QWidget):
 
         right_layout.addWidget(send_group)
 
+        # 电脑锁定配置（任务级，每个任务可单独设置）
+        lock_group = QGroupBox("电脑锁定")
+        lock_layout = QHBoxLayout(lock_group)
+        self.keep_unlock_check = QCheckBox("执行期间防自动锁定")
+        self.keep_unlock_check.setToolTip(
+            "开启后：任务执行期间阻止电脑自动锁定/休眠，确保发送不被打断。\n"
+            "注意：若电脑已被手动锁定(Win+L)，程序无法自动解锁，任务会失败。"
+        )
+        self.relock_check = QCheckBox("发送完成后自动锁定")
+        self.relock_check.setToolTip(
+            "开启后：任务发送完成后自动锁定电脑（等同 Win+L）。\n"
+            "若近期 15 分钟内还有其他定时任务，会等最后一个任务完成后再锁定。"
+        )
+        lock_layout.addWidget(self.keep_unlock_check)
+        lock_layout.addWidget(self.relock_check)
+        lock_layout.addStretch()
+        right_layout.addWidget(lock_group)
+
         # 操作区 + 保存
         action_row = QHBoxLayout()
         self.save_task_btn = QPushButton("💾 保存当前任务")
@@ -2124,6 +2231,8 @@ class ScheduleTab(QWidget):
         self.chat_delay_spin.setValue(task.chat_delay)
         self.send_interval_spin.setValue(task.send_interval)
         self.default_city_edit.setText(task.default_city or "")
+        self.keep_unlock_check.setChecked(bool(getattr(task, "keep_unlocked", False)))
+        self.relock_check.setChecked(bool(getattr(task, "relock_after", False)))
         self._on_repeat_mode_changed(idx)
 
     def _reset_form(self):
@@ -2140,6 +2249,8 @@ class ScheduleTab(QWidget):
         self.chat_delay_spin.setValue(0.3)
         self.send_interval_spin.setValue(0.5)
         self.default_city_edit.clear()
+        self.keep_unlock_check.setChecked(False)
+        self.relock_check.setChecked(False)
 
     # ------------------------- 增删改 -------------------------
     def _on_new_task(self):
@@ -2229,6 +2340,8 @@ class ScheduleTab(QWidget):
             chat_delay=float(self.chat_delay_spin.value()),
             send_interval=float(self.send_interval_spin.value()),
             default_city=self.default_city_edit.text().strip(),
+            keep_unlocked=self.keep_unlock_check.isChecked(),
+            relock_after=self.relock_check.isChecked(),
         )
         return task
 
@@ -2350,22 +2463,30 @@ class ScheduleTab(QWidget):
             message=current.message,
             chat_delay=current.chat_delay,
             send_interval=current.send_interval,
-            log_callback=self._post_log_from_worker,
+            log_callback=self._post_schedule_log_from_worker,
             default_city=current.default_city,
         )
+
+        # 保存任务配置供完成回调使用
+        self._current_run_task = current
+
         worker.finished_with_result.connect(self._on_send_finished)
         # 让 QThread 自动回收 C++ 对象，避免反复启动后 Qt 对象堆积
         worker.finished.connect(lambda: self._cleanup_schedule_worker_after(worker))
         self.send_worker = worker
         self.stop_send_btn.setEnabled(True)
         self.run_now_btn.setEnabled(False)
+
+        # 按任务配置启动防锁定守护
+        if getattr(current, "keep_unlocked", False):
+            mw = self.window()
+            if mw and hasattr(mw, "workstation_guard"):
+                if not mw.workstation_guard.is_running():
+                    mw.workstation_guard.start()
+                    self.log(f"[定时] 任务「{current.name}」已开启防锁定守护")
+
         self.log(f"[定时] 手动立即执行任务: {current.name}")
         worker.start()
-
-    def _post_log_from_worker(self, message: str):
-        # 从非 GUI 线程安全切换到主线程再写日志。
-        # 如果当前就在主线程，singleShot(0, ...) 也只是下一轮事件循环再执行，无副作用。
-        QTimer.singleShot(0, lambda m=message: self.log(m))
 
     def _cleanup_schedule_worker_after(self, worker):
         try:
@@ -2393,6 +2514,15 @@ class ScheduleTab(QWidget):
                 msg += f"…等{len(failed_recipients)}人"
             msg += "）"
         self.log(msg)
+        # 按任务配置决定是否发送后锁定
+        task = getattr(self, "_current_run_task", None)
+        if task and getattr(task, "relock_after", False):
+            mw = self.window()
+            if mw and hasattr(mw, "workstation_guard"):
+                try:
+                    mw.workstation_guard.maybe_relock_after_task(mw.schedule_store)
+                except Exception:
+                    pass
 
     # ------------------------- 天气设置 -------------------------
     def _on_open_weather_settings(self):
@@ -2507,6 +2637,11 @@ class MainWindow(QMainWindow):
         # 因为子线程没有 Qt event loop，singleShot 永远不会触发
         self._schedule_log_signal.connect(self._on_schedule_log_signal)
 
+        # 电脑锁定守护：阻止定时发送期间电脑自动锁定，任务完成后自动锁回
+        self.workstation_guard = WorkstationGuard(
+            log_fn=self._post_schedule_log_from_worker
+        )
+
         self.init_ui()
         self.init_tray()
         self.schedule_dispatcher.start()
@@ -2530,10 +2665,11 @@ class MainWindow(QMainWindow):
             pass
 
     def _schedule_dispatch_log(self, message):
-        try:
-            self.schedule_tab.log(message)
-        except Exception:
-            pass
+        # 关键修复：该回调在 ScheduleDispatcher 调度线程里被直接调用，
+        # 绝不能在这里碰 QTextEdit 等 QWidget（跨线程操作会与主线程
+        # 重绘/写入竞争，导致界面卡死"无响应"甚至崩溃）。
+        # 统一走 _schedule_log_signal 投递到主线程再写面板。
+        self._post_schedule_log_from_worker(message)
 
     def _on_schedule_triggered(self, task: ScheduleTask, slot: str):
         # 如果已有定时发送在跑，跳过本轮，等待下一次也会重复（不过已被 mark_fired，
@@ -2547,12 +2683,16 @@ class MainWindow(QMainWindow):
 
     def _run_schedule_task_serialized(self, task: ScheduleTask, slot: str):
         with self._schedule_running_lock:
+            # 按任务配置启动防锁定守护
+            if getattr(task, "keep_unlocked", False):
+                if not self.workstation_guard.is_running():
+                    self.workstation_guard.start()
+                    self._post_schedule_log_from_worker(
+                        f"[定时] 任务「{task.name}」已开启防锁定守护"
+                    )
             self._post_schedule_log_from_worker(
                 f"[定时] 开始执行任务「{task.name}」 时间点 {slot} 接收人数 {len(task.recipients)}"
             )
-            # 在 ScheduleRun Python 子线程构造 QThread；affinity 是本子线程。
-            # 关键修复：connect 时显式用 DirectConnection，避免 AutoConnection
-            # 因 worker.affinity 线程没有 Qt event loop 而导致 finished 信号永远不触发。
             worker = ScheduleSendWorker(
                 recipients=list(task.recipients),
                 message=task.message,
@@ -2566,20 +2706,29 @@ class MainWindow(QMainWindow):
             result = {"success": 0, "failed": 0, "failed_list": []}
 
             def on_finished(success, failed, failed_list):
-                result["success"] = success
-                result["failed"] = failed
+                # DirectConnection 下本函数在 worker QThread 内同步执行；
+                # 这里只做 dict 赋值 + Event.set()，不碰任何 GUI，线程安全。
+                if finished.is_set():
+                    # 兜底去重：超时路径已 set() 过则不再覆盖统计。
+                    return
+                result["success"] = int(success or 0)
+                result["failed"] = int(failed or 0)
                 result["failed_list"] = list(failed_list or [])
                 finished.set()
 
             self._schedule_worker = worker
+            # 必须用 DirectConnection：
+            # 1) on_finished 只做 dict 赋值 + Event.set()，不碰任何 GUI，
+            #    在 worker 线程内同步执行是安全的；
+            # 2) QueuedConnection 会把调用投递到"连接建立时所在线程"
+            #    （ScheduleRun 子线程）的事件队列，而该线程没有 Qt event loop，
+            #    排队的事件永远不会执行 → result 永远是 0/0，统计全错。
             worker.finished_with_result.connect(
                 on_finished, Qt.ConnectionType.DirectConnection)
             worker.finished.connect(
                 lambda: self._cleanup_main_schedule_worker_after(worker),
                 Qt.ConnectionType.DirectConnection,
             )
-            # QThread.start() 是线程安全的，可以从任何线程调用，
-            # 它会启动一个新的 OS 线程跑 run()，不再依赖当前线程的 event loop
             worker.start()
 
             total_timeout = max(60.0, 60.0 * (len(task.recipients) or 1) * 10.0)
@@ -2587,12 +2736,24 @@ class MainWindow(QMainWindow):
             finished.wait(timeout=total_timeout)
             if not finished.is_set():
                 self._post_schedule_log_from_worker(
-                    f"[定时] ⚠ 任务「{task.name}」执行超时（{int(total_timeout)}秒）"
+                    f"[定时] ⚠ 任务「{task.name}」执行超时（{int(total_timeout)}秒），强制停止"
                 )
+                try:
+                    worker.stop()
+                except Exception:
+                    pass
             self._post_schedule_log_from_worker(
                 f"[定时] 任务「{task.name}」时间点 {slot} 完成："
                 f"成功{result['success']}，失败{result['failed']}"
             )
+            # 发送完成后：按任务配置决定是否锁定电脑
+            if getattr(task, "relock_after", False):
+                try:
+                    self.workstation_guard.maybe_relock_after_task(
+                        self.schedule_store
+                    )
+                except Exception:
+                    pass
 
     def _post_schedule_log_from_worker(self, message):
         # 关键修复：用 pyqtSignal 跨线程投递，不要用 QTimer.singleShot(0,...)
@@ -2605,13 +2766,11 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_schedule_log_signal(self, message):
-        # 主线程 slot：把日志同时写到定时 Tab 主面板 + 数据发送 Tab 面板
+        # 主线程 slot：只写 schedule_tab.log 一个入口。
+        # ScheduleTab.log 内部会通过 log_callback 转发到数据发送主面板，
+        # 这里再直写 table_filter_tab 会导致主面板每条日志出现两行。
         try:
             self.schedule_tab.log(message)
-        except Exception:
-            pass
-        try:
-            self.table_filter_tab.log(message)
         except Exception:
             pass
 
@@ -2648,6 +2807,13 @@ class MainWindow(QMainWindow):
         self.tray_menu.addAction(self.show_window_action)
         self.tray_menu.addSeparator()
 
+        self.autostart_action = QAction("开机自启动", self)
+        self.autostart_action.setCheckable(True)
+        self.autostart_action.setChecked(is_autostart_enabled())
+        self.autostart_action.toggled.connect(self._on_autostart_toggled)
+        self.tray_menu.addAction(self.autostart_action)
+        self.tray_menu.addSeparator()
+
         self.exit_action = QAction("退出程序", self)
         self.exit_action.triggered.connect(self.request_exit)
         self.tray_menu.addAction(self.exit_action)
@@ -2660,6 +2826,17 @@ class MainWindow(QMainWindow):
 
     def log(self, message):
         self.table_filter_tab.log(message)
+
+    def _on_autostart_toggled(self, checked: bool):
+        ok = set_autostart(checked)
+        if ok:
+            self.log(f"开机自启动已{'开启' if checked else '关闭'}")
+        else:
+            # 写注册表失败，恢复 UI 勾选状态
+            self.autostart_action.blockSignals(True)
+            self.autostart_action.setChecked(not checked)
+            self.autostart_action.blockSignals(False)
+            QMessageBox.warning(self, "设置失败", "无法修改开机自启动设置，请检查权限。")
 
     def show_main_window(self):
         if self._closing_requested:
@@ -2742,6 +2919,14 @@ class MainWindow(QMainWindow):
         if dispatcher is not None:
             try:
                 dispatcher.stop()
+            except Exception:
+                pass
+
+        # 停止电脑锁定守护并恢复屏保/锁屏策略原状
+        guard = getattr(self, "workstation_guard", None)
+        if guard is not None:
+            try:
+                guard.stop()
             except Exception:
                 pass
 

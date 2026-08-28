@@ -63,6 +63,10 @@ class WeChatSender:
         # 最近一次确认句柄可用的时间戳；超时会先做一次轻量探活
         self._last_healthy_ts = 0.0
         self._own_initialize_called = False
+        # ChatInfo 短缓存：避免同一接收人发送时重复 UIA 调用（每次 50-200ms）
+        self._chatinfo_cache = None
+        self._chatinfo_cache_ts = 0.0
+        self._chatinfo_cache_ttl = 1.5  # 秒
 
     @classmethod
     def shared_instance(cls) -> "WeChatSender":
@@ -188,6 +192,7 @@ class WeChatSender:
         try:
             # 解除旧引用，便于 GC 回收句柄相关资源
             self.wx = None
+            self._invalidate_chatinfo_cache()
             if log_fn:
                 try:
                     log_fn("🔄 微信句柄失效，正在重新连接微信...")
@@ -214,29 +219,41 @@ class WeChatSender:
         安全读取 ChatInfo。
         返回 (is_healthy, chatinfo)。
         is_healthy=False 意味着句柄已失效，调用方应主动 reconnect 再试一次。
+        带 1.5 秒短缓存：同一次发送流程中 ChatWith 后可能连续调用多次 ChatInfo，
+        缓存避免冗余 UIA 调用（每次 50-200ms），显著提升发送速度。
+        ChatWith 后调用方应通过 _invalidate_chatinfo_cache() 清除缓存。
         """
         if not self.wx:
             return False, None
+        # 短缓存命中
+        now = time.time()
+        if (self._chatinfo_cache is not None
+                and now - self._chatinfo_cache_ts < self._chatinfo_cache_ttl):
+            return True, self._chatinfo_cache
         try:
             chatinfo = self.wx.ChatInfo()
         except Exception:
+            self._chatinfo_cache = None
             return False, None
-        # wxauto4 正常时会返回 dict；异常状态下可能返回 None / {} / '无' 等异常值
         if not isinstance(chatinfo, dict):
+            self._chatinfo_cache = None
             return False, None
-        # chat_name 不存在或者为空字符串，通常也表明当前无法读取会话，需要重连
-        name = chatinfo.get("chat_name")
-        # 注意：刚打开微信、没有任何聊天被选中时，chat_name 可能是空，这并不意味着句柄坏，
-        # 所以这里只判断"调用没抛异常且是 dict"就算健康，chat_name 缺省由上层再处理。
-        _ = name
-        self._last_healthy_ts = time.time()
+        self._chatinfo_cache = chatinfo
+        self._chatinfo_cache_ts = now
+        self._last_healthy_ts = now
         return True, chatinfo
+
+    def _invalidate_chatinfo_cache(self):
+        """ChatWith 切换了聊天窗口后调用，清除缓存的 ChatInfo。"""
+        self._chatinfo_cache = None
 
     def _safe_chatwith(self, recipient: str, exact: bool = False) -> bool:
         if not self.wx:
             return False
         try:
             self.wx.ChatWith(recipient, exact=exact)
+            # 切换了聊天窗口，清除 ChatInfo 缓存
+            self._invalidate_chatinfo_cache()
             return True
         except Exception:
             return False
