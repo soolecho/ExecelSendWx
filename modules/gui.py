@@ -165,7 +165,11 @@ class CollapsibleGroupBox(QWidget):
         outer.addWidget(self._content)
 
         self._refresh_title_text()
-        self._anim: Optional[QPropertyAnimation] = None
+        # 单一持久动画对象：反复折叠/展开时只 stop + 重设参数重启，
+        # 不频繁创建/销毁动画对象（避免极端连点时 deleteLater 堆积引发原生崩溃）
+        self._anim = QPropertyAnimation(self._content, b"maximumHeight", self)
+        self._anim.finished.connect(self._on_anim_finished)
+        self._anim_target_collapsed = False
         if collapsed:
             self.set_collapsed(True)
 
@@ -194,6 +198,16 @@ class CollapsibleGroupBox(QWidget):
     def is_collapsed(self) -> bool:
         return self._collapsed
 
+    def _kill_anim(self) -> None:
+        """停止进行中的折叠动画并解除高度限制（stop 不触发 finished，
+        可防止旧动画结束回调把内容显示状态写反）。"""
+        if self._anim is not None:
+            try:
+                self._anim.stop()
+            except Exception:
+                pass
+        self._content.setMaximumHeight(16777215)
+
     def set_collapsed(self, collapsed: bool, animate: bool = False) -> None:
         collapsed = bool(collapsed)
         if collapsed == self._collapsed:
@@ -201,6 +215,9 @@ class CollapsibleGroupBox(QWidget):
         if animate:
             self._animated_set_collapsed(collapsed)
             return
+        # 即时切换：若动画仍在跑（如精简模式/自动展开与点击动画并发），
+        # 必须先终止旧动画，否则旧动画结束回调会把内容显示状态写反
+        self._kill_anim()
         self._collapsed = collapsed
         self._content.setVisible(not collapsed)
         self._refresh_title_text()
@@ -228,15 +245,10 @@ class CollapsibleGroupBox(QWidget):
         - 动画中途再次点击时立即定格当前高度并从该处开新动画，不会跳变。
         """
         content = self._content
-        # 上一次动画未结束：断开其回调并定格在当前高度，从该处续动
-        if self._anim is not None:
-            try:
-                self._anim.finished.disconnect()
-            except TypeError:
-                pass
-            self._anim.stop()
-            self._anim.deleteLater()
-            self._anim = None
+        anim = self._anim
+        # 上一次动画未结束：定格当前高度（stop 不触发 finished），从该处续动
+        if anim.state() == QAbstractAnimation.State.Running:
+            anim.stop()
         cur_max = max(0, content.maximumHeight())
         if collapsed:
             # 折叠：从当前可见高度收到 0（完全展开时取实际高度）
@@ -254,24 +266,36 @@ class CollapsibleGroupBox(QWidget):
 
         content.setVisible(True)
         content.setMaximumHeight(cur_max)
-        self._anim = QPropertyAnimation(content, b"maximumHeight", self)
-        self._anim.setStartValue(cur_max)
+        anim.setStartValue(cur_max)
         if collapsed:
-            self._anim.setEndValue(0)
-            self._anim.setDuration(240)
-            self._anim.setEasingCurve(QEasingCurve.Type.InCubic)
+            anim.setEndValue(0)
+            anim.setDuration(280)
+            # 柔和减速：先慢后收，不突兀
+            anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
         else:
-            self._anim.setEndValue(content.sizeHint().height())
-            self._anim.setDuration(340)
-            # OutBack 回弹过冲 = 果冻效果
-            self._anim.setEasingCurve(QEasingCurve.Type.OutBack)
+            target_h = content.sizeHint().height()
+            if target_h <= 0:
+                # 尺寸提示异常（控件尚未布局完成）：放弃动画走即时展开，避免空转
+                content.setMaximumHeight(16777215)
+                content.setVisible(True)
+                self._notify_window(True)
+                return
+            anim.setEndValue(target_h)
+            anim.setDuration(420)
+            # 轻微 OutBack 回弹（过冲幅度调到 1.05，比默认 1.70 柔和很多）
+            soft_curve = QEasingCurve(QEasingCurve.Type.OutBack)
+            try:
+                soft_curve.setOvershoot(1.05)
+            except Exception:
+                pass
+            anim.setEasingCurve(soft_curve)
             # 展开时窗口同步放大，给内容腾出弹跳空间
             self._notify_window(True, animate_window=True)
-        self._anim.finished.connect(lambda c=collapsed: self._on_anim_finished(c))
-        self._anim.start()
+        self._anim_target_collapsed = collapsed
+        anim.start()
 
-    def _on_anim_finished(self, collapsed: bool) -> None:
-        self._anim = None
+    def _on_anim_finished(self) -> None:
+        collapsed = self._anim_target_collapsed
         if collapsed:
             self._content.setVisible(False)
         self._content.setMaximumHeight(16777215)  # 解除高度限制
@@ -3560,8 +3584,9 @@ class MainWindow(QMainWindow):
         all_collapsed = all(g.is_collapsed() for g in groups)
         self._compact_mode = all_collapsed
         self.compact_btn.setText("📄 详细模式" if all_collapsed else "📑 精简模式")
-        # 切换 tab 后内容高度不同，弹性窗口跟随自适应
-        QTimer.singleShot(0, self.fit_to_content)
+        # 切换 tab 后按新页理想尺寸适应（折叠的分组不计入 sizeHint，
+        # 已展开内容完整显示，不再出现定时任务页文字被压扁）
+        QTimer.singleShot(0, lambda: self.fit_to_content(True))
 
     def changeEvent(self, event):
         """系统明暗（夜间/日间）主题切换时，重刷精简按钮配色。"""
@@ -3571,6 +3596,11 @@ class MainWindow(QMainWindow):
                 self.compact_btn.setStyleSheet(_compact_btn_css())
             except Exception:
                 pass
+        elif event.type() == QEvent.Type.WindowStateChange:
+            # 从最小化恢复：最小化期间折叠/展开被跳过，恢复后补一次自适应
+            if not self.isMinimized() and not self.isMaximized() \
+                    and not self.isFullScreen() and self._startup_fit_done:
+                QTimer.singleShot(0, lambda: self.fit_to_content(True))
 
     def showEvent(self, event):
         """首次显示后按内容理想尺寸自适应一次，修复启动时部分文字被压缩。"""
@@ -3581,6 +3611,17 @@ class MainWindow(QMainWindow):
 
     def _animate_window_geometry(self, target: QRect) -> None:
         """平滑动画过渡到目标窗口几何（折叠/展开时的果冻弹性跟随）。"""
+        # 目标几何与当前一致：停掉可能在跑的旧动画，无需新建动画
+        if self.geometry() == target:
+            if (
+                self._geo_anim is not None
+                and self._geo_anim.state() == QAbstractAnimation.State.Running
+            ):
+                try:
+                    self._geo_anim.stop()
+                except Exception:
+                    pass
+            return
         if (
             self._geo_anim is not None
             and self._geo_anim.state() == QAbstractAnimation.State.Running
@@ -3594,8 +3635,8 @@ class MainWindow(QMainWindow):
                 pass
             self._geo_anim.deleteLater()
         anim = QPropertyAnimation(self, b"geometry", self)
-        anim.setDuration(240)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setDuration(300)
+        anim.setEasingCurve(QEasingCurve.Type.OutQuart)
         anim.setEndValue(target)
         self._geo_anim = anim
         anim.start()
@@ -3612,7 +3653,12 @@ class MainWindow(QMainWindow):
         - 限制在屏幕可用区域内，保留最小尺寸地板；最大化/全屏/未显示时不干预。
         """
         try:
-            if not self.isVisible() or self.isMaximized() or self.isFullScreen():
+            if (
+                not self.isVisible()
+                or self.isMinimized()
+                or self.isMaximized()
+                or self.isFullScreen()
+            ):
                 return
             # 关键：先同步分发挂起的布局事件，刷新各 widget 的 sizeHint/minimumSizeHint
             # 缓存（QTimer(0) 回调可能先于 LayoutRequest 执行，否则会读到折叠前的旧尺寸）
