@@ -12,7 +12,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, pyqtSignal, QObject, QThread, QTimer, QLockFile, QStandardPaths,
-    QTime, QEvent, QSize
+    QTime, QEvent, QSize, QRect, QPropertyAnimation, QEasingCurve,
+    QAbstractAnimation
 )
 from PyQt6.QtGui import QAction, QFont, QIcon, QGuiApplication
 
@@ -164,6 +165,7 @@ class CollapsibleGroupBox(QWidget):
         outer.addWidget(self._content)
 
         self._refresh_title_text()
+        self._anim: Optional[QPropertyAnimation] = None
         if collapsed:
             self.set_collapsed(True)
 
@@ -192,9 +194,12 @@ class CollapsibleGroupBox(QWidget):
     def is_collapsed(self) -> bool:
         return self._collapsed
 
-    def set_collapsed(self, collapsed: bool) -> None:
+    def set_collapsed(self, collapsed: bool, animate: bool = False) -> None:
         collapsed = bool(collapsed)
         if collapsed == self._collapsed:
+            return
+        if animate:
+            self._animated_set_collapsed(collapsed)
             return
         self._collapsed = collapsed
         self._content.setVisible(not collapsed)
@@ -203,12 +208,78 @@ class CollapsibleGroupBox(QWidget):
         # 折叠/展开后请求顶层窗口弹性自适应。
         # 仅在顶层窗口已显示时调度，避免构造阶段（默认折叠组）启动即误调整。
         # expanding: 折叠→False(窗口收缩到最小尺寸)，展开→True(窗口放大到理想尺寸)
+        self._notify_window(not collapsed)
+
+    def _notify_window(self, expanding: bool, animate_window: bool = False) -> None:
+        """通知顶层窗口弹性适应（折叠→收缩 / 展开→放大）。"""
         win = self.window()
         if win is not None and win.isVisible() and hasattr(win, "fit_to_content"):
-            QTimer.singleShot(0, lambda: win.fit_to_content(not collapsed))
+            if animate_window:
+                win.fit_to_content(expanding, animate_window=True)
+            else:
+                QTimer.singleShot(0, lambda: win.fit_to_content(expanding))
+
+    def _animated_set_collapsed(self, collapsed: bool) -> None:
+        """果冻式折叠/展开动画：内容区高度弹入弹出，窗口同步弹性跟随。
+
+        - 展开：窗口先平滑放大腾出空间，内容区高度以 OutBack（回弹过冲）
+          从当前高度弹到理想高度，产生果冻感；
+        - 折叠：内容区高度平滑收到 0 后隐藏，窗口再平滑收缩；
+        - 动画中途再次点击时立即定格当前高度并从该处开新动画，不会跳变。
+        """
+        content = self._content
+        # 上一次动画未结束：断开其回调并定格在当前高度，从该处续动
+        if self._anim is not None:
+            try:
+                self._anim.finished.disconnect()
+            except TypeError:
+                pass
+            self._anim.stop()
+            self._anim.deleteLater()
+            self._anim = None
+        cur_max = max(0, content.maximumHeight())
+        if collapsed:
+            # 折叠：从当前可见高度收到 0（完全展开时取实际高度）
+            if cur_max >= 16777215:
+                cur_max = content.height() or content.sizeHint().height()
+        else:
+            # 展开：完全折叠态（不可见）从 0 弹到理想高度；
+            # 动画中途反转则从当前已弹出高度续动
+            if cur_max >= 16777215:
+                cur_max = 0
+
+        self._collapsed = collapsed
+        self._refresh_title_text()
+        self.collapsedChanged.emit(collapsed)
+
+        content.setVisible(True)
+        content.setMaximumHeight(cur_max)
+        self._anim = QPropertyAnimation(content, b"maximumHeight", self)
+        self._anim.setStartValue(cur_max)
+        if collapsed:
+            self._anim.setEndValue(0)
+            self._anim.setDuration(240)
+            self._anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        else:
+            self._anim.setEndValue(content.sizeHint().height())
+            self._anim.setDuration(340)
+            # OutBack 回弹过冲 = 果冻效果
+            self._anim.setEasingCurve(QEasingCurve.Type.OutBack)
+            # 展开时窗口同步放大，给内容腾出弹跳空间
+            self._notify_window(True, animate_window=True)
+        self._anim.finished.connect(lambda c=collapsed: self._on_anim_finished(c))
+        self._anim.start()
+
+    def _on_anim_finished(self, collapsed: bool) -> None:
+        self._anim = None
+        if collapsed:
+            self._content.setVisible(False)
+        self._content.setMaximumHeight(16777215)  # 解除高度限制
+        # 动画结束后窗口弹性跟随（折叠收缩 / 展开放大补齐）
+        self._notify_window(not collapsed, animate_window=True)
 
     def toggle(self) -> None:
-        self.set_collapsed(not self._collapsed)
+        self.set_collapsed(not self._collapsed, animate=True)
 
     def setEnabled(self, enabled: bool) -> None:
         """重写：标题栏保持可点，只禁用内容区（兼容 weekday_group_box.setEnabled 调用）。"""
@@ -1283,6 +1354,8 @@ class TableFilterTab(QWidget):
         self.url_group = url_group
         self.filter_group = filter_group
         self.send_group = send_group
+        # 加载配置后需要自动展开的分组（人员列表/数据预览/发送控制）
+        self._load_expand_groups = [persons_group, preview_group, control_group]
 
     def _collapse_groups(self, *groups):
         """批量折叠指定分组（忽略 None）。"""
@@ -1638,6 +1711,11 @@ class TableFilterTab(QWidget):
             self.log("配置已应用，并已自动加载人员数据")
         else:
             self.log("⚠ 配置已部分应用，请重新选择缺失的列")
+
+        # 配置加载成功后自动展开人员列表/数据预览/发送控制分组（若处于折叠状态）
+        for g in getattr(self, "_load_expand_groups", []):
+            if g is not None and g.is_collapsed():
+                g.set_collapsed(False)
 
         if missing_settings:
             QMessageBox.warning(
@@ -3390,6 +3468,9 @@ class MainWindow(QMainWindow):
         self._close_ready = False
         self._shutdown_poll_count = 0
         self._tray_hint_shown = False
+        # 窗口弹性自适应状态：首次显示后按内容尺寸适配一次；几何动画句柄
+        self._startup_fit_done = False
+        self._geo_anim: Optional[QPropertyAnimation] = None
 
         self.schedule_store = ScheduleStore()
         self.schedule_dispatcher = ScheduleDispatcher(self.schedule_store)
@@ -3491,7 +3572,35 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
-    def fit_to_content(self, expanding=None):
+    def showEvent(self, event):
+        """首次显示后按内容理想尺寸自适应一次，修复启动时部分文字被压缩。"""
+        super().showEvent(event)
+        if not self._startup_fit_done:
+            self._startup_fit_done = True
+            QTimer.singleShot(0, lambda: self.fit_to_content(True))
+
+    def _animate_window_geometry(self, target: QRect) -> None:
+        """平滑动画过渡到目标窗口几何（折叠/展开时的果冻弹性跟随）。"""
+        if (
+            self._geo_anim is not None
+            and self._geo_anim.state() == QAbstractAnimation.State.Running
+            and self._geo_anim.endValue() == target
+        ):
+            return  # 目标相同且动画进行中，无需重启
+        if self._geo_anim is not None:
+            try:
+                self._geo_anim.stop()
+            except Exception:
+                pass
+            self._geo_anim.deleteLater()
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(240)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.setEndValue(target)
+        self._geo_anim = anim
+        anim.start()
+
+    def fit_to_content(self, expanding=None, animate_window=False):
         """弹性窗口：折叠/展开分组后，窗口尺寸跟随内容自适应收缩或放大。
 
         - expanding=False（折叠触发）：目标取当前页 minimumSizeHint，窗口收缩到
@@ -3543,10 +3652,36 @@ class MainWindow(QMainWindow):
             min_w, min_h = 520, 300
             w = max(min_w, min(target_w, avail.width()))
             h = max(min_h, min(target_h, avail.height()))
-            # 保持窗口不超出屏幕可用区域
-            x = max(avail.left(), min(self.x(), avail.right() - w))
-            y = max(avail.top(), min(self.y(), avail.bottom() - h))
-            self.setGeometry(x, y, w, h)
+            # 关键：setGeometry 设的是客户区几何，屏幕可用区约束的是整个窗口
+            # 框架（含标题栏）。必须先把框架四边的开销（标题栏高度、边框宽度）
+            # 扣除，否则内容接近满屏时窗口框架顶端会被顶出屏幕外，
+            # 表现为"标题栏和最小化/最大化/关闭按钮不见了"。
+            frame = self.frameGeometry()
+            geo = self.geometry()
+            # Qt 框架几何包围客户区：标题栏在客户区上方（frame.top < geo.top），
+            # 故各方向开销为：上 = geo.top-frame.top，下/右 = frame-geo
+            ft = max(0, geo.top() - frame.top())         # 标题栏高度
+            fl = max(0, geo.left() - frame.left())       # 左边框宽度
+            fr = max(0, frame.right() - geo.right())     # 右边框宽度
+            fb = max(0, frame.bottom() - geo.bottom())   # 底边框宽度
+            w = max(min_w, min(target_w, avail.width() - fl - fr))
+            h = max(min_h, min(target_h, avail.height() - ft - fb))
+            # 保持整个窗口框架（含标题栏）在屏幕可用区内
+            x = max(avail.left() + fl, min(self.x(), avail.left() + avail.width() - fr - w))
+            y = max(avail.top() + ft, min(self.y(), avail.top() + avail.height() - fb - h))
+            if animate_window:
+                # 果冻弹性：窗口平滑动画过渡到目标几何
+                self._animate_window_geometry(QRect(x, y, w, h))
+            else:
+                # 立即适配：停掉进行中的几何动画，避免旧动画回写几何值
+                if self._geo_anim is not None:
+                    try:
+                        self._geo_anim.stop()
+                    except Exception:
+                        pass
+                    self._geo_anim.deleteLater()
+                    self._geo_anim = None
+                self.setGeometry(x, y, w, h)
         except Exception:
             pass
 
