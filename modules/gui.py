@@ -8,12 +8,13 @@ from PyQt6.QtWidgets import (
     QComboBox, QListWidget, QListWidgetItem, QGroupBox,
     QCheckBox, QProgressBar, QMessageBox, QSplitter, QTabWidget,
     QDoubleSpinBox, QDialog, QDialogButtonBox, QFileDialog,
-    QMenu, QStyle, QSystemTrayIcon, QSpinBox, QTimeEdit, QStackedWidget
+    QMenu, QStyle, QSystemTrayIcon, QSpinBox, QTimeEdit, QStackedWidget,
+    QLayout
 )
 from PyQt6.QtCore import (
     Qt, pyqtSignal, QObject, QThread, QTimer, QLockFile, QStandardPaths,
-    QTime, QEvent, QSize, QRect, QPropertyAnimation, QEasingCurve,
-    QAbstractAnimation
+    QTime, QEvent, QSize, QRect, QPoint, QPropertyAnimation, QEasingCurve,
+    QAbstractAnimation, QVariantAnimation
 )
 from PyQt6.QtGui import QAction, QFont, QIcon, QGuiApplication
 
@@ -284,6 +285,96 @@ class ChipSection(QWidget):
         self._content.setEnabled(enabled)
 
 
+class FlowLayout(QLayout):
+    """自动换行流式布局：窄宽度下芯片自动竖向换行（空栏收缩成芯片导轨用）。"""
+
+    def __init__(self, parent=None, margin=0, h_spacing=6, v_spacing=4):
+        super().__init__(parent)
+        if parent is not None:
+            self.setContentsMargins(margin, margin, margin, margin)
+        self._items: List = []
+        self._h_space = h_spacing
+        self._v_space = v_spacing
+
+    def __del__(self):
+        while self.count():
+            self.takeAt(0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        size += QSize(m.left() + m.right(), m.top() + m.bottom())
+        return size
+
+    def _spacing(self, pm):
+        opt = None
+        widget = self.parentWidget()
+        if widget is not None:
+            opt = widget.style()
+        result = opt.pixelMetric(pm, None, widget) if opt is not None else 0
+        return max(result, 0)
+
+    def _h_spacing(self):
+        return self._h_space if self._h_space >= 0 else self._spacing(
+            QStyle.PixelMetric.PM_LayoutHorizontalSpacing)
+
+    def _v_spacing(self):
+        return self._v_space if self._v_space >= 0 else self._spacing(
+            QStyle.PixelMetric.PM_LayoutVerticalSpacing)
+
+    def _do_layout(self, rect, test_only):
+        m = self.contentsMargins()
+        effective = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_height = effective.x(), effective.y(), 0
+        for item in self._items:
+            wsize = item.sizeHint()
+            next_x = x + wsize.width() + self._h_spacing()
+            if next_x - self._h_spacing() > effective.right() and line_height > 0:
+                x = effective.x()
+                y = y + line_height + self._v_spacing()
+                next_x = x + wsize.width() + self._h_spacing()
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), wsize))
+            x = next_x
+            line_height = max(line_height, wsize.height())
+        return y + line_height - rect.y() + m.bottom()
+
+
 class ChipBar(QWidget):
     """一排胶囊芯片按钮：点击果冻展开/折叠对应 ChipSection。
 
@@ -296,11 +387,10 @@ class ChipBar(QWidget):
         self._exclusive = exclusive
         self.sections: List[ChipSection] = []
         self._syncing = False
-        self._bar_layout = QHBoxLayout(self)
-        self._bar_layout.setContentsMargins(0, 0, 0, 0)
-        self._bar_layout.setSpacing(6)
-        # 末端弹簧：芯片始终靠左排列
-        self._bar_layout.addStretch(1)
+        # 流式布局：宽度够时芯片一横排，栏收缩后芯片自动换行成"导轨"
+        self._bar_layout = FlowLayout(self, margin=0, h_spacing=6, v_spacing=4)
+        # 宽度随父栏收缩，高度按宽度换行自适应
+        self.setMinimumWidth(108)
 
     def set_exclusive(self, exclusive: bool) -> None:
         self._exclusive = bool(exclusive)
@@ -320,8 +410,7 @@ class ChipBar(QWidget):
             lambda _checked=False, s=section:
                 s.set_collapsed(not s.is_collapsed(), animate=True)
         )
-        # 插到末端弹簧之前
-        self._bar_layout.insertWidget(self._bar_layout.count() - 1, btn)
+        self._bar_layout.addWidget(btn)
         section._chip = btn
         section.collapsedChanged.connect(
             lambda c, s=section: self._on_section_changed(s, c)
@@ -1418,9 +1507,22 @@ class TableFilterTab(QWidget):
         splitter.addWidget(right_panel)
         
         splitter.setSizes([285, 280, 285])
-        
+
         main_layout.addWidget(splitter)
         self.setLayout(main_layout)
+
+        # 三栏引用：某栏所有面板都收起时，该栏平滑收缩为窄"芯片导轨"，
+        # 腾出的宽度自动分给仍有面板展开的栏，避免大块空背板
+        self.data_splitter = splitter
+        self._rail_columns = [
+            (left_panel, left_bar),
+            (middle_panel, middle_bar),
+            (right_panel, right_bar),
+        ]
+        self._rail_anim: Optional[QVariantAnimation] = None
+        for _panel, bar in self._rail_columns:
+            for sec in bar.sections:
+                sec.collapsedChanged.connect(self._schedule_rail_relayout)
 
         # 注册所有可折叠面板，供全局精简开关遍历
         self._collapsible_groups = [
@@ -1458,6 +1560,81 @@ class TableFilterTab(QWidget):
                 g.set_collapsed(False, animate=True)
             elif not should_open and not g.is_collapsed():
                 g.set_collapsed(True, animate=True)
+
+    # --------------------- 空栏芯片导轨（自动收缩/恢复） ---------------------
+    _RAIL_WIDTH = 126
+
+    def _schedule_rail_relayout(self, *_args):
+        """面板折叠/展开后，延迟到布局事件处理完再重算栏宽（动画起始态已确定）。"""
+        QTimer.singleShot(0, self._relayout_rails)
+
+    def _relayout_rails(self):
+        """全收起的栏平滑收缩为窄芯片导轨，腾出的宽度按比例分给展开的栏。"""
+        sp = self.data_splitter
+        if sp is None:
+            return
+        start = sp.sizes()
+        if len(start) != 3 or sum(start) <= 0:
+            return
+        total = sum(start)
+        closed = [
+            all(s.is_collapsed() for s in bar.sections)
+            for _p, bar in self._rail_columns
+        ]
+        # 每栏导轨宽度按该栏最宽芯片动态计算（FlowLayout 会自动换行）
+        rails = [
+            max(112, bar.sizeHint().width() + 12)
+            for _p, bar in self._rail_columns
+        ]
+        if not hasattr(self, "_rail_weights"):
+            self._rail_weights = [285.0, 280.0, 285.0]
+        n_closed = sum(closed)
+        avail = total - sum(rails[i] for i, c in enumerate(closed) if c)
+        open_weight = sum(
+            self._rail_weights[i] for i, c in enumerate(closed) if not c
+        )
+        target = []
+        for i, is_closed in enumerate(closed):
+            if is_closed or open_weight <= 0:
+                target.append(rails[i])
+            else:
+                target.append(max(rails[i], int(avail * self._rail_weights[i] / open_weight)))
+        # 修正取整误差到最后一个展开栏
+        diff = total - sum(target)
+        if diff != 0:
+            for i in range(2, -1, -1):
+                if not closed[i]:
+                    target[i] += diff
+                    break
+        if target == start:
+            return
+        if self._rail_anim is not None:
+            try:
+                self._rail_anim.stop()
+            except Exception:
+                pass
+        anim = QVariantAnimation(self)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setDuration(300)
+        anim.setEasingCurve(QEasingCurve.Type.OutQuart)
+
+        def on_change(t, st=list(start), tg=target):
+            sp.setSizes([
+                int(s + (e - s) * t) for s, e in zip(st, tg)
+            ])
+
+        def on_finish():
+            # 记住当前展开栏宽度比例，供下次恢复时按原比例分配
+            cur = sp.sizes()
+            for i, is_closed in enumerate(closed):
+                if not is_closed and cur[i] > rails[i]:
+                    self._rail_weights[i] = float(cur[i])
+
+        anim.valueChanged.connect(on_change)
+        anim.finished.connect(on_finish)
+        self._rail_anim = anim
+        anim.start()
 
     def connect_signals(self):
         self.save_config_btn.clicked.connect(self.save_config)
