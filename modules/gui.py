@@ -40,6 +40,85 @@ _AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _AUTOSTART_REG_NAME = "ExcelSendWx"
 
 
+class CollapsibleGroupBox(QWidget):
+    """可折叠分组框：点击标题栏切换内容显示/隐藏，▼ 展开 / ▶ 折叠。
+
+    用法（替代 QGroupBox，最小化改动）::
+
+        group = CollapsibleGroupBox("配置管理", collapsed=True)
+        layout = group.contentLayout()      # 替代 QVBoxLayout(group)
+        layout.addWidget(...)
+        parent_layout.addWidget(group)
+    """
+
+    collapsedChanged = pyqtSignal(bool)  # True = 已折叠
+
+    _TITLE_CSS = (
+        "QPushButton{text-align:left;background:#e2e4e8;border:none;"
+        "padding:5px 8px;font-weight:bold;border-radius:3px}"
+        "QPushButton:hover{background:#cfcfd6}"
+        "QPushButton:pressed{background:#c0c0c8}"
+    )
+
+    def __init__(self, title: str = "", parent=None, collapsed: bool = False):
+        super().__init__(parent)
+        self._collapsed = False
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._title_btn = QPushButton(f"▼  {title}")
+        self._title_btn.setStyleSheet(self._TITLE_CSS)
+        self._title_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._title_btn.clicked.connect(self.toggle)
+        outer.addWidget(self._title_btn)
+
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(8, 4, 8, 6)
+        self._content_layout.setSpacing(5)
+        outer.addWidget(self._content)
+
+        if collapsed:
+            self.set_collapsed(True)
+
+    # ---- public API ----
+    def contentLayout(self) -> QVBoxLayout:
+        """返回内容区布局，供外部 addWidget / addLayout（替代 QVBoxLayout(group)）。"""
+        return self._content_layout
+
+    def set_title(self, title: str) -> None:
+        arrow = "▶" if self._collapsed else "▼"
+        self._title_btn.setText(f"{arrow}  {title}")
+
+    def is_collapsed(self) -> bool:
+        return self._collapsed
+
+    def set_collapsed(self, collapsed: bool) -> None:
+        collapsed = bool(collapsed)
+        if collapsed == self._collapsed:
+            return
+        self._collapsed = collapsed
+        self._content.setVisible(not collapsed)
+        # 更新箭头
+        txt = self._title_btn.text()
+        prefix = "▶" if collapsed else "▼"
+        if txt.startswith(("▶", "▼")):
+            txt = prefix + txt[1:]
+        else:
+            txt = f"{prefix}  {txt}"
+        self._title_btn.setText(txt)
+        self.collapsedChanged.emit(collapsed)
+
+    def toggle(self) -> None:
+        self.set_collapsed(not self._collapsed)
+
+    def setEnabled(self, enabled: bool) -> None:
+        """重写：标题栏保持可点，只禁用内容区（兼容 weekday_group_box.setEnabled 调用）。"""
+        super().setEnabled(enabled)
+        self._content.setEnabled(enabled)
+
+
 def _get_autostart_command() -> str:
     """获取用于注册表 Run 键的启动命令。
 
@@ -782,8 +861,8 @@ class TableFilterTab(QWidget):
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         
-        config_group = QGroupBox("配置管理")
-        config_layout = QVBoxLayout(config_group)
+        config_group = CollapsibleGroupBox("配置管理", collapsed=True)
+        config_layout = config_group.contentLayout()
 
         self.current_config_label = QLabel("当前配置: 未加载")
         self.current_config_label.setWordWrap(True)
@@ -813,8 +892,8 @@ class TableFilterTab(QWidget):
 
         left_layout.addWidget(config_group)
 
-        url_group = QGroupBox("文档设置")
-        url_layout = QVBoxLayout(url_group)
+        url_group = CollapsibleGroupBox("文档设置")
+        url_layout = url_group.contentLayout()
         
         excel_btn_layout = QHBoxLayout()
         self.excel_btn = QPushButton("📂 选择Excel文件")
@@ -875,8 +954,8 @@ class TableFilterTab(QWidget):
         
         left_layout.addWidget(url_group)
         
-        filter_group = QGroupBox("筛选条件")
-        filter_layout = QVBoxLayout(filter_group)
+        filter_group = CollapsibleGroupBox("筛选条件", collapsed=True)
+        filter_layout = filter_group.contentLayout()
         
         self.filter_conditions_layout = QVBoxLayout()
         filter_layout.addLayout(self.filter_conditions_layout)
@@ -905,8 +984,8 @@ class TableFilterTab(QWidget):
         middle_panel = QWidget()
         middle_layout = QVBoxLayout(middle_panel)
         
-        persons_group = QGroupBox("人员列表")
-        persons_layout = QVBoxLayout(persons_group)
+        persons_group = CollapsibleGroupBox("人员列表")
+        persons_layout = persons_group.contentLayout()
         
         self.persons_list = QListWidget()
         self.persons_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
@@ -922,8 +1001,8 @@ class TableFilterTab(QWidget):
         
         middle_layout.addWidget(persons_group)
         
-        preview_group = QGroupBox("数据预览")
-        preview_layout = QVBoxLayout(preview_group)
+        preview_group = CollapsibleGroupBox("数据预览")
+        preview_layout = preview_group.contentLayout()
         
         self.preview_text = QTextEdit()
         self.preview_text.setReadOnly(True)
@@ -939,8 +1018,8 @@ class TableFilterTab(QWidget):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         
-        send_group = QGroupBox("发送设置")
-        send_layout = QVBoxLayout(send_group)
+        send_group = CollapsibleGroupBox("发送设置")
+        send_layout = send_group.contentLayout()
         
         send_layout.addWidget(QLabel("微信接收人(手动指定):"))
         self.wechat_edit = QLineEdit()
@@ -1029,8 +1108,8 @@ class TableFilterTab(QWidget):
         
         right_layout.addWidget(send_group)
         
-        progress_group = QGroupBox("发送进度")
-        progress_layout = QVBoxLayout(progress_group)
+        progress_group = CollapsibleGroupBox("发送进度")
+        progress_layout = progress_group.contentLayout()
         
         self.progress_bar = QProgressBar()
         self.progress_bar.setValue(0)
@@ -1042,8 +1121,8 @@ class TableFilterTab(QWidget):
         
         right_layout.addWidget(progress_group)
         
-        log_group = QGroupBox("日志")
-        log_layout = QVBoxLayout(log_group)
+        log_group = CollapsibleGroupBox("日志")
+        log_layout = log_group.contentLayout()
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
@@ -1052,8 +1131,9 @@ class TableFilterTab(QWidget):
         
         right_layout.addWidget(log_group)
         
-        control_group = QGroupBox("发送控制")
-        control_layout = QHBoxLayout(control_group)
+        control_group = CollapsibleGroupBox("发送控制")
+        control_layout = QHBoxLayout()
+        control_group.contentLayout().addLayout(control_layout)
         
         self.start_send_btn = QPushButton("▶ 开始发送")
         self.start_send_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px; font-size: 14px;")
@@ -1094,6 +1174,24 @@ class TableFilterTab(QWidget):
         
         main_layout.addWidget(splitter)
         self.setLayout(main_layout)
+
+        # 注册所有可折叠分组，供全局精简开关遍历
+        self._collapsible_groups = [
+            config_group, url_group, filter_group,
+            persons_group, preview_group,
+            send_group, progress_group, log_group, control_group,
+        ]
+        # 保存自动折叠需要引用的分组实例
+        self.config_group = config_group
+        self.url_group = url_group
+        self.filter_group = filter_group
+        self.send_group = send_group
+
+    def _collapse_groups(self, *groups):
+        """批量折叠指定分组（忽略 None）。"""
+        for g in groups:
+            if g is not None:
+                g.set_collapsed(True)
 
     def connect_signals(self):
         self.save_config_btn.clicked.connect(self.save_config)
@@ -1246,6 +1344,8 @@ class TableFilterTab(QWidget):
             "保存成功",
             f"配置已保存到:\n{saved_path}",
         )
+        # 保存成功后自动折叠配置管理区
+        self._collapse_groups(self.config_group)
         return True
 
     def load_config(self):
@@ -1922,6 +2022,8 @@ class TableFilterTab(QWidget):
                 self.log(f"⚠ 建立微信映射失败: {e}")
         
         self.log(f"数据加载完成！找到 {self.persons_list.count()} 个人")
+        # 自动折叠左侧配置区，让人员列表和发送区更宽敞
+        self._collapse_groups(self.config_group, self.url_group, self.filter_group)
 
     def log(self, message):
         self.log_text.append(message)
@@ -2052,6 +2154,8 @@ class TableFilterTab(QWidget):
             lambda current=worker: self.on_send_finished(current)
         )
         worker.start()
+        # 自动折叠发送设置区，保留进度/日志/控制可见
+        self._collapse_groups(self.send_group)
 
     def pause_send(self):
         if self.worker and self.worker.isRunning():
@@ -2112,6 +2216,7 @@ class TableFilterTab(QWidget):
             lambda current=worker: self.on_send_finished(current)
         )
         worker.start()
+        self._collapse_groups(self.send_group)
 
     def on_send_finished(self, worker):
         if worker is self.worker:
@@ -2233,8 +2338,8 @@ class ScheduleTab(QWidget):
         main_layout.setSpacing(8)
 
         # --- 左侧：任务列表 + 通用按钮 ---
-        left_group = QGroupBox("定时任务列表")
-        left_layout = QVBoxLayout(left_group)
+        left_group = CollapsibleGroupBox("定时任务列表")
+        left_layout = left_group.contentLayout()
 
         self.task_list = QListWidget()
         self.task_list.setMinimumWidth(240)
@@ -2284,8 +2389,8 @@ class ScheduleTab(QWidget):
         right_layout.setSpacing(6)
 
         # 基本
-        base_group = QGroupBox("任务基础")
-        base_layout = QVBoxLayout(base_group)
+        base_group = CollapsibleGroupBox("任务基础")
+        base_layout = base_group.contentLayout()
         row = QHBoxLayout()
         row.addWidget(QLabel("任务名称:"))
         self.name_edit = QLineEdit()
@@ -2298,8 +2403,8 @@ class ScheduleTab(QWidget):
         right_layout.addWidget(base_group)
 
         # 重复规则
-        repeat_group = QGroupBox("重复规则")
-        repeat_layout = QVBoxLayout(repeat_group)
+        repeat_group = CollapsibleGroupBox("重复规则")
+        repeat_layout = repeat_group.contentLayout()
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("模式:"))
         self.repeat_mode_combo = QComboBox()
@@ -2337,8 +2442,8 @@ class ScheduleTab(QWidget):
         right_layout.addWidget(repeat_group)
 
         # 发送内容
-        send_group = QGroupBox("发送内容")
-        send_layout = QVBoxLayout(send_group)
+        send_group = CollapsibleGroupBox("发送内容")
+        send_layout = send_group.contentLayout()
 
         send_layout.addWidget(QLabel("接收人(好友/群名，支持模糊匹配，每行一个或英文逗号分隔):"))
         self.recipients_edit = QTextEdit()
@@ -2430,8 +2535,9 @@ class ScheduleTab(QWidget):
         right_layout.addWidget(send_group)
 
         # 电脑锁定/完成后行为配置（任务级，每个任务可单独设置）
-        lock_group = QGroupBox("电脑锁定 / 完成后行为")
-        lock_layout = QHBoxLayout(lock_group)
+        lock_group = CollapsibleGroupBox("电脑锁定 / 完成后行为", collapsed=True)
+        lock_layout = QHBoxLayout()
+        lock_group.contentLayout().addLayout(lock_layout)
         self.keep_unlock_check = QCheckBox("执行期间防自动锁定")
         self.keep_unlock_check.setToolTip(
             "开启后：任务执行期间阻止电脑自动锁定/休眠，确保发送不被打断。\n"
@@ -2467,8 +2573,8 @@ class ScheduleTab(QWidget):
         right_layout.addLayout(action_row)
 
         # 日志（共享主日志的回调，这里也放只读面板，方便查看）
-        log_group = QGroupBox("定时发送日志")
-        log_layout = QVBoxLayout(log_group)
+        log_group = CollapsibleGroupBox("定时发送日志")
+        log_layout = log_group.contentLayout()
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMinimumHeight(140)
@@ -2476,6 +2582,18 @@ class ScheduleTab(QWidget):
         right_layout.addWidget(log_group, 1)
 
         main_layout.addWidget(right, 1)
+
+        # 注册所有可折叠分组，供全局精简开关遍历
+        self._collapsible_groups = [
+            left_group, base_group, repeat_group,
+            send_group, lock_group, log_group,
+        ]
+
+    def _collapse_groups(self, *groups):
+        """批量折叠指定分组（忽略 None）。"""
+        for g in groups:
+            if g is not None:
+                g.set_collapsed(True)
 
     # ------------------------- 信号绑定 -------------------------
     def connect_signals(self):
@@ -3209,6 +3327,20 @@ class MainWindow(QMainWindow):
         self.tab_widget = QTabWidget()
         self.tab_widget.addTab(self.table_filter_tab, "📊 数据发送")
         self.tab_widget.addTab(self.schedule_tab, "⏰ 定时发送")
+
+        # 全局精简/详细开关：放 QTabWidget 右上角 corner
+        self._compact_mode = False
+        self.compact_btn = QPushButton("📑 精简模式")
+        self.compact_btn.setStyleSheet(
+            "QPushButton{padding:3px 10px;font-size:12px;border:1px solid #bbb;"
+            "border-radius:3px;background:#f5f5f5}"
+            "QPushButton:hover{background:#e8e8e8}"
+        )
+        self.compact_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.compact_btn.clicked.connect(self._on_compact_toggle)
+        self.tab_widget.setCornerWidget(self.compact_btn)
+        self.tab_widget.currentChanged.connect(self._sync_compact_btn)
+
         self.setCentralWidget(self.tab_widget)
 
         # 注入 worker 创建回调：任何发送 worker 启动后，在任务栏/窗口标题显示进度，
@@ -3217,6 +3349,25 @@ class MainWindow(QMainWindow):
         self.schedule_tab.worker_created_cb = self._attach_global_progress_schedule
         self._taskbar = None
         self._send_progress_active = False
+
+    def _on_compact_toggle(self):
+        """全局精简/详细模式：折叠/展开当前 tab 的所有可折叠分组。"""
+        self._compact_mode = not self._compact_mode
+        widget = self.tab_widget.currentWidget()
+        groups = getattr(widget, "_collapsible_groups", [])
+        for g in groups:
+            g.set_collapsed(self._compact_mode)
+        self.compact_btn.setText("📄 详细模式" if self._compact_mode else "📑 精简模式")
+
+    def _sync_compact_btn(self, _index):
+        """切换 tab 时根据当前 tab 的折叠状态更新按钮文字。"""
+        widget = self.tab_widget.currentWidget()
+        groups = getattr(widget, "_collapsible_groups", [])
+        if not groups:
+            return
+        all_collapsed = all(g.is_collapsed() for g in groups)
+        self._compact_mode = all_collapsed
+        self.compact_btn.setText("📄 详细模式" if all_collapsed else "📑 精简模式")
 
     # ------------------------- 全局发送进度（任务栏/标题/托盘） -------------------------
     def _ensure_taskbar(self):
