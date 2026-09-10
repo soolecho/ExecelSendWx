@@ -290,6 +290,8 @@ class SendWorker(QThread):
         total_count = len(self.tasks)
         sender = None
         result_emitted = False
+        # 预初始化：若在赋值前抛异常，finally 还原时不能引用未定义变量
+        _orig_sender_log = None
 
         # 附加文件预检：配置了附件但文件不存在时提示并按无附件继续。
         # 必须在 _normalize_task(会读取 self.attachment 生成发送步骤)之前执行。
@@ -488,11 +490,15 @@ class SendWorker(QThread):
                     except Exception:
                         pass
                 # 还原 sender.log，避免共享单例的 log 回调指向已销毁的 QThread 信号
+                if _orig_sender_log is not None:
+                    try:
+                        sender.log = _orig_sender_log
+                    except Exception:
+                        pass
                 try:
-                    sender.log = _orig_sender_log
+                    sender.cleanup_temp_images()
                 except Exception:
                     pass
-                sender.cleanup_temp_images()
 
     def set_paused(self, value):
         if value:
@@ -2732,20 +2738,52 @@ class ScheduleTab(QWidget):
 
         def on_test():
             test_city = city_edit.text().strip() or "北京"
-            self.log(f"[天气] 开始测试连接：city={test_city} url={url_edit.text().strip()}")
-            try:
-                ok, m = weather_fetcher.test_connection(
-                    key_edit.text().strip(),
-                    url_edit.text().strip(),
-                    test_city,
-                    log_fn=lambda msg: self.log(f"[天气] {msg}"),
-                )
-            except Exception as exc:
-                ok, m = False, f"测试异常: {exc}"
-                self.log(f"[天气] ❌ {m}")
-            color = "#2e7d32" if ok else "#c62828"
-            result_label.setText(f'<span style="color:{color}">{m}</span>')
-            result_label.setTextFormat(Qt.TextFormat.RichText)
+            base_url = url_edit.text().strip()
+            api_key = key_edit.text().strip()
+            self.log(f"[天气] 开始测试连接：city={test_city} url={base_url}")
+            # 防止重复点击 + 网络请求放后台线程，避免阻塞主线程导致界面卡死
+            test_btn.setEnabled(False)
+            test_btn.setText("测试中...")
+            result_label.setText("正在测试连接，请稍候（最多约 8 秒）...")
+
+            class _TestSignal(QObject):
+                done = pyqtSignal(bool, str)
+                log = pyqtSignal(str)
+
+            sig = _TestSignal()
+
+            def on_log(msg):
+                self.log(f"[天气] {msg}")
+
+            def on_done(ok, m):
+                color = "#2e7d32" if ok else "#c62828"
+                result_label.setText(f'<span style="color:{color}">{m}</span>')
+                result_label.setTextFormat(Qt.TextFormat.RichText)
+                test_btn.setEnabled(True)
+                test_btn.setText("测试连接")
+                # 对话框关闭后信号对象随父对象回收，断开避免悬挂
+                try:
+                    sig.deleteLater()
+                except Exception:
+                    pass
+
+            sig.log.connect(on_log)
+            sig.done.connect(on_done)
+
+            def _worker():
+                try:
+                    ok, m = weather_fetcher.test_connection(
+                        api_key,
+                        base_url,
+                        test_city,
+                        log_fn=lambda msg: sig.log.emit(str(msg)),
+                    )
+                except Exception as exc:
+                    ok, m = False, f"测试异常: {exc}"
+                    sig.log.emit(str(m))
+                sig.done.emit(bool(ok), str(m))
+
+            threading.Thread(target=_worker, daemon=True, name="WeatherTest").start()
 
         def on_save():
             try:
@@ -3094,6 +3132,17 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
 
+        # 定时页「立即执行」启动的 worker（ScheduleTab 自己持有）
+        schedule_tab = getattr(self, "schedule_tab", None)
+        if schedule_tab is not None:
+            manual_worker = getattr(schedule_tab, "send_worker", None)
+            if manual_worker and isinstance(manual_worker, QThread):
+                try:
+                    if manual_worker.isRunning():
+                        manual_worker.stop()
+                except Exception:
+                    pass
+
         dispatcher = getattr(self, "schedule_dispatcher", None)
         if dispatcher is not None:
             try:
@@ -3113,16 +3162,23 @@ class MainWindow(QMainWindow):
         worker = self.table_filter_tab.worker
         excel_worker = self.table_filter_tab.excel_worker
         schedule_worker = getattr(self, "_schedule_worker", None)
+        manual_worker = None
+        schedule_tab = getattr(self, "schedule_tab", None)
+        if schedule_tab is not None:
+            manual_worker = getattr(schedule_tab, "send_worker", None)
         running = bool(
             (worker and worker.isRunning())
             or (excel_worker and excel_worker.isRunning())
         )
-        if not running and schedule_worker is not None:
-            try:
-                if isinstance(schedule_worker, QThread) and schedule_worker.isRunning():
-                    running = True
-            except Exception:
-                pass
+        for w in (schedule_worker, manual_worker):
+            if running:
+                break
+            if w is not None:
+                try:
+                    if isinstance(w, QThread) and w.isRunning():
+                        running = True
+                except Exception:
+                    pass
         return running
 
     def _poll_worker_shutdown(self):
