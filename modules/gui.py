@@ -564,6 +564,7 @@ class ScheduleSendWorker(QThread):
     """定时消息发送 Worker：为多个接收人逐条发送自定义文字，含3次重试+模糊匹配。"""
 
     finished_with_result = pyqtSignal(int, int, list)  # success, failed, failed_recipients
+    progress = pyqtSignal(int, int)  # current, total：用于任务栏/标题进度（主线程连接）
 
     def __init__(
         self,
@@ -700,6 +701,7 @@ class ScheduleSendWorker(QThread):
                 if not recipient:
                     continue
                 self.log(f"[定时] [{idx+1}/{total}] 发送到 {recipient}")
+                self.progress.emit(idx + 1, total)
 
                 text_ok = False
                 # 按任务配置的发送顺序逐项发送；接收人成败以消息文字为准，附件失败不计入失败
@@ -761,6 +763,8 @@ class TableFilterTab(QWidget):
         self.headers = []
         self.excel_worker = None
         self.worker = None
+        # 由 MainWindow 注入：worker 创建后回调，用于连接任务栏进度等全局信号
+        self.worker_created_cb = None
         self.last_failed_tasks = []
         self.config_manager = ConfigManager()
         self.current_config_path = None
@@ -2035,6 +2039,11 @@ class TableFilterTab(QWidget):
             attachment=self.attachment_edit.text().strip()
         )
         self.worker = worker
+        if self.worker_created_cb:
+            try:
+                self.worker_created_cb(worker)
+            except Exception:
+                pass
         worker.signals.result.connect(self.on_send_result)
         worker.signals.error.connect(self.on_send_error)
         worker.signals.log.connect(self.log)
@@ -2090,6 +2099,11 @@ class TableFilterTab(QWidget):
             attachment=self.attachment_edit.text().strip()
         )
         self.worker = worker
+        if self.worker_created_cb:
+            try:
+                self.worker_created_cb(worker)
+            except Exception:
+                pass
         worker.signals.result.connect(self.on_send_result)
         worker.signals.error.connect(self.on_send_error)
         worker.signals.log.connect(self.log)
@@ -2206,6 +2220,8 @@ class ScheduleTab(QWidget):
         self.send_worker: Optional[ScheduleSendWorker] = None
         # 接收 MainWindow 的统一日志回调，外部赋值
         self.log_callback = None
+        # MainWindow 注入：worker 创建后回调，用于连接任务栏进度等全局信号
+        self.worker_created_cb = None
         self.init_ui()
         self.connect_signals()
         self.reload_tasks()
@@ -2953,6 +2969,11 @@ class ScheduleTab(QWidget):
                     self.log(f"[定时] 任务「{current.name}」已开启防锁定守护")
 
         self.log(f"[定时] 手动立即执行任务: {current.name}")
+        if self.worker_created_cb:
+            try:
+                self.worker_created_cb(worker)
+            except Exception:
+                pass
         worker.start()
 
     def _cleanup_schedule_worker_after(self, worker):
@@ -3141,6 +3162,8 @@ class MainWindow(QMainWindow):
     _schedule_log_signal = pyqtSignal(str)
     # 跨线程触发投递：调度器线程 emit -> 主线程创建 QThread（确保 affinity 正确）
     _schedule_trigger_signal = pyqtSignal(object, str)
+    # 发送进度开始：attach 可能发生在调度线程，用信号排队到主线程再碰 GUI/COM
+    _progress_begin_signal = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -3163,6 +3186,9 @@ class MainWindow(QMainWindow):
         # 因为子线程没有 Qt event loop，singleShot 永远不会触发
         self._schedule_log_signal.connect(self._on_schedule_log_signal)
         self._schedule_trigger_signal.connect(self._on_schedule_trigger_in_main)
+        # 进度开始信号始终在主线程执行（receiver=MainWindow），保证 setWindowTitle/
+        # winId()/COM/托盘 全部在主线程，避免调度线程跨线程操作 GUI
+        self._progress_begin_signal.connect(self._begin_send_progress)
 
         # 电脑锁定守护：阻止定时发送期间电脑自动锁定，任务完成后自动锁回
         self.workstation_guard = WorkstationGuard(
@@ -3184,6 +3210,124 @@ class MainWindow(QMainWindow):
         self.tab_widget.addTab(self.table_filter_tab, "📊 数据发送")
         self.tab_widget.addTab(self.schedule_tab, "⏰ 定时发送")
         self.setCentralWidget(self.tab_widget)
+
+        # 注入 worker 创建回调：任何发送 worker 启动后，在任务栏/窗口标题显示进度，
+        # 主窗口被微信窗口挡住时也能在任务栏看到发送进度
+        self.table_filter_tab.worker_created_cb = self._attach_global_progress_table
+        self.schedule_tab.worker_created_cb = self._attach_global_progress_schedule
+        self._taskbar = None
+        self._send_progress_active = False
+
+    # ------------------------- 全局发送进度（任务栏/标题/托盘） -------------------------
+    def _ensure_taskbar(self):
+        """懒加载任务栏进度条（需要 native 窗口 HWND，show 之后才有效）。"""
+        if self._taskbar is not None:
+            return self._taskbar
+        try:
+            from modules.taskbar_progress import TaskbarProgress
+            tb = TaskbarProgress(int(self.winId()))
+            self._taskbar = tb if tb.available else False
+        except Exception:
+            self._taskbar = False
+        return self._taskbar if self._taskbar is not False else None
+
+    def _begin_send_progress(self):
+        self._send_progress_active = True
+        tb = self._ensure_taskbar()
+        if tb:
+            tb.set_indeterminate()
+        self.setWindowTitle(f"📤 发送中… - {APP_TITLE}")
+        try:
+            self.tray_icon.setToolTip(f"{APP_TITLE}\n📤 发送中…")
+        except Exception:
+            pass
+
+    def _update_send_progress(self, current, total):
+        if not self._send_progress_active:
+            self._begin_send_progress()
+        try:
+            current = max(0, int(current))
+            total = max(1, int(total))
+            pct = int(current * 100 / total)
+        except Exception:
+            return
+        tb = self._ensure_taskbar()
+        if tb:
+            tb.set_value(current, total)
+        title = f"📤 发送中 {current}/{total} ({pct}%) - {APP_TITLE}"
+        self.setWindowTitle(title)
+        try:
+            self.tray_icon.setToolTip(f"{APP_TITLE}\n{title}")
+        except Exception:
+            pass
+
+    def _finish_send_progress(self, failed=0):
+        tb = self._ensure_taskbar()
+        if tb and failed:
+            tb.set_error()
+        elif tb:
+            tb.clear()
+        self.setWindowTitle(APP_TITLE)
+        try:
+            self.tray_icon.setToolTip(APP_TITLE)
+        except Exception:
+            pass
+        self._send_progress_active = False
+        # 有失败时红色状态停留 4 秒再清，提示用户注意
+        if tb and failed:
+            QTimer.singleShot(4000, lambda: tb.clear() if tb else None)
+
+    def _attach_global_progress_table(self, worker):
+        """数据发送 worker（进度信号为 0-100 百分比）。
+
+        注意：这些信号由 worker 线程发出，槽必须是 MainWindow 的绑定方法
+        （receiver 为主线程 QObject，AutoConnection 自动变 QueuedConnection，
+        在主线程执行）。不能用 lambda——lambda 无 receiver，会在 worker 线程
+        直接执行，跨线程操作 GUI/COM 会导致界面卡死。
+        """
+        try:
+            self._progress_begin_signal.emit()
+            worker.signals.progress.connect(self._on_table_progress_pct)
+            # result = (success, failed, total, failed_tasks)
+            worker.signals.result.connect(self._on_table_result)
+            worker.signals.error.connect(self._on_table_error)
+            worker.finished.connect(self._clear_progress_if_idle)
+        except Exception:
+            pass
+
+    def _on_table_progress_pct(self, pct):
+        self._update_send_progress(pct, 100)
+
+    def _on_table_result(self, r):
+        failed = r[1] if isinstance(r, (list, tuple)) and len(r) > 1 else 0
+        self._finish_send_progress(failed)
+
+    def _on_table_error(self, _e):
+        self._finish_send_progress(failed=1)
+
+    def _attach_global_progress_schedule(self, worker):
+        """定时发送 worker（进度信号为 current/total）。
+
+        同理，finished_with_result 虽在另一处用 DirectConnection 连接，但本
+        连接是独立的；绑定方法 receiver 在主线程，AutoConnection → 排队到主线程。
+        """
+        try:
+            # emit 线程安全；_begin_send_progress 经排队在主线程执行，
+            # 保证本方法即便被调度线程调用也不会跨线程碰 GUI/COM
+            self._progress_begin_signal.emit()
+            worker.progress.connect(self._update_send_progress)
+            worker.finished_with_result.connect(self._on_schedule_result)
+        except Exception:
+            pass
+
+    def _on_schedule_result(self, _ok, fail, _recipients):
+        self._finish_send_progress(fail)
+
+    def _clear_progress_if_idle(self):
+        # finished 在 result/error 之后触发；仅当两者都未结束进度（异常退出兜底）才清除，
+        # 否则保留 result/error 设置的状态（如失败红色停留 4 秒）
+        if self._send_progress_active:
+            self._finish_send_progress(0)
 
     def _schedule_log_to_main(self, message):
         try:
@@ -3267,6 +3411,11 @@ class MainWindow(QMainWindow):
             worker.finished.connect(
                 lambda: self._cleanup_main_schedule_worker_after(worker)
             )
+            # 任务栏/标题进度：默认连接（AutoConnection），槽在主线程执行，可安全更新 GUI
+            try:
+                self._attach_global_progress_schedule(worker)
+            except Exception:
+                pass
             worker.start()
 
             total_timeout = max(60.0, 60.0 * (len(task.recipients) or 1) * 10.0)
