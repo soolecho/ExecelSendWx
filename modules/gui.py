@@ -242,7 +242,8 @@ class SendWorker(QThread):
         send_interval=2,
         chat_delay=0.8,
         send_mode="text",
-        minimize_after=True
+        minimize_after=True,
+        attachment=""
     ):
         super().__init__()
         self.tasks = tasks
@@ -250,6 +251,7 @@ class SendWorker(QThread):
         self.chat_delay = chat_delay
         self.send_mode = send_mode
         self.minimize_after = bool(minimize_after)
+        self.attachment = str(attachment or "").strip()
         self.signals = WorkerSignals()
         self.paused_event = threading.Event()
         self.stopped_event = threading.Event()
@@ -278,6 +280,8 @@ class SendWorker(QThread):
             steps.append({"type": "text", "index": 0})
         if custom_msg:
             steps.append({"type": "custom", "index": 0})
+        if self.attachment:
+            steps.append({"type": "attachment", "index": 0})
         return steps
 
     def run(self):
@@ -286,7 +290,15 @@ class SendWorker(QThread):
         total_count = len(self.tasks)
         sender = None
         result_emitted = False
-        
+
+        # 附加文件预检：配置了附件但文件不存在时提示并按无附件继续。
+        # 必须在 _normalize_task(会读取 self.attachment 生成发送步骤)之前执行。
+        if self.attachment and not os.path.exists(self.attachment):
+            self.signals.log.emit(
+                f"⚠ 附加文件不存在，本次发送不带附件: {self.attachment}"
+            )
+            self.attachment = ""
+
         try:
             self.tasks = [self._normalize_task(task) for task in self.tasks]
             self.signals.log.emit("初始化微信客户端...")
@@ -376,6 +388,17 @@ class SendWorker(QThread):
                                 stop_event=self.stopped_event
                             )
                             step["index"] = next_index
+                        elif step_type == "attachment":
+                            success = sender.send_file(
+                                self.attachment,
+                                recipient,
+                                chat_delay=self.chat_delay,
+                                stop_event=self.stopped_event
+                            )
+                            if success:
+                                self.signals.log.emit(
+                                    f"[{i+1}/{total_count}] 已发送附加文件"
+                                )
                         else:
                             success = sender.send_message(
                                 task["custom_msg"],
@@ -529,6 +552,7 @@ class ScheduleSendWorker(QThread):
         log_callback=None,
         default_city="",
         minimize_after=True,
+        attachment="",
     ):
         super().__init__()
         self.recipients = list(recipients or [])
@@ -537,6 +561,7 @@ class ScheduleSendWorker(QThread):
         self.send_interval = max(0.0, min(30.0, float(send_interval)))
         self.default_city = str(default_city or "")
         self.minimize_after = bool(minimize_after)
+        self.attachment = str(attachment or "").strip()
         self._log_cb = log_callback
         self.stopped_event = threading.Event()
         self._sender = None
@@ -618,6 +643,14 @@ class ScheduleSendWorker(QThread):
             return
 
         total = len(self.recipients)
+        # 附加文件预检：配置了附件但文件不存在时提示并跳过附件（文字照常发送）
+        attachment_ok = False
+        if self.attachment:
+            if os.path.exists(self.attachment):
+                attachment_ok = True
+                self.log(f"[定时] 本任务将附加发送文件: {os.path.basename(self.attachment)}")
+            else:
+                self.log(f"[定时] ⚠ 附加文件不存在，跳过附件发送: {self.attachment}")
         try:
             for idx, recipient in enumerate(self.recipients):
                 if self.stopped_event.is_set():
@@ -641,6 +674,16 @@ class ScheduleSendWorker(QThread):
                     stop_event=self.stopped_event,
                 )
                 self._first_send = False
+                # 文字发送成功后再发附加文件；附件失败只记录日志，
+                # 不把整个接收人判为失败（避免重试时文字重复发送）
+                if ok and attachment_ok:
+                    if not self._sender.send_file(
+                        self.attachment,
+                        recipient,
+                        chat_delay=self.chat_delay,
+                        stop_event=self.stopped_event,
+                    ):
+                        self.log(f"[定时] ⚠ 附加文件发送失败: {recipient}")
                 if ok:
                     success += 1
                 else:
@@ -894,6 +937,20 @@ class TableFilterTab(QWidget):
         self.custom_msg_edit.setMaximumHeight(60)
         self.custom_msg_edit.setEnabled(False)
         send_layout.addWidget(self.custom_msg_edit)
+
+        attach_row = QHBoxLayout()
+        attach_row.addWidget(QLabel("附加文件:"))
+        self.attachment_edit = QLineEdit()
+        self.attachment_edit.setReadOnly(True)
+        self.attachment_edit.setPlaceholderText("可选，选择文件/图片随消息一起发送")
+        attach_row.addWidget(self.attachment_edit, 1)
+        self.attach_pick_btn = QPushButton("选择...")
+        self.attach_clear_btn = QPushButton("清除")
+        self.attach_pick_btn.setFixedWidth(60)
+        self.attach_clear_btn.setFixedWidth(50)
+        attach_row.addWidget(self.attach_pick_btn)
+        attach_row.addWidget(self.attach_clear_btn)
+        send_layout.addLayout(attach_row)
         
         self.send_btn = QPushButton("发送选中人员数据")
         self.send_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 5px 8px; font-size: 12px;")
@@ -993,6 +1050,8 @@ class TableFilterTab(QWidget):
         self.clear_filter_btn.clicked.connect(self.clear_filter_conditions)
         self.apply_filter_btn.clicked.connect(self.apply_filter)
         self.custom_msg_checkbox.stateChanged.connect(self.on_custom_msg_checkbox_changed)
+        self.attach_pick_btn.clicked.connect(self._on_pick_attachment)
+        self.attach_clear_btn.clicked.connect(self._on_clear_attachment)
 
     def refresh_recent_configs(self):
         self.recent_config_list.clear()
@@ -1049,6 +1108,7 @@ class TableFilterTab(QWidget):
                     self.custom_msg_checkbox.isChecked()
                 ),
                 "custom_message": self.custom_msg_edit.toPlainText(),
+                "attachment": self.attachment_edit.text().strip(),
             },
         }
 
@@ -1271,6 +1331,9 @@ class TableFilterTab(QWidget):
         self.custom_msg_edit.setPlainText(
             send_settings.get("custom_message", "")
         )
+        self.attachment_edit.setText(
+            send_settings.get("attachment", "") or ""
+        )
 
         can_load_data = (
             name_column in self.headers
@@ -1368,6 +1431,19 @@ class TableFilterTab(QWidget):
 
     def on_custom_msg_checkbox_changed(self, state):
         self.custom_msg_edit.setEnabled(state == Qt.CheckState.Checked.value)
+
+    def _on_pick_attachment(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择附加文件(文件/图片)",
+            "",
+            "常用文件 (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.pdf *.doc *.docx *.xls *.xlsx *.ppt *.pptx *.txt *.zip *.rar *.7z);;所有文件 (*.*)",
+        )
+        if path:
+            self.attachment_edit.setText(path)
+
+    def _on_clear_attachment(self):
+        self.attachment_edit.clear()
 
     def open_extract_columns_dialog(self):
         if not hasattr(self, 'headers') or not self.headers:
@@ -1768,7 +1844,8 @@ class TableFilterTab(QWidget):
             send_interval=self.send_interval_spin.value(),
             chat_delay=self.chat_delay_spin.value(),
             send_mode=send_mode,
-            minimize_after=self.minimize_check.isChecked()
+            minimize_after=self.minimize_check.isChecked(),
+            attachment=self.attachment_edit.text().strip()
         )
         self.worker = worker
         worker.signals.result.connect(self.on_send_result)
@@ -1822,7 +1899,8 @@ class TableFilterTab(QWidget):
             send_interval=self.send_interval_spin.value(),
             chat_delay=self.chat_delay_spin.value(),
             send_mode=getattr(self, 'last_send_mode', 'text'),
-            minimize_after=self.minimize_check.isChecked()
+            minimize_after=self.minimize_check.isChecked(),
+            attachment=self.attachment_edit.text().strip()
         )
         self.worker = worker
         worker.signals.result.connect(self.on_send_result)
@@ -2090,6 +2168,20 @@ class ScheduleTab(QWidget):
         city_row.addWidget(self.default_city_edit, 1)
         send_layout.addLayout(city_row)
 
+        attach_row = QHBoxLayout()
+        attach_row.addWidget(QLabel("附加文件:"))
+        self.attachment_edit = QLineEdit()
+        self.attachment_edit.setReadOnly(True)
+        self.attachment_edit.setPlaceholderText("可选，选择文件/图片随消息一起发送")
+        attach_row.addWidget(self.attachment_edit, 1)
+        self.attach_pick_btn = QPushButton("选择...")
+        self.attach_clear_btn = QPushButton("清除")
+        self.attach_pick_btn.setFixedWidth(60)
+        self.attach_clear_btn.setFixedWidth(50)
+        attach_row.addWidget(self.attach_pick_btn)
+        attach_row.addWidget(self.attach_clear_btn)
+        send_layout.addLayout(attach_row)
+
         delay_row = QHBoxLayout()
         delay_row.addWidget(QLabel("聊天窗口切换延迟(秒):"))
         self.chat_delay_spin = QDoubleSpinBox()
@@ -2168,6 +2260,8 @@ class ScheduleTab(QWidget):
         self.add_time_btn.clicked.connect(self._on_add_time)
         self.del_time_btn.clicked.connect(self._on_del_time)
         self.repeat_mode_combo.currentIndexChanged.connect(self._on_repeat_mode_changed)
+        self.attach_pick_btn.clicked.connect(self._on_pick_attachment)
+        self.attach_clear_btn.clicked.connect(self._on_clear_attachment)
         self.save_all_btn.clicked.connect(self._on_save_all)
         self.load_config_btn.clicked.connect(self._on_load_all)
         self.run_now_btn.clicked.connect(self._on_run_now)
@@ -2284,6 +2378,7 @@ class ScheduleTab(QWidget):
         self.keep_unlock_check.setChecked(bool(getattr(task, "keep_unlocked", False)))
         self.relock_check.setChecked(bool(getattr(task, "relock_after", False)))
         self.minimize_check.setChecked(bool(getattr(task, "minimize_after", True)))
+        self.attachment_edit.setText(getattr(task, "attachment", "") or "")
         self._on_repeat_mode_changed(idx)
 
     def _reset_form(self):
@@ -2303,6 +2398,7 @@ class ScheduleTab(QWidget):
         self.keep_unlock_check.setChecked(False)
         self.relock_check.setChecked(False)
         self.minimize_check.setChecked(True)
+        self.attachment_edit.clear()
 
     # ------------------------- 增删改 -------------------------
     def _on_new_task(self):
@@ -2395,8 +2491,23 @@ class ScheduleTab(QWidget):
             keep_unlocked=self.keep_unlock_check.isChecked(),
             relock_after=self.relock_check.isChecked(),
             minimize_after=self.minimize_check.isChecked(),
+            attachment=self.attachment_edit.text().strip(),
         )
         return task
+
+    # ------------------------- 附加文件 -------------------------
+    def _on_pick_attachment(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择附加文件(文件/图片)",
+            "",
+            "常用文件 (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.pdf *.doc *.docx *.xls *.xlsx *.ppt *.pptx *.txt *.zip *.rar *.7z);;所有文件 (*.*)",
+        )
+        if path:
+            self.attachment_edit.setText(path)
+
+    def _on_clear_attachment(self):
+        self.attachment_edit.clear()
 
     # ------------------------- 重复模式/时间点 -------------------------
     def _on_repeat_mode_changed(self, index):
@@ -2519,6 +2630,7 @@ class ScheduleTab(QWidget):
             log_callback=self._worker_log_signal.emit,
             default_city=current.default_city,
             minimize_after=getattr(current, "minimize_after", True),
+            attachment=getattr(current, "attachment", "") or "",
         )
 
         # 保存任务配置供完成回调使用
@@ -2745,6 +2857,7 @@ class MainWindow(QMainWindow):
             log_callback=self._post_schedule_log_from_worker,
             default_city=task.default_city,
             minimize_after=getattr(task, "minimize_after", True),
+            attachment=getattr(task, "attachment", "") or "",
         )
         self._schedule_worker = worker
         threading.Thread(

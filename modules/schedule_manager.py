@@ -61,6 +61,8 @@ class ScheduleTask:
     relock_after: bool = False   # 发送完成后自动锁定电脑
     # 发送完成后最小化微信窗口（任务级开关）
     minimize_after: bool = True
+    # 附加文件（文件/图片绝对路径），随消息额外发送；空表示不发送附件
+    attachment: str = ""
     # 已触发记录：{ "YYYY-MM-DD": ["08:30", ...] }
     fired_log: Dict[str, List[str]] = field(default_factory=dict)
     created_at: str = ""
@@ -123,6 +125,7 @@ class ScheduleTask:
             keep_unlocked=bool(data.get("keep_unlocked", False)),
             relock_after=bool(data.get("relock_after", False)),
             minimize_after=bool(data.get("minimize_after", True)),
+            attachment=str(data.get("attachment", "") or ""),
             fired_log=_normalize_fired_log(data.get("fired_log")),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
