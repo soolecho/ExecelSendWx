@@ -8,13 +8,13 @@ from PyQt6.QtWidgets import (
     QComboBox, QListWidget, QListWidgetItem, QGroupBox,
     QCheckBox, QProgressBar, QMessageBox, QSplitter, QTabWidget,
     QDoubleSpinBox, QDialog, QDialogButtonBox, QFileDialog,
-    QMenu, QStyle, QSystemTrayIcon, QSpinBox, QTimeEdit
+    QMenu, QStyle, QSystemTrayIcon, QSpinBox, QTimeEdit, QStackedWidget
 )
 from PyQt6.QtCore import (
     Qt, pyqtSignal, QObject, QThread, QTimer, QLockFile, QStandardPaths,
-    QTime
+    QTime, QEvent, QSize
 )
-from PyQt6.QtGui import QAction, QFont, QIcon
+from PyQt6.QtGui import QAction, QFont, QIcon, QGuiApplication
 
 from modules.config_manager import ConfigError, ConfigManager
 from modules.wechat_sender import WeChatSender
@@ -40,6 +40,96 @@ _AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _AUTOSTART_REG_NAME = "ExcelSendWx"
 
 
+def _app_is_dark() -> bool:
+    """根据当前应用调色板判断是否为深色（夜间）模式。"""
+    try:
+        window_lightness = QApplication.palette().color(
+            QApplication.palette().ColorRole.Window
+        ).lightness()
+        return window_lightness < 128
+    except Exception:
+        return False
+
+
+def _collapsible_title_css() -> str:
+    """折叠分组标题栏样式：显式指定文字色，明/暗主题均清晰可读。"""
+    if _app_is_dark():
+        return (
+            "QPushButton{text-align:left;background:#3a3d44;color:#f2f2f2;"
+            "border:1px solid #2a2d31;padding:5px 8px;font-weight:bold;"
+            "border-radius:3px}"
+            "QPushButton:hover{background:#494d55}"
+            "QPushButton:pressed{background:#565b64}"
+            "QPushButton:disabled{color:#8a8a8a;background:#33363b}"
+        )
+    return (
+        "QPushButton{text-align:left;background:#e2e4e8;color:#1f1f1f;"
+        "border:1px solid #c8c8ce;padding:5px 8px;font-weight:bold;"
+        "border-radius:3px}"
+        "QPushButton:hover{background:#cfcfd6}"
+        "QPushButton:pressed{background:#c0c0c8}"
+        "QPushButton:disabled{color:#9a9a9a;background:#ececed}"
+    )
+
+
+def _compact_btn_css() -> str:
+    """全局精简/详细按钮样式：明暗主题适配。"""
+    if _app_is_dark():
+        return (
+            "QPushButton{padding:3px 10px;font-size:12px;color:#f2f2f2;"
+            "border:1px solid #4a4d55;border-radius:3px;background:#3a3d44}"
+            "QPushButton:hover{background:#494d55}"
+        )
+    return (
+        "QPushButton{padding:3px 10px;font-size:12px;color:#1f1f1f;"
+        "border:1px solid #bbb;border-radius:3px;background:#f5f5f5}"
+        "QPushButton:hover{background:#e8e8e8}"
+    )
+
+
+class ElasticPage(QWidget):
+    """弹性 tab 页面容器：非当前显示的页不报告尺寸提示。
+
+    QTabWidget 内部 QStackedLayout 枚举所有页面的 sizeHint/minimumSizeHint
+    （不跳过隐藏页），导致当前页分组全部折叠后，窗口仍被另一个未折叠的 tab
+    页顶住而无法收缩。本容器在非当前页时返回 (0,0)，当前页时透传布局真实
+    尺寸；切换 tab 后窗口会按新页重新弹性适应。
+    """
+
+    def _is_noncurrent(self) -> bool:
+        p = self.parent()
+        # QTabWidget 内部用 QStackedWidget 承载页面
+        while p is not None:
+            if isinstance(p, QStackedWidget):
+                return p.currentWidget() is not self
+            p = p.parent()
+        return False
+
+    def sizeHint(self):
+        if self._is_noncurrent():
+            return QSize(0, 0)
+        return super().sizeHint()
+
+    def minimumSizeHint(self):
+        if self._is_noncurrent():
+            return QSize(0, 0)
+        return super().minimumSizeHint()
+
+    def content_widget(self) -> QWidget:
+        """返回容器内承载的真实 tab 页面（ElasticPage 只是弹性包装层）。"""
+        lay = self.layout()
+        if lay is not None and lay.count():
+            w = lay.itemAt(0).widget()
+            if w is not None:
+                return w
+        return self
+
+
+class _ElasticTabWidget(QTabWidget):
+    """弹性 TabWidget（配套 ElasticPage 使用，保留 tab 基础行为）。"""
+    pass
+
+
 class CollapsibleGroupBox(QWidget):
     """可折叠分组框：点击标题栏切换内容显示/隐藏，▼ 展开 / ▶ 折叠。
 
@@ -53,22 +143,16 @@ class CollapsibleGroupBox(QWidget):
 
     collapsedChanged = pyqtSignal(bool)  # True = 已折叠
 
-    _TITLE_CSS = (
-        "QPushButton{text-align:left;background:#e2e4e8;border:none;"
-        "padding:5px 8px;font-weight:bold;border-radius:3px}"
-        "QPushButton:hover{background:#cfcfd6}"
-        "QPushButton:pressed{background:#c0c0c8}"
-    )
-
     def __init__(self, title: str = "", parent=None, collapsed: bool = False):
         super().__init__(parent)
         self._collapsed = False
+        self._title_text = title
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        self._title_btn = QPushButton(f"▼  {title}")
-        self._title_btn.setStyleSheet(self._TITLE_CSS)
+        self._title_btn = QPushButton()
+        self._apply_title_style()
         self._title_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._title_btn.clicked.connect(self.toggle)
         outer.addWidget(self._title_btn)
@@ -79,8 +163,22 @@ class CollapsibleGroupBox(QWidget):
         self._content_layout.setSpacing(5)
         outer.addWidget(self._content)
 
+        self._refresh_title_text()
         if collapsed:
             self.set_collapsed(True)
+
+    def _apply_title_style(self):
+        self._title_btn.setStyleSheet(_collapsible_title_css())
+
+    def _refresh_title_text(self):
+        arrow = "▶" if self._collapsed else "▼"
+        self._title_btn.setText(f"{arrow}  {self._title_text}")
+
+    def changeEvent(self, event):
+        """系统/应用明暗主题切换时自动重刷配色。"""
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange:
+            self._apply_title_style()
 
     # ---- public API ----
     def contentLayout(self) -> QVBoxLayout:
@@ -88,8 +186,8 @@ class CollapsibleGroupBox(QWidget):
         return self._content_layout
 
     def set_title(self, title: str) -> None:
-        arrow = "▶" if self._collapsed else "▼"
-        self._title_btn.setText(f"{arrow}  {title}")
+        self._title_text = title
+        self._refresh_title_text()
 
     def is_collapsed(self) -> bool:
         return self._collapsed
@@ -100,15 +198,14 @@ class CollapsibleGroupBox(QWidget):
             return
         self._collapsed = collapsed
         self._content.setVisible(not collapsed)
-        # 更新箭头
-        txt = self._title_btn.text()
-        prefix = "▶" if collapsed else "▼"
-        if txt.startswith(("▶", "▼")):
-            txt = prefix + txt[1:]
-        else:
-            txt = f"{prefix}  {txt}"
-        self._title_btn.setText(txt)
+        self._refresh_title_text()
         self.collapsedChanged.emit(collapsed)
+        # 折叠/展开后请求顶层窗口弹性自适应。
+        # 仅在顶层窗口已显示时调度，避免构造阶段（默认折叠组）启动即误调整。
+        # expanding: 折叠→False(窗口收缩到最小尺寸)，展开→True(窗口放大到理想尺寸)
+        win = self.window()
+        if win is not None and win.isVisible() and hasattr(win, "fit_to_content"):
+            QTimer.singleShot(0, lambda: win.fit_to_content(not collapsed))
 
     def toggle(self) -> None:
         self.set_collapsed(not self._collapsed)
@@ -3287,6 +3384,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
         self.setGeometry(50, 50, 850, 580)
+        # 弹性窗口最小地板：折叠后可缩到这个尺寸，不至于过小
+        self.setMinimumSize(520, 300)
         self._closing_requested = False
         self._close_ready = False
         self._shutdown_poll_count = 0
@@ -3324,18 +3423,23 @@ class MainWindow(QMainWindow):
         # 让 ScheduleTab 日志同时写入原表格发送主界面的日志面板，保持统一查看
         self.schedule_tab.log_callback = self._schedule_log_to_main
 
-        self.tab_widget = QTabWidget()
-        self.tab_widget.addTab(self.table_filter_tab, "📊 数据发送")
-        self.tab_widget.addTab(self.schedule_tab, "⏰ 定时发送")
+        self.tab_widget = _ElasticTabWidget()
+        # 用 ElasticPage 包装：非当前页不报告尺寸提示，窗口才能弹性收缩
+        page1 = ElasticPage()
+        pl1 = QVBoxLayout(page1)
+        pl1.setContentsMargins(0, 0, 0, 0)
+        pl1.addWidget(self.table_filter_tab)
+        page2 = ElasticPage()
+        pl2 = QVBoxLayout(page2)
+        pl2.setContentsMargins(0, 0, 0, 0)
+        pl2.addWidget(self.schedule_tab)
+        self.tab_widget.addTab(page1, "📊 数据发送")
+        self.tab_widget.addTab(page2, "⏰ 定时发送")
 
         # 全局精简/详细开关：放 QTabWidget 右上角 corner
         self._compact_mode = False
         self.compact_btn = QPushButton("📑 精简模式")
-        self.compact_btn.setStyleSheet(
-            "QPushButton{padding:3px 10px;font-size:12px;border:1px solid #bbb;"
-            "border-radius:3px;background:#f5f5f5}"
-            "QPushButton:hover{background:#e8e8e8}"
-        )
+        self.compact_btn.setStyleSheet(_compact_btn_css())
         self.compact_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.compact_btn.clicked.connect(self._on_compact_toggle)
         self.tab_widget.setCornerWidget(self.compact_btn)
@@ -3350,10 +3454,17 @@ class MainWindow(QMainWindow):
         self._taskbar = None
         self._send_progress_active = False
 
+    def _current_tab_content(self) -> QWidget:
+        """取当前 tab 内的真实业务页面（穿透 ElasticPage 包装层）。"""
+        page = self.tab_widget.currentWidget()
+        if isinstance(page, ElasticPage):
+            return page.content_widget()
+        return page
+
     def _on_compact_toggle(self):
         """全局精简/详细模式：折叠/展开当前 tab 的所有可折叠分组。"""
         self._compact_mode = not self._compact_mode
-        widget = self.tab_widget.currentWidget()
+        widget = self._current_tab_content()
         groups = getattr(widget, "_collapsible_groups", [])
         for g in groups:
             g.set_collapsed(self._compact_mode)
@@ -3361,13 +3472,83 @@ class MainWindow(QMainWindow):
 
     def _sync_compact_btn(self, _index):
         """切换 tab 时根据当前 tab 的折叠状态更新按钮文字。"""
-        widget = self.tab_widget.currentWidget()
+        widget = self._current_tab_content()
         groups = getattr(widget, "_collapsible_groups", [])
         if not groups:
             return
         all_collapsed = all(g.is_collapsed() for g in groups)
         self._compact_mode = all_collapsed
         self.compact_btn.setText("📄 详细模式" if all_collapsed else "📑 精简模式")
+        # 切换 tab 后内容高度不同，弹性窗口跟随自适应
+        QTimer.singleShot(0, self.fit_to_content)
+
+    def changeEvent(self, event):
+        """系统明暗（夜间/日间）主题切换时，重刷精简按钮配色。"""
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange:
+            try:
+                self.compact_btn.setStyleSheet(_compact_btn_css())
+            except Exception:
+                pass
+
+    def fit_to_content(self, expanding=None):
+        """弹性窗口：折叠/展开分组后，窗口尺寸跟随内容自适应收缩或放大。
+
+        - expanding=False（折叠触发）：目标取当前页 minimumSizeHint，窗口收缩到
+          刚好不裁切内容的最小尺寸；
+        - expanding=True（展开触发）：目标取当前页 sizeHint，窗口放大到理想尺寸；
+        - expanding=None（如切换 tab）：仅保证不小于 minimumSizeHint，不强行放大。
+        - 注意不能用 QTabWidget.sizeHint()：QStackedWidget 会取所有页面的最大值，
+          当前页折叠后它仍报其它页的大尺寸，无法用于弹性收缩。
+        - 限制在屏幕可用区域内，保留最小尺寸地板；最大化/全屏/未显示时不干预。
+        """
+        try:
+            if not self.isVisible() or self.isMaximized() or self.isFullScreen():
+                return
+            # 关键：先同步分发挂起的布局事件，刷新各 widget 的 sizeHint/minimumSizeHint
+            # 缓存（QTimer(0) 回调可能先于 LayoutRequest 执行，否则会读到折叠前的旧尺寸）
+            app = QApplication.instance()
+            if app is not None:
+                app.sendPostedEvents(None, QEvent.Type.LayoutRequest)
+            page = self.tab_widget.currentWidget()
+            if page is None:
+                return
+            min_hint = page.minimumSizeHint()
+            if not min_hint.isValid() or min_hint.width() <= 0:
+                min_hint = page.sizeHint()
+            if expanding:
+                hint = page.sizeHint()
+                if not hint.isValid() or hint.width() <= 0:
+                    hint = min_hint
+                # 展开时理想尺寸与最小尺寸取较大者
+                target_w = max(hint.width(), min_hint.width())
+                target_h = max(hint.height(), min_hint.height())
+            else:
+                # expanding=False（折叠）或 None（切换 tab）：
+                # 窗口收缩/适应到内容最小尺寸，不浪费空间
+                target_w, target_h = min_hint.width(), min_hint.height()
+            # 加上非页面部分增量（tab 栏高度、边框等）：当前窗口尺寸减去页面实际尺寸
+            delta_w = self.width() - page.width()
+            delta_h = self.height() - page.height()
+            target_w += max(0, delta_w)
+            target_h += max(0, delta_h)
+
+            screen = (
+                QGuiApplication.screenAt(self.geometry().center())
+                or QGuiApplication.primaryScreen()
+            )
+            if screen is None:
+                return
+            avail = screen.availableGeometry()
+            min_w, min_h = 520, 300
+            w = max(min_w, min(target_w, avail.width()))
+            h = max(min_h, min(target_h, avail.height()))
+            # 保持窗口不超出屏幕可用区域
+            x = max(avail.left(), min(self.x(), avail.right() - w))
+            y = max(avail.top(), min(self.y(), avail.bottom() - h))
+            self.setGeometry(x, y, w, h)
+        except Exception:
+            pass
 
     # ------------------------- 全局发送进度（任务栏/标题/托盘） -------------------------
     def _ensure_taskbar(self):
