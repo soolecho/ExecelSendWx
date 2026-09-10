@@ -63,8 +63,9 @@ class ScheduleTask:
     minimize_after: bool = True
     # 附加文件（文件/图片绝对路径），随消息额外发送；空表示不发送附件
     attachment: str = ""
-    # 附件发送时机：after=先发文字再发附件（默认）；before=先发附件再发文字
-    attach_order: str = "after"
+    # 发送顺序：["message", "attachment"] 等，勾选的内容才发送，列表顺序即发送先后。
+    # 兼容旧字段 attach_order（before/after），读取时迁移。
+    send_order: List[str] = field(default_factory=lambda: ["message"])
     # 已触发记录：{ "YYYY-MM-DD": ["08:30", ...] }
     fired_log: Dict[str, List[str]] = field(default_factory=dict)
     created_at: str = ""
@@ -128,7 +129,7 @@ class ScheduleTask:
             relock_after=bool(data.get("relock_after", False)),
             minimize_after=bool(data.get("minimize_after", True)),
             attachment=str(data.get("attachment", "") or ""),
-            attach_order=str(data.get("attach_order", "after") or "after"),
+            send_order=_normalize_send_order(data),
             fired_log=_normalize_fired_log(data.get("fired_log")),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),
@@ -176,6 +177,35 @@ def _normalize_fired_log(value) -> Dict[str, List[str]]:
         if slots:
             result[str(k)] = slots
     return result
+
+
+def _normalize_send_order(data) -> List[str]:
+    """发送顺序：合法项 message / attachment；去重保序；兼容旧 attach_order。
+
+    旧数据没有 send_order 时：
+      - attach_order == "before" 且有附件 -> ["attachment", "message"]
+      - 有附件 -> ["message", "attachment"]
+      - 无附件 -> ["message"]
+    """
+    valid = ("message", "attachment")
+    raw = data.get("send_order") if isinstance(data, dict) else None
+    if isinstance(raw, list) and raw:
+        order: List[str] = []
+        for k in raw:
+            k = str(k).strip()
+            if k in valid and k not in order:
+                order.append(k)
+        if "message" not in order:
+            order.append("message")
+        return order
+    # 旧字段迁移
+    has_attach = bool(str(data.get("attachment", "") or "").strip())
+    attach_order = str(data.get("attach_order", "after") or "after")
+    if has_attach and attach_order == "before":
+        return ["attachment", "message"]
+    if has_attach:
+        return ["message", "attachment"]
+    return ["message"]
 
 
 def _write_json(path: Path, data) -> None:
