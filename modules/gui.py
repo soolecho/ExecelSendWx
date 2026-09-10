@@ -52,24 +52,26 @@ def _app_is_dark() -> bool:
         return False
 
 
-def _collapsible_title_css() -> str:
-    """折叠分组标题栏样式：显式指定文字色，明/暗主题均清晰可读。"""
+def _chip_css() -> str:
+    """芯片按钮样式：胶囊形，选中态高亮；明/暗主题均清晰可读。"""
     if _app_is_dark():
         return (
-            "QPushButton{text-align:left;background:#3a3d44;color:#f2f2f2;"
-            "border:1px solid #2a2d31;padding:5px 8px;font-weight:bold;"
-            "border-radius:3px}"
-            "QPushButton:hover{background:#494d55}"
-            "QPushButton:pressed{background:#565b64}"
-            "QPushButton:disabled{color:#8a8a8a;background:#33363b}"
+            "QPushButton{text-align:center;background:#33363b;color:#d8dae0;"
+            "border:1px solid #4a4d55;padding:4px 14px;font-size:12px;"
+            "border-radius:13px}"
+            "QPushButton:hover{background:#3d4148;border-color:#5d636e}"
+            "QPushButton:checked{background:#3a6ea5;border-color:#5a9bd6;"
+            "color:#ffffff;font-weight:bold}"
+            "QPushButton:checked:hover{background:#467bb8}"
         )
     return (
-        "QPushButton{text-align:left;background:#e2e4e8;color:#1f1f1f;"
-        "border:1px solid #c8c8ce;padding:5px 8px;font-weight:bold;"
-        "border-radius:3px}"
-        "QPushButton:hover{background:#cfcfd6}"
-        "QPushButton:pressed{background:#c0c0c8}"
-        "QPushButton:disabled{color:#9a9a9a;background:#ececed}"
+        "QPushButton{text-align:center;background:#ffffff;color:#333333;"
+        "border:1px solid #c9ccd4;padding:4px 14px;font-size:12px;"
+        "border-radius:13px}"
+        "QPushButton:hover{background:#eef1f6;border-color:#aeb4c0}"
+        "QPushButton:checked{background:#2f78c4;border-color:#2f78c4;"
+        "color:#ffffff;font-weight:bold}"
+        "QPushButton:checked:hover{background:#3b85d1}"
     )
 
 
@@ -131,40 +133,36 @@ class _ElasticTabWidget(QTabWidget):
     pass
 
 
-class CollapsibleGroupBox(QWidget):
-    """可折叠分组框：点击标题栏切换内容显示/隐藏，▼ 展开 / ▶ 折叠。
+class ChipSection(QWidget):
+    """芯片面板：无独立标题，由所属 ChipBar 上的芯片按钮控制果冻展开/折叠。
 
-    用法（替代 QGroupBox，最小化改动）::
+    与 ChipBar 配套使用::
 
-        group = CollapsibleGroupBox("配置管理", collapsed=True)
-        layout = group.contentLayout()      # 替代 QVBoxLayout(group)
-        layout.addWidget(...)
-        parent_layout.addWidget(group)
+        bar = ChipBar(exclusive=True)
+        parent_layout.addWidget(bar)
+        section = bar.add_section("发送设置")
+        parent_layout.addWidget(section)
+        section.contentLayout().addWidget(...)
     """
 
     collapsedChanged = pyqtSignal(bool)  # True = 已折叠
 
-    def __init__(self, title: str = "", parent=None, collapsed: bool = False):
+    def __init__(self, parent=None, collapsed: bool = False):
         super().__init__(parent)
         self._collapsed = False
-        self._title_text = title
+        self._title_text = ""
+        self._chip: Optional[QPushButton] = None
+        self._chip_bar = None
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        self._title_btn = QPushButton()
-        self._apply_title_style()
-        self._title_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._title_btn.clicked.connect(self.toggle)
-        outer.addWidget(self._title_btn)
-
         self._content = QWidget()
         self._content_layout = QVBoxLayout(self._content)
-        self._content_layout.setContentsMargins(8, 4, 8, 6)
+        self._content_layout.setContentsMargins(8, 6, 8, 8)
         self._content_layout.setSpacing(5)
         outer.addWidget(self._content)
 
-        self._refresh_title_text()
         # 单一持久动画对象：反复折叠/展开时只 stop + 重设参数重启，
         # 不频繁创建/销毁动画对象（避免极端连点时 deleteLater 堆积引发原生崩溃）
         self._anim = QPropertyAnimation(self._content, b"maximumHeight", self)
@@ -173,27 +171,15 @@ class CollapsibleGroupBox(QWidget):
         if collapsed:
             self.set_collapsed(True)
 
-    def _apply_title_style(self):
-        self._title_btn.setStyleSheet(_collapsible_title_css())
-
-    def _refresh_title_text(self):
-        arrow = "▶" if self._collapsed else "▼"
-        self._title_btn.setText(f"{arrow}  {self._title_text}")
-
-    def changeEvent(self, event):
-        """系统/应用明暗主题切换时自动重刷配色。"""
-        super().changeEvent(event)
-        if event.type() == QEvent.Type.PaletteChange:
-            self._apply_title_style()
-
     # ---- public API ----
     def contentLayout(self) -> QVBoxLayout:
-        """返回内容区布局，供外部 addWidget / addLayout（替代 QVBoxLayout(group)）。"""
+        """返回内容区布局，供外部 addWidget / addLayout。"""
         return self._content_layout
 
     def set_title(self, title: str) -> None:
         self._title_text = title
-        self._refresh_title_text()
+        if self._chip is not None:
+            self._chip.setText(title)
 
     def is_collapsed(self) -> bool:
         return self._collapsed
@@ -201,11 +187,10 @@ class CollapsibleGroupBox(QWidget):
     def _kill_anim(self) -> None:
         """停止进行中的折叠动画并解除高度限制（stop 不触发 finished，
         可防止旧动画结束回调把内容显示状态写反）。"""
-        if self._anim is not None:
-            try:
-                self._anim.stop()
-            except Exception:
-                pass
+        try:
+            self._anim.stop()
+        except Exception:
+            pass
         self._content.setMaximumHeight(16777215)
 
     def set_collapsed(self, collapsed: bool, animate: bool = False) -> None:
@@ -220,11 +205,7 @@ class CollapsibleGroupBox(QWidget):
         self._kill_anim()
         self._collapsed = collapsed
         self._content.setVisible(not collapsed)
-        self._refresh_title_text()
         self.collapsedChanged.emit(collapsed)
-        # 折叠/展开后请求顶层窗口弹性自适应。
-        # 仅在顶层窗口已显示时调度，避免构造阶段（默认折叠组）启动即误调整。
-        # expanding: 折叠→False(窗口收缩到最小尺寸)，展开→True(窗口放大到理想尺寸)
         self._notify_window(not collapsed)
 
     def _notify_window(self, expanding: bool, animate_window: bool = False) -> None:
@@ -237,13 +218,7 @@ class CollapsibleGroupBox(QWidget):
                 QTimer.singleShot(0, lambda: win.fit_to_content(expanding))
 
     def _animated_set_collapsed(self, collapsed: bool) -> None:
-        """果冻式折叠/展开动画：内容区高度弹入弹出，窗口同步弹性跟随。
-
-        - 展开：窗口先平滑放大腾出空间，内容区高度以 OutBack（回弹过冲）
-          从当前高度弹到理想高度，产生果冻感；
-        - 折叠：内容区高度平滑收到 0 后隐藏，窗口再平滑收缩；
-        - 动画中途再次点击时立即定格当前高度并从该处开新动画，不会跳变。
-        """
+        """果冻式折叠/展开：展开轻柔回弹（允吸感），折叠平滑吸入；窗口弹性跟随。"""
         content = self._content
         anim = self._anim
         # 上一次动画未结束：定格当前高度（stop 不触发 finished），从该处续动
@@ -261,7 +236,6 @@ class CollapsibleGroupBox(QWidget):
                 cur_max = 0
 
         self._collapsed = collapsed
-        self._refresh_title_text()
         self.collapsedChanged.emit(collapsed)
 
         content.setVisible(True)
@@ -269,9 +243,9 @@ class CollapsibleGroupBox(QWidget):
         anim.setStartValue(cur_max)
         if collapsed:
             anim.setEndValue(0)
-            anim.setDuration(280)
-            # 柔和减速：先慢后收，不突兀
-            anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+            anim.setDuration(260)
+            # 吸入感：平滑加速收起
+            anim.setEasingCurve(QEasingCurve.Type.InQuart)
         else:
             target_h = content.sizeHint().height()
             if target_h <= 0:
@@ -282,7 +256,7 @@ class CollapsibleGroupBox(QWidget):
                 return
             anim.setEndValue(target_h)
             anim.setDuration(420)
-            # 轻微 OutBack 回弹（过冲幅度调到 1.05，比默认 1.70 柔和很多）
+            # 轻微 OutBack 回弹（过冲 1.05，柔和的果冻/允吸感）
             soft_curve = QEasingCurve(QEasingCurve.Type.OutBack)
             try:
                 soft_curve.setOvershoot(1.05)
@@ -306,9 +280,77 @@ class CollapsibleGroupBox(QWidget):
         self.set_collapsed(not self._collapsed, animate=True)
 
     def setEnabled(self, enabled: bool) -> None:
-        """重写：标题栏保持可点，只禁用内容区（兼容 weekday_group_box.setEnabled 调用）。"""
-        super().setEnabled(enabled)
+        """只禁用/启用内容区，芯片按钮始终可点（面板仍可展开查看）。"""
         self._content.setEnabled(enabled)
+
+
+class ChipBar(QWidget):
+    """一排胶囊芯片按钮：点击果冻展开/折叠对应 ChipSection。
+
+    - exclusive=False（默认，数据发送页）：多个面板可同时展开；
+    - exclusive=True（定时任务页）：手风琴，展开一个自动收起同排其他面板。
+    """
+
+    def __init__(self, exclusive: bool = False, parent=None):
+        super().__init__(parent)
+        self._exclusive = exclusive
+        self.sections: List[ChipSection] = []
+        self._syncing = False
+        self._bar_layout = QHBoxLayout(self)
+        self._bar_layout.setContentsMargins(0, 0, 0, 0)
+        self._bar_layout.setSpacing(6)
+        # 末端弹簧：芯片始终靠左排列
+        self._bar_layout.addStretch(1)
+
+    def set_exclusive(self, exclusive: bool) -> None:
+        self._exclusive = bool(exclusive)
+
+    def add_section(self, title: str, collapsed: bool = False) -> ChipSection:
+        """创建芯片按钮+面板并登记；面板需由调用方 addWidget 到同列布局。"""
+        section = ChipSection(collapsed=collapsed)
+        section._chip_bar = self
+        section._title_text = title
+
+        btn = QPushButton(title)
+        btn.setCheckable(True)
+        btn.setChecked(not collapsed)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(_chip_css())
+        btn.clicked.connect(
+            lambda _checked=False, s=section:
+                s.set_collapsed(not s.is_collapsed(), animate=True)
+        )
+        # 插到末端弹簧之前
+        self._bar_layout.insertWidget(self._bar_layout.count() - 1, btn)
+        section._chip = btn
+        section.collapsedChanged.connect(
+            lambda c, s=section: self._on_section_changed(s, c)
+        )
+        self.sections.append(section)
+        return section
+
+    def _on_section_changed(self, section: ChipSection, collapsed: bool) -> None:
+        # 同步芯片选中态（用户点击 / 程序自动折叠都一致）
+        if section._chip is not None:
+            section._chip.setChecked(not collapsed)
+        # 手风琴：展开一个，自动收起同排其他面板
+        if self._exclusive and not collapsed and not self._syncing:
+            self._syncing = True
+            try:
+                for other in self.sections:
+                    if other is not section and not other.is_collapsed():
+                        other.set_collapsed(True, animate=True)
+            finally:
+                self._syncing = False
+
+    def changeEvent(self, event):
+        """系统/应用明暗主题切换时重刷所有芯片配色。"""
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.PaletteChange:
+            css = _chip_css()
+            for s in self.sections:
+                if s._chip is not None:
+                    s._chip.setStyleSheet(css)
 
 
 def _get_autostart_command() -> str:
@@ -1052,8 +1094,12 @@ class TableFilterTab(QWidget):
         
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
-        
-        config_group = CollapsibleGroupBox("配置管理", collapsed=True)
+
+        # 左栏芯片排：配置管理 / 文档设置 / 筛选条件（可多个同时展开）
+        left_bar = ChipBar(exclusive=False)
+        left_layout.addWidget(left_bar)
+
+        config_group = left_bar.add_section("⚙ 配置管理", collapsed=True)
         config_layout = config_group.contentLayout()
 
         self.current_config_label = QLabel("当前配置: 未加载")
@@ -1084,7 +1130,7 @@ class TableFilterTab(QWidget):
 
         left_layout.addWidget(config_group)
 
-        url_group = CollapsibleGroupBox("文档设置")
+        url_group = left_bar.add_section("📄 文档设置")
         url_layout = url_group.contentLayout()
         
         excel_btn_layout = QHBoxLayout()
@@ -1146,7 +1192,7 @@ class TableFilterTab(QWidget):
         
         left_layout.addWidget(url_group)
         
-        filter_group = CollapsibleGroupBox("筛选条件", collapsed=True)
+        filter_group = left_bar.add_section("🔍 筛选条件", collapsed=True)
         filter_layout = filter_group.contentLayout()
         
         self.filter_conditions_layout = QVBoxLayout()
@@ -1175,8 +1221,12 @@ class TableFilterTab(QWidget):
         
         middle_panel = QWidget()
         middle_layout = QVBoxLayout(middle_panel)
-        
-        persons_group = CollapsibleGroupBox("人员列表")
+
+        # 中栏芯片排：人员列表 / 数据预览
+        middle_bar = ChipBar(exclusive=False)
+        middle_layout.addWidget(middle_bar)
+
+        persons_group = middle_bar.add_section("👥 人员列表")
         persons_layout = persons_group.contentLayout()
         
         self.persons_list = QListWidget()
@@ -1193,7 +1243,7 @@ class TableFilterTab(QWidget):
         
         middle_layout.addWidget(persons_group)
         
-        preview_group = CollapsibleGroupBox("数据预览")
+        preview_group = middle_bar.add_section("👀 数据预览", collapsed=True)
         preview_layout = preview_group.contentLayout()
         
         self.preview_text = QTextEdit()
@@ -1209,8 +1259,13 @@ class TableFilterTab(QWidget):
         
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
-        
-        send_group = CollapsibleGroupBox("发送设置")
+
+        # 右栏芯片排：发送设置 / 发送进度 / 日志 / 发送控制（默认只打开发送设置，
+        # 发送时自动切换为只保留进度+控制）
+        right_bar = ChipBar(exclusive=False)
+        right_layout.addWidget(right_bar)
+
+        send_group = right_bar.add_section("✉ 发送设置")
         send_layout = send_group.contentLayout()
         
         send_layout.addWidget(QLabel("微信接收人(手动指定):"))
@@ -1300,7 +1355,7 @@ class TableFilterTab(QWidget):
         
         right_layout.addWidget(send_group)
         
-        progress_group = CollapsibleGroupBox("发送进度")
+        progress_group = right_bar.add_section("📊 发送进度", collapsed=True)
         progress_layout = progress_group.contentLayout()
         
         self.progress_bar = QProgressBar()
@@ -1313,7 +1368,7 @@ class TableFilterTab(QWidget):
         
         right_layout.addWidget(progress_group)
         
-        log_group = CollapsibleGroupBox("日志")
+        log_group = right_bar.add_section("📝 日志", collapsed=True)
         log_layout = log_group.contentLayout()
         
         self.log_text = QTextEdit()
@@ -1323,7 +1378,7 @@ class TableFilterTab(QWidget):
         
         right_layout.addWidget(log_group)
         
-        control_group = CollapsibleGroupBox("发送控制")
+        control_group = right_bar.add_section("🎛 发送控制", collapsed=True)
         control_layout = QHBoxLayout()
         control_group.contentLayout().addLayout(control_layout)
         
@@ -1367,25 +1422,42 @@ class TableFilterTab(QWidget):
         main_layout.addWidget(splitter)
         self.setLayout(main_layout)
 
-        # 注册所有可折叠分组，供全局精简开关遍历
+        # 注册所有可折叠面板，供全局精简开关遍历
         self._collapsible_groups = [
             config_group, url_group, filter_group,
             persons_group, preview_group,
             send_group, progress_group, log_group, control_group,
         ]
-        # 保存自动折叠需要引用的分组实例
+        # 保存各面板引用（自动折叠/发送时自动切换视图用）
         self.config_group = config_group
         self.url_group = url_group
         self.filter_group = filter_group
+        self.persons_group = persons_group
+        self.preview_group = preview_group
         self.send_group = send_group
-        # 加载配置后需要自动展开的分组（人员列表/数据预览/发送控制）
-        self._load_expand_groups = [persons_group, preview_group, control_group]
+        self.progress_group = progress_group
+        self.log_group = log_group
+        self.control_group = control_group
+        # 加载配置后自动展开：人员列表/数据预览/发送进度/发送控制
+        self._load_expand_groups = [
+            persons_group, preview_group, progress_group, control_group,
+        ]
 
     def _collapse_groups(self, *groups):
-        """批量折叠指定分组（忽略 None）。"""
+        """批量折叠指定面板（忽略 None）。"""
         for g in groups:
             if g is not None:
                 g.set_collapsed(True)
+
+    def _enter_sending_view(self):
+        """点发送后自动切换视图：只保留发送控制+发送进度，其他面板果冻收起。"""
+        keep = {self.control_group, self.progress_group}
+        for g in self._collapsible_groups:
+            should_open = g in keep
+            if should_open and g.is_collapsed():
+                g.set_collapsed(False, animate=True)
+            elif not should_open and not g.is_collapsed():
+                g.set_collapsed(True, animate=True)
 
     def connect_signals(self):
         self.save_config_btn.clicked.connect(self.save_config)
@@ -2353,8 +2425,8 @@ class TableFilterTab(QWidget):
             lambda current=worker: self.on_send_finished(current)
         )
         worker.start()
-        # 自动折叠发送设置区，保留进度/日志/控制可见
-        self._collapse_groups(self.send_group)
+        # 自动切换视图：只保留发送控制+发送进度，其他面板收起
+        self._enter_sending_view()
 
     def pause_send(self):
         if self.worker and self.worker.isRunning():
@@ -2415,7 +2487,7 @@ class TableFilterTab(QWidget):
             lambda current=worker: self.on_send_finished(current)
         )
         worker.start()
-        self._collapse_groups(self.send_group)
+        self._enter_sending_view()
 
     def on_send_finished(self, worker):
         if worker is self.worker:
@@ -2526,9 +2598,15 @@ class ScheduleTab(QWidget):
         self.log_callback = None
         # MainWindow 注入：worker 创建后回调，用于连接任务栏进度等全局信号
         self.worker_created_cb = None
+        # 表单脏检测：_loading_form 期间程序化填充表单不视为改动；
+        # _form_ready 在首次任务加载完成前为 False（避免启动时误弹保存区）
+        self._loading_form = False
+        self._form_dirty = False
+        self._form_ready = False
         self.init_ui()
         self.connect_signals()
         self.reload_tasks()
+        self._form_ready = True
 
     # ----------------------------- UI -----------------------------
     def init_ui(self):
@@ -2536,9 +2614,17 @@ class ScheduleTab(QWidget):
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(8)
 
-        # --- 左侧：任务列表 + 通用按钮 ---
-        left_group = CollapsibleGroupBox("定时任务列表")
-        left_layout = left_group.contentLayout()
+        # --- 左侧：任务列表 + 配置保存（芯片排，可同开；保存区默认收起，
+        #     表单有改动/新建任务时自动果冻弹出，保存成功后自动收起） ---
+        left_panel = QWidget()
+        left_column = QVBoxLayout(left_panel)
+        left_column.setContentsMargins(0, 0, 0, 0)
+        left_column.setSpacing(6)
+        left_bar = ChipBar(exclusive=False)
+        left_column.addWidget(left_bar)
+
+        list_group = left_bar.add_section("📋 任务列表")
+        left_layout = list_group.contentLayout()
 
         self.task_list = QListWidget()
         self.task_list.setMinimumWidth(240)
@@ -2553,12 +2639,17 @@ class ScheduleTab(QWidget):
         left_btn1.addWidget(self.delete_task_btn)
         left_layout.addLayout(left_btn1)
 
+        left_column.addWidget(list_group)
+
+        save_group = left_bar.add_section("💾 配置保存", collapsed=True)
+        save_layout = save_group.contentLayout()
         left_btn2 = QHBoxLayout()
         self.save_all_btn = QPushButton("保存为定时配置")
         self.load_config_btn = QPushButton("加载定时配置")
         left_btn2.addWidget(self.save_all_btn)
         left_btn2.addWidget(self.load_config_btn)
-        left_layout.addLayout(left_btn2)
+        save_layout.addLayout(left_btn2)
+        left_column.addWidget(save_group)
 
         left_btn3 = QHBoxLayout()
         self.run_now_btn = QPushButton("立即执行所选任务")
@@ -2579,16 +2670,18 @@ class ScheduleTab(QWidget):
         left_layout.addWidget(self.dispatcher_status_label)
 
         left_layout.addStretch()
-        main_layout.addWidget(left_group, 0)
+        main_layout.addWidget(left_panel, 0)
 
-        # --- 右侧：编辑表单 ---
+        # --- 右侧：编辑表单（手风琴芯片排：同一时间只展开一个面板） ---
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(6)
+        right_bar = ChipBar(exclusive=True)
+        right_layout.addWidget(right_bar)
 
         # 基本
-        base_group = CollapsibleGroupBox("任务基础")
+        base_group = right_bar.add_section("📌 任务基础")
         base_layout = base_group.contentLayout()
         row = QHBoxLayout()
         row.addWidget(QLabel("任务名称:"))
@@ -2602,7 +2695,7 @@ class ScheduleTab(QWidget):
         right_layout.addWidget(base_group)
 
         # 重复规则
-        repeat_group = CollapsibleGroupBox("重复规则")
+        repeat_group = right_bar.add_section("🔁 重复规则", collapsed=True)
         repeat_layout = repeat_group.contentLayout()
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("模式:"))
@@ -2641,7 +2734,7 @@ class ScheduleTab(QWidget):
         right_layout.addWidget(repeat_group)
 
         # 发送内容
-        send_group = CollapsibleGroupBox("发送内容")
+        send_group = right_bar.add_section("✉ 发送内容", collapsed=True)
         send_layout = send_group.contentLayout()
 
         send_layout.addWidget(QLabel("接收人(好友/群名，支持模糊匹配，每行一个或英文逗号分隔):"))
@@ -2734,7 +2827,7 @@ class ScheduleTab(QWidget):
         right_layout.addWidget(send_group)
 
         # 电脑锁定/完成后行为配置（任务级，每个任务可单独设置）
-        lock_group = CollapsibleGroupBox("电脑锁定 / 完成后行为", collapsed=True)
+        lock_group = right_bar.add_section("🔒 锁定 / 完成后行为", collapsed=True)
         lock_layout = QHBoxLayout()
         lock_group.contentLayout().addLayout(lock_layout)
         self.keep_unlock_check = QCheckBox("执行期间防自动锁定")
@@ -2772,21 +2865,24 @@ class ScheduleTab(QWidget):
         right_layout.addLayout(action_row)
 
         # 日志（共享主日志的回调，这里也放只读面板，方便查看）
-        log_group = CollapsibleGroupBox("定时发送日志")
+        log_group = right_bar.add_section("📜 定时发送日志", collapsed=True)
         log_layout = log_group.contentLayout()
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMinimumHeight(140)
         log_layout.addWidget(self.log_text)
-        right_layout.addWidget(log_group, 1)
+        right_layout.addWidget(log_group)
+        right_layout.addStretch(1)
 
         main_layout.addWidget(right, 1)
 
-        # 注册所有可折叠分组，供全局精简开关遍历
+        # 注册所有可折叠面板，供全局精简开关遍历
         self._collapsible_groups = [
-            left_group, base_group, repeat_group,
+            list_group, save_group, base_group, repeat_group,
             send_group, lock_group, log_group,
         ]
+        self.list_group = list_group
+        self.save_group = save_group
 
     def _collapse_groups(self, *groups):
         """批量折叠指定分组（忽略 None）。"""
@@ -2816,6 +2912,42 @@ class ScheduleTab(QWidget):
         self.run_now_btn.clicked.connect(self._on_run_now)
         self.stop_send_btn.clicked.connect(self._on_stop_send)
         self.weather_settings_btn.clicked.connect(self._on_open_weather_settings)
+        self._connect_form_dirty_signals()
+
+    # ------------------------- 表单脏检测 -------------------------
+    def _connect_form_dirty_signals(self):
+        """所有表单控件改动 → 标记脏并自动果冻弹出「配置保存」面板。"""
+        mark = self._mark_form_dirty
+        self.name_edit.textChanged.connect(mark)
+        self.enabled_check.stateChanged.connect(mark)
+        self.repeat_mode_combo.currentIndexChanged.connect(mark)
+        for cb in self.weekday_checks.values():
+            cb.stateChanged.connect(mark)
+        self.time_list.model().rowsInserted.connect(lambda *a: mark())
+        self.time_list.model().rowsRemoved.connect(lambda *a: mark())
+        self.recipients_edit.textChanged.connect(mark)
+        self.message_edit.textChanged.connect(mark)
+        self.default_city_edit.textChanged.connect(mark)
+        self.chat_delay_spin.valueChanged.connect(mark)
+        self.send_interval_spin.valueChanged.connect(mark)
+        self.keep_unlock_check.stateChanged.connect(mark)
+        self.relock_check.stateChanged.connect(mark)
+        self.minimize_check.stateChanged.connect(mark)
+        self.sched_order_list.itemChanged.connect(lambda *a: mark())
+
+    def _mark_form_dirty(self, *_args):
+        """表单被用户改动：置脏并自动弹出保存区（程序填充阶段忽略）。"""
+        if not self._form_ready or self._loading_form:
+            return
+        self._form_dirty = True
+        if self.save_group.is_collapsed():
+            self.save_group.set_collapsed(False, animate=True)
+
+    def _clear_form_dirty(self):
+        """保存/加载成功后清脏并自动收起保存区。"""
+        self._form_dirty = False
+        if not self.save_group.is_collapsed():
+            self.save_group.set_collapsed(True, animate=True)
 
     # ------------------------- 日志 -------------------------
     # 最大日志行数（交给 QTextDocument 原生裁剪，CPU/内存都更省）
@@ -2910,57 +3042,75 @@ class ScheduleTab(QWidget):
         self.log(f"[定时] {task.name} 已{'启用' if new_enabled else '禁用'}")
 
     def _load_task_to_form(self, task: ScheduleTask):
-        self.name_edit.setText(task.name)
-        self.enabled_check.setChecked(task.enabled)
-        idx = 0 if task.repeat_mode == "daily" else 1
-        self.repeat_mode_combo.setCurrentIndex(idx)
-        for d, cb in self.weekday_checks.items():
-            cb.setChecked(d in set(task.days))
-        self.time_list.clear()
-        for slot in task.times:
-            self.time_list.addItem(slot)
-        self.recipients_edit.setPlainText("\n".join(task.recipients))
-        self.message_edit.setPlainText(task.message)
-        self.chat_delay_spin.setValue(task.chat_delay)
-        self.send_interval_spin.setValue(task.send_interval)
-        self.default_city_edit.setText(task.default_city or "")
-        self.keep_unlock_check.setChecked(bool(getattr(task, "keep_unlocked", False)))
-        self.relock_check.setChecked(bool(getattr(task, "relock_after", False)))
-        self.minimize_check.setChecked(bool(getattr(task, "minimize_after", True)))
-        self.attachment_edit.setText(getattr(task, "attachment", "") or "")
-        order = getattr(task, "send_order", None) or ["message"]
-        # 附件为空时即使顺序里含 attachment 也不勾选
-        if not self.attachment_edit.text().strip():
-            order = [k for k in order if k != "attachment"]
-            if "message" not in order:
-                order = ["message"] + order
-        self._set_sched_order(order)
-        self._on_repeat_mode_changed(idx)
+        # 程序化填充：屏蔽脏信号，避免加载已有任务也弹出保存区
+        self._loading_form = True
+        try:
+            self.name_edit.setText(task.name)
+            self.enabled_check.setChecked(task.enabled)
+            idx = 0 if task.repeat_mode == "daily" else 1
+            self.repeat_mode_combo.setCurrentIndex(idx)
+            for d, cb in self.weekday_checks.items():
+                cb.setChecked(d in set(task.days))
+            self.time_list.clear()
+            for slot in task.times:
+                self.time_list.addItem(slot)
+            self.recipients_edit.setPlainText("\n".join(task.recipients))
+            self.message_edit.setPlainText(task.message)
+            self.chat_delay_spin.setValue(task.chat_delay)
+            self.send_interval_spin.setValue(task.send_interval)
+            self.default_city_edit.setText(task.default_city or "")
+            self.keep_unlock_check.setChecked(bool(getattr(task, "keep_unlocked", False)))
+            self.relock_check.setChecked(bool(getattr(task, "relock_after", False)))
+            self.minimize_check.setChecked(bool(getattr(task, "minimize_after", True)))
+            self.attachment_edit.setText(getattr(task, "attachment", "") or "")
+            order = getattr(task, "send_order", None) or ["message"]
+            # 附件为空时即使顺序里含 attachment 也不勾选
+            if not self.attachment_edit.text().strip():
+                order = [k for k in order if k != "attachment"]
+                if "message" not in order:
+                    order = ["message"] + order
+            self._set_sched_order(order)
+            self._on_repeat_mode_changed(idx)
+        finally:
+            self._loading_form = False
+        self._form_dirty = False
+        # 加载已有任务 = 干净状态：自动收起保存区（即时，避免连续切任务时动画打架）
+        if not self.save_group.is_collapsed():
+            self.save_group.set_collapsed(True)
 
     def _reset_form(self):
-        self.current_task_id = None
-        self.name_edit.clear()
-        self.enabled_check.setChecked(True)
-        self.repeat_mode_combo.setCurrentIndex(0)
-        for cb in self.weekday_checks.values():
-            cb.setChecked(False)
-        self.time_list.clear()
-        self.time_edit.setTime(QTime(9, 0))
-        self.recipients_edit.clear()
-        self.message_edit.clear()
-        self.chat_delay_spin.setValue(0.3)
-        self.send_interval_spin.setValue(0.5)
-        self.default_city_edit.clear()
-        self.keep_unlock_check.setChecked(False)
-        self.relock_check.setChecked(False)
-        self.minimize_check.setChecked(True)
-        self.attachment_edit.clear()
-        self._set_sched_order(["message"])
+        self._loading_form = True
+        try:
+            self.current_task_id = None
+            self.name_edit.clear()
+            self.enabled_check.setChecked(True)
+            self.repeat_mode_combo.setCurrentIndex(0)
+            for cb in self.weekday_checks.values():
+                cb.setChecked(False)
+            self.time_list.clear()
+            self.time_edit.setTime(QTime(9, 0))
+            self.recipients_edit.clear()
+            self.message_edit.clear()
+            self.chat_delay_spin.setValue(0.3)
+            self.send_interval_spin.setValue(0.5)
+            self.default_city_edit.clear()
+            self.keep_unlock_check.setChecked(False)
+            self.relock_check.setChecked(False)
+            self.minimize_check.setChecked(True)
+            self.attachment_edit.clear()
+            self._set_sched_order(["message"])
+        finally:
+            self._loading_form = False
+        self._form_dirty = False
 
     # ------------------------- 增删改 -------------------------
     def _on_new_task(self):
         self._reset_form()
         self.name_edit.setFocus()
+        # 新任务 = 待保存的新配置：自动弹出保存区
+        self._form_dirty = True
+        if self.save_group.is_collapsed():
+            self.save_group.set_collapsed(False, animate=True)
 
     def _on_clone_task(self):
         task = self._form_to_task(new_id=True)
@@ -3003,6 +3153,8 @@ class ScheduleTab(QWidget):
         self.log(f"[定时] 已保存任务: {task.name}")
         self.reload_tasks()
         self._select_task_by_id(task.id)
+        # 保存成功：清脏并自动收起保存区
+        self._clear_form_dirty()
 
     def _select_task_by_id(self, task_id):
         for i in range(self.task_list.count()):
@@ -3114,6 +3266,7 @@ class ScheduleTab(QWidget):
         item = self.sched_order_list.takeItem(row)
         self.sched_order_list.insertItem(target, item)
         self.sched_order_list.setCurrentRow(target)
+        self._mark_form_dirty()
 
     def _on_sched_order_item_changed(self, _item):
         # 消息文字是定时任务的根本，若被取消勾选则提示并恢复勾选
@@ -3137,10 +3290,12 @@ class ScheduleTab(QWidget):
         if path:
             self.attachment_edit.setText(path)
             self._set_sched_item_checked("attachment", True)
+            self._mark_form_dirty()
 
     def _on_clear_attachment(self):
         self.attachment_edit.clear()
         self._set_sched_item_checked("attachment", False)
+        self._mark_form_dirty()
 
     # ------------------------- 重复模式/时间点 -------------------------
     def _on_repeat_mode_changed(self, index):
@@ -3192,6 +3347,8 @@ class ScheduleTab(QWidget):
             return
         self.log(f"[定时] 配置已保存到: {path}")
         QMessageBox.information(self, "保存成功", f"已保存 {len(tasks)} 个定时任务配置")
+        # 保存成功：清脏并自动收起保存区
+        self._clear_form_dirty()
 
     def _on_load_all(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -3232,6 +3389,10 @@ class ScheduleTab(QWidget):
         self.reload_tasks()
         self.log(f"[定时] 已导入 {len(loaded)} 个任务配置: {os.path.basename(path)}")
         QMessageBox.information(self, "导入成功", f"已导入 {len(loaded)} 个定时任务")
+        # 加载完成 = 干净状态：收起保存区
+        self._form_dirty = False
+        if not self.save_group.is_collapsed():
+            self.save_group.set_collapsed(True)
 
     # ------------------------- 立即执行 -------------------------
     def _on_run_now(self):
