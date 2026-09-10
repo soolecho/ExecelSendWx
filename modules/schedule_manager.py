@@ -63,6 +63,8 @@ class ScheduleTask:
     minimize_after: bool = True
     # 附加文件（文件/图片绝对路径），随消息额外发送；空表示不发送附件
     attachment: str = ""
+    # 附件发送时机：after=先发文字再发附件（默认）；before=先发附件再发文字
+    attach_order: str = "after"
     # 已触发记录：{ "YYYY-MM-DD": ["08:30", ...] }
     fired_log: Dict[str, List[str]] = field(default_factory=dict)
     created_at: str = ""
@@ -126,6 +128,7 @@ class ScheduleTask:
             relock_after=bool(data.get("relock_after", False)),
             minimize_after=bool(data.get("minimize_after", True)),
             attachment=str(data.get("attachment", "") or ""),
+            attach_order=str(data.get("attach_order", "after") or "after"),
             fired_log=_normalize_fired_log(data.get("fired_log")),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),

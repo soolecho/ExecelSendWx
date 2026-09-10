@@ -241,7 +241,8 @@ class SendWorker(QThread):
         tasks,
         send_interval=2,
         chat_delay=0.8,
-        send_mode="text",
+        send_order=None,
+        send_mode=None,
         minimize_after=True,
         attachment=""
     ):
@@ -249,9 +250,22 @@ class SendWorker(QThread):
         self.tasks = tasks
         self.send_interval = send_interval
         self.chat_delay = chat_delay
-        self.send_mode = send_mode
         self.minimize_after = bool(minimize_after)
         self.attachment = str(attachment or "").strip()
+        # 发送顺序：显式 send_order 优先；兼容旧 send_mode 参数
+        if send_order:
+            order = list(send_order)
+        elif send_mode in ("image",):
+            order = ["image"]
+        elif send_mode == "image_text":
+            order = ["image", "text"]
+        else:
+            order = ["text"]
+        # 去重保序，只保留合法类型
+        self.send_order = []
+        for k in order:
+            if k in ("text", "image", "custom", "attachment") and k not in self.send_order:
+                self.send_order.append(k)
         self.signals = WorkerSignals()
         self.paused_event = threading.Event()
         self.stopped_event = threading.Event()
@@ -273,15 +287,17 @@ class SendWorker(QThread):
         }
 
     def _create_steps(self, custom_msg):
+        """按用户配置的发送顺序生成步骤；内容为空的步骤跳过。"""
         steps = []
-        if self.send_mode in ("image", "image_text"):
-            steps.append({"type": "image", "index": 0})
-        if self.send_mode in ("text", "image_text"):
-            steps.append({"type": "text", "index": 0})
-        if custom_msg:
-            steps.append({"type": "custom", "index": 0})
-        if self.attachment:
-            steps.append({"type": "attachment", "index": 0})
+        for kind in self.send_order:
+            if kind == "image":
+                steps.append({"type": "image", "index": 0})
+            elif kind == "text":
+                steps.append({"type": "text", "index": 0})
+            elif kind == "custom" and custom_msg:
+                steps.append({"type": "custom", "index": 0})
+            elif kind == "attachment" and self.attachment:
+                steps.append({"type": "attachment", "index": 0})
         return steps
 
     def run(self):
@@ -559,6 +575,7 @@ class ScheduleSendWorker(QThread):
         default_city="",
         minimize_after=True,
         attachment="",
+        attach_order="after",
     ):
         super().__init__()
         self.recipients = list(recipients or [])
@@ -568,6 +585,7 @@ class ScheduleSendWorker(QThread):
         self.default_city = str(default_city or "")
         self.minimize_after = bool(minimize_after)
         self.attachment = str(attachment or "").strip()
+        self.attach_order = "before" if str(attach_order) == "before" else "after"
         self._log_cb = log_callback
         self.stopped_event = threading.Event()
         self._sender = None
@@ -671,18 +689,21 @@ class ScheduleSendWorker(QThread):
                 if not recipient:
                     continue
                 self.log(f"[定时] [{idx+1}/{total}] 发送到 {recipient}")
-                ok = self._sender.send_message(
-                    content=self.message,
-                    recipient=recipient,
-                    first_send=self._first_send,
-                    chat_delay=self.chat_delay,
-                    fast_mode=False,
-                    stop_event=self.stopped_event,
-                )
-                self._first_send = False
-                # 文字发送成功后再发附加文件；附件失败只记录日志，
-                # 不把整个接收人判为失败（避免重试时文字重复发送）
-                if ok and attachment_ok:
+
+                def _send_text():
+                    return self._sender.send_message(
+                        content=self.message,
+                        recipient=recipient,
+                        first_send=self._first_send,
+                        chat_delay=self.chat_delay,
+                        fast_mode=False,
+                        stop_event=self.stopped_event,
+                    )
+
+                def _send_attach():
+                    # 附件失败只记录日志，不把接收人判为失败（避免重试时内容重复发送）
+                    if not attachment_ok:
+                        return
                     if not self._sender.send_file(
                         self.attachment,
                         recipient,
@@ -690,6 +711,16 @@ class ScheduleSendWorker(QThread):
                         stop_event=self.stopped_event,
                     ):
                         self.log(f"[定时] ⚠ 附加文件发送失败: {recipient}")
+
+                # 按任务配置的顺序发送：before=先附件后文字，after=先文字后附件（默认）
+                if self.attach_order == "before":
+                    _send_attach()
+                    ok = _send_text()
+                else:
+                    ok = _send_text()
+                    if ok:
+                        _send_attach()
+                self._first_send = False
                 if ok:
                     success += 1
                 else:
@@ -907,13 +938,37 @@ class TableFilterTab(QWidget):
         send_layout.addWidget(self.wechat_edit)
         
         send_mode_layout = QHBoxLayout()
-        send_mode_layout.addWidget(QLabel("数据发送形式:"))
-        self.send_mode_combo = QComboBox()
-        self.send_mode_combo.addItem("文字", "text")
-        self.send_mode_combo.addItem("图片", "image")
-        self.send_mode_combo.addItem("图片后再发文字", "image_text")
-        send_mode_layout.addWidget(self.send_mode_combo)
+        send_mode_layout.addWidget(QLabel("发送内容顺序(勾选启用，选中后点右侧按钮调整先后):"))
         send_layout.addLayout(send_mode_layout)
+        order_row = QHBoxLayout()
+        self.send_order_list = QListWidget()
+        self.send_order_list.setMaximumHeight(92)
+        # 顺序即发送先后：每项带勾选框表示是否发送该内容
+        self._ORDER_ITEMS = [
+            ("text", "表格文字（提取的数据）"),
+            ("image", "表格图片（数据截图）"),
+            ("custom", "自定义消息"),
+            ("attachment", "附加文件"),
+        ]
+        for key, label in self._ORDER_ITEMS:
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if key == "text" else Qt.CheckState.Unchecked
+            )
+            self.send_order_list.addItem(item)
+        order_row.addWidget(self.send_order_list, 1)
+        order_btns = QVBoxLayout()
+        self.order_up_btn = QPushButton("⬆ 上移")
+        self.order_down_btn = QPushButton("⬇ 下移")
+        order_btns.addWidget(self.order_up_btn)
+        order_btns.addWidget(self.order_down_btn)
+        order_btns.addStretch()
+        order_row.addLayout(order_btns)
+        send_layout.addLayout(order_row)
+        # 保留一个隐藏兼容属性：部分旧逻辑读取 send_mode_combo 时不再报错
+        self.send_mode_combo = None
 
         interval_layout = QHBoxLayout()
         interval_layout.addWidget(QLabel("发送间隔(秒):"))
@@ -1058,6 +1113,9 @@ class TableFilterTab(QWidget):
         self.custom_msg_checkbox.stateChanged.connect(self.on_custom_msg_checkbox_changed)
         self.attach_pick_btn.clicked.connect(self._on_pick_attachment)
         self.attach_clear_btn.clicked.connect(self._on_clear_attachment)
+        self.order_up_btn.clicked.connect(lambda: self._move_order_item(-1))
+        self.order_down_btn.clicked.connect(lambda: self._move_order_item(1))
+        self.send_order_list.itemChanged.connect(self._on_send_order_item_changed)
 
     def refresh_recent_configs(self):
         self.recent_config_list.clear()
@@ -1107,7 +1165,8 @@ class TableFilterTab(QWidget):
             },
             "send": {
                 "manual_recipient": self.wechat_edit.text().strip(),
-                "mode": self.send_mode_combo.currentData(),
+                "mode": "custom",
+                "send_order": self._get_send_order(),
                 "interval": self.send_interval_spin.value(),
                 "chat_delay": self.chat_delay_spin.value(),
                 "custom_message_enabled": (
@@ -1322,17 +1381,9 @@ class TableFilterTab(QWidget):
         self.wechat_edit.setText(
             send_settings.get("manual_recipient", "")
         )
-        send_mode_index = self.send_mode_combo.findData(
-            send_settings.get("mode", "text")
-        )
-        if send_mode_index >= 0:
-            self.send_mode_combo.setCurrentIndex(send_mode_index)
         self.send_interval_spin.setValue(send_settings.get("interval", 0.5))
         self.chat_delay_spin.setValue(
             send_settings.get("chat_delay", 0.3)
-        )
-        self.custom_msg_checkbox.setChecked(
-            send_settings.get("custom_message_enabled", False)
         )
         self.custom_msg_edit.setPlainText(
             send_settings.get("custom_message", "")
@@ -1340,6 +1391,37 @@ class TableFilterTab(QWidget):
         self.attachment_edit.setText(
             send_settings.get("attachment", "") or ""
         )
+
+        # 发送顺序：优先读新字段 send_order；旧配置从 mode 迁移
+        custom_enabled = bool(send_settings.get("custom_message_enabled", False))
+        attachment_path = self.attachment_edit.text().strip()
+        raw_order = send_settings.get("send_order")
+        valid_keys = {k for k, _ in self._ORDER_ITEMS}
+        if isinstance(raw_order, list) and raw_order:
+            order = [k for k in raw_order if k in valid_keys]
+            if custom_enabled and "custom" not in order:
+                order.append("custom")
+            if attachment_path and "attachment" not in order:
+                order.append("attachment")
+        else:
+            mode = send_settings.get("mode", "text")
+            if mode == "image":
+                order = ["image"]
+            elif mode == "image_text":
+                order = ["image", "text"]
+            else:
+                order = ["text"]
+            if custom_enabled:
+                order.append("custom")
+            if attachment_path:
+                order.append("attachment")
+        # 勾选了但内容为空的不发送（防止误发空附件步骤）
+        if not custom_enabled and "custom" in order:
+            order.remove("custom")
+        if not attachment_path and "attachment" in order:
+            order.remove("attachment")
+        self._set_send_order(order)
+        self.custom_msg_checkbox.setChecked("custom" in order)
 
         can_load_data = (
             name_column in self.headers
@@ -1436,7 +1518,10 @@ class TableFilterTab(QWidget):
         pass
 
     def on_custom_msg_checkbox_changed(self, state):
-        self.custom_msg_edit.setEnabled(state == Qt.CheckState.Checked.value)
+        checked = state == Qt.CheckState.Checked.value
+        self.custom_msg_edit.setEnabled(checked)
+        # 同步发送顺序列表里的“自定义消息”勾选状态
+        self._set_order_item_checked("custom", checked)
 
     def _on_pick_attachment(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1447,9 +1532,89 @@ class TableFilterTab(QWidget):
         )
         if path:
             self.attachment_edit.setText(path)
+            # 选中文件自动勾选发送顺序里的“附加文件”
+            self._set_order_item_checked("attachment", True)
 
     def _on_clear_attachment(self):
         self.attachment_edit.clear()
+        self._set_order_item_checked("attachment", False)
+
+    # ------------------------- 发送顺序 -------------------------
+    def _get_send_order(self):
+        """按列表行顺序返回已勾选的内容类型 key 列表。"""
+        order = []
+        for i in range(self.send_order_list.count()):
+            item = self.send_order_list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                order.append(item.data(Qt.ItemDataRole.UserRole))
+        return order
+
+    def _find_order_item(self, key):
+        for i in range(self.send_order_list.count()):
+            item = self.send_order_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == key:
+                return i, item
+        return -1, None
+
+    def _set_order_item_checked(self, key, checked):
+        _idx, item = self._find_order_item(key)
+        if item is None:
+            return
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        if item.checkState() != state:
+            self.send_order_list.blockSignals(True)
+            try:
+                item.setCheckState(state)
+            finally:
+                self.send_order_list.blockSignals(False)
+        if key == "custom":
+            self.custom_msg_edit.setEnabled(checked)
+
+    def _set_send_order(self, order_keys):
+        """按给定顺序重建列表行并设置勾选状态。"""
+        label_map = dict(self._ORDER_ITEMS)
+        self.send_order_list.blockSignals(True)
+        try:
+            self.send_order_list.clear()
+            enabled = set(order_keys)
+            ordered = list(order_keys)
+            # 未包含的类型追加在后面（未勾选），保证四项始终可见可勾选
+            for key, _label in self._ORDER_ITEMS:
+                if key not in enabled and key not in ordered:
+                    ordered.append(key)
+            for key in ordered:
+                item = QListWidgetItem(label_map.get(key, key))
+                item.setData(Qt.ItemDataRole.UserRole, key)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(
+                    Qt.CheckState.Checked if key in enabled else Qt.CheckState.Unchecked
+                )
+                self.send_order_list.addItem(item)
+        finally:
+            self.send_order_list.blockSignals(False)
+        self.custom_msg_edit.setEnabled("custom" in enabled)
+
+    def _move_order_item(self, delta):
+        row = self.send_order_list.currentRow()
+        if row < 0:
+            return
+        target = row + delta
+        if target < 0 or target >= self.send_order_list.count():
+            return
+        item = self.send_order_list.takeItem(row)
+        self.send_order_list.insertItem(target, item)
+        self.send_order_list.setCurrentRow(target)
+
+    def _on_send_order_item_changed(self, item):
+        # 自定义消息勾选状态联动编辑框可用性 + 顶部复选框
+        if item.data(Qt.ItemDataRole.UserRole) == "custom":
+            checked = item.checkState() == Qt.CheckState.Checked
+            self.custom_msg_edit.setEnabled(checked)
+            self.custom_msg_checkbox.blockSignals(True)
+            try:
+                self.custom_msg_checkbox.setChecked(checked)
+            finally:
+                self.custom_msg_checkbox.blockSignals(False)
 
     def open_extract_columns_dialog(self):
         if not hasattr(self, 'headers') or not self.headers:
@@ -1774,7 +1939,17 @@ class TableFilterTab(QWidget):
         custom_msg = ""
         if self.custom_msg_checkbox.isChecked():
             custom_msg = self.custom_msg_edit.toPlainText().strip()
-        send_mode = self.send_mode_combo.currentData()
+        send_order = self._get_send_order()
+        attachment_path = self.attachment_edit.text().strip()
+
+        # 至少要勾选一种实际会发送的内容
+        effective_order = [k for k in send_order if not (
+            (k == "custom" and not custom_msg)
+            or (k == "attachment" and not attachment_path)
+        )]
+        if not effective_order:
+            QMessageBox.warning(self, "警告", "请至少勾选一种要发送的内容（表格文字/表格图片/自定义消息/附加文件）")
+            return
         
         tasks = []
         missing_wechat = []
@@ -1823,7 +1998,8 @@ class TableFilterTab(QWidget):
                 break
             confirm_text += f"  • {task['name']} → {task['recipient']}\n"
         confirm_text += f"\n发送间隔: {self.send_interval_spin.value()}秒"
-        confirm_text += f"\n数据发送形式: {self.send_mode_combo.currentText()}"
+        _order_label = {"text": "表格文字", "image": "表格图片", "custom": "自定义消息", "attachment": "附加文件"}
+        confirm_text += "\n发送顺序: " + " → ".join(_order_label.get(k, k) for k in effective_order)
         if custom_msg:
             confirm_text += f"\n包含自定义消息: {custom_msg[:30]}..." if len(custom_msg) > 30 else f"\n包含自定义消息: {custom_msg}"
         
@@ -1843,13 +2019,13 @@ class TableFilterTab(QWidget):
         self.stop_send_btn.setEnabled(True)
         self.progress_bar.setValue(0)
         self.progress_label.setText("正在发送...")
-        self.last_send_mode = send_mode
-        
+        self.last_send_order = list(send_order)
+
         worker = SendWorker(
             tasks=tasks,
             send_interval=self.send_interval_spin.value(),
             chat_delay=self.chat_delay_spin.value(),
-            send_mode=send_mode,
+            send_order=list(send_order),
             minimize_after=self.minimize_check.isChecked(),
             attachment=self.attachment_edit.text().strip()
         )
@@ -1904,7 +2080,7 @@ class TableFilterTab(QWidget):
             tasks=failed_tasks,
             send_interval=self.send_interval_spin.value(),
             chat_delay=self.chat_delay_spin.value(),
-            send_mode=getattr(self, 'last_send_mode', 'text'),
+            send_order=list(getattr(self, 'last_send_order', ['text'])),
             minimize_after=self.minimize_check.isChecked(),
             attachment=self.attachment_edit.text().strip()
         )
@@ -2188,6 +2364,15 @@ class ScheduleTab(QWidget):
         attach_row.addWidget(self.attach_clear_btn)
         send_layout.addLayout(attach_row)
 
+        attach_order_row = QHBoxLayout()
+        attach_order_row.addWidget(QLabel("附件发送时机:"))
+        self.attach_order_combo = QComboBox()
+        self.attach_order_combo.addItem("先发文字，再发附件", "after")
+        self.attach_order_combo.addItem("先发附件，再发文字", "before")
+        attach_order_row.addWidget(self.attach_order_combo)
+        attach_order_row.addStretch(1)
+        send_layout.addLayout(attach_order_row)
+
         delay_row = QHBoxLayout()
         delay_row.addWidget(QLabel("聊天窗口切换延迟(秒):"))
         self.chat_delay_spin = QDoubleSpinBox()
@@ -2385,6 +2570,9 @@ class ScheduleTab(QWidget):
         self.relock_check.setChecked(bool(getattr(task, "relock_after", False)))
         self.minimize_check.setChecked(bool(getattr(task, "minimize_after", True)))
         self.attachment_edit.setText(getattr(task, "attachment", "") or "")
+        ao = getattr(task, "attach_order", "after") or "after"
+        ai = self.attach_order_combo.findData(ao)
+        self.attach_order_combo.setCurrentIndex(ai if ai >= 0 else 0)
         self._on_repeat_mode_changed(idx)
 
     def _reset_form(self):
@@ -2405,6 +2593,7 @@ class ScheduleTab(QWidget):
         self.relock_check.setChecked(False)
         self.minimize_check.setChecked(True)
         self.attachment_edit.clear()
+        self.attach_order_combo.setCurrentIndex(0)
 
     # ------------------------- 增删改 -------------------------
     def _on_new_task(self):
@@ -2498,6 +2687,7 @@ class ScheduleTab(QWidget):
             relock_after=self.relock_check.isChecked(),
             minimize_after=self.minimize_check.isChecked(),
             attachment=self.attachment_edit.text().strip(),
+            attach_order=self.attach_order_combo.currentData() or "after",
         )
         return task
 
@@ -2637,6 +2827,7 @@ class ScheduleTab(QWidget):
             default_city=current.default_city,
             minimize_after=getattr(current, "minimize_after", True),
             attachment=getattr(current, "attachment", "") or "",
+            attach_order=getattr(current, "attach_order", "after") or "after",
         )
 
         # 保存任务配置供完成回调使用
@@ -2736,12 +2927,21 @@ class ScheduleTab(QWidget):
         btn_row.addWidget(cancel_btn)
         layout.addLayout(btn_row)
 
+        # 测试连接状态：防重复点击 + 对话框关闭后回调安全处理
+        test_state = {"running": False, "sig": None}
+
         def on_test():
+            # 重入保护：测试进行中直接忽略后续点击（按钮也已置灰，双保险）
+            if test_state["running"]:
+                return
+            if not dlg.isVisible():
+                return
             test_city = city_edit.text().strip() or "北京"
             base_url = url_edit.text().strip()
             api_key = key_edit.text().strip()
             self.log(f"[天气] 开始测试连接：city={test_city} url={base_url}")
             # 防止重复点击 + 网络请求放后台线程，避免阻塞主线程导致界面卡死
+            test_state["running"] = True
             test_btn.setEnabled(False)
             test_btn.setText("测试中...")
             result_label.setText("正在测试连接，请稍候（最多约 8 秒）...")
@@ -2751,17 +2951,27 @@ class ScheduleTab(QWidget):
                 log = pyqtSignal(str)
 
             sig = _TestSignal()
+            test_state["sig"] = sig
 
             def on_log(msg):
-                self.log(f"[天气] {msg}")
+                try:
+                    self.log(f"[天气] {msg}")
+                except Exception:
+                    pass
 
             def on_done(ok, m):
-                color = "#2e7d32" if ok else "#c62828"
-                result_label.setText(f'<span style="color:{color}">{m}</span>')
-                result_label.setTextFormat(Qt.TextFormat.RichText)
-                test_btn.setEnabled(True)
-                test_btn.setText("测试连接")
-                # 对话框关闭后信号对象随父对象回收，断开避免悬挂
+                # 回调到达时对话框可能已关闭，控件已销毁——整段保护
+                try:
+                    if dlg.isVisible():
+                        color = "#2e7d32" if ok else "#c62828"
+                        result_label.setText(f'<span style="color:{color}">{m}</span>')
+                        result_label.setTextFormat(Qt.TextFormat.RichText)
+                        test_btn.setEnabled(True)
+                        test_btn.setText("测试连接")
+                except Exception:
+                    pass
+                test_state["running"] = False
+                test_state["sig"] = None
                 try:
                     sig.deleteLater()
                 except Exception:
@@ -2780,8 +2990,14 @@ class ScheduleTab(QWidget):
                     )
                 except Exception as exc:
                     ok, m = False, f"测试异常: {exc}"
-                    sig.log.emit(str(m))
-                sig.done.emit(bool(ok), str(m))
+                    try:
+                        sig.log.emit(str(m))
+                    except Exception:
+                        pass
+                try:
+                    sig.done.emit(bool(ok), str(m))
+                except Exception:
+                    pass
 
             threading.Thread(target=_worker, daemon=True, name="WeatherTest").start()
 
@@ -2896,6 +3112,7 @@ class MainWindow(QMainWindow):
             default_city=task.default_city,
             minimize_after=getattr(task, "minimize_after", True),
             attachment=getattr(task, "attachment", "") or "",
+            attach_order=getattr(task, "attach_order", "after") or "after",
         )
         self._schedule_worker = worker
         threading.Thread(
