@@ -800,6 +800,22 @@ class SendWorker(QThread):
                         messages.append(person_data[j:j+max_message_length])
                     
                     while task["pending_steps"] and not self.stopped_event.is_set():
+                        # 每个收件人只在第一个 step 前切换一次聊天窗口；
+                        # 后续 text/image/attachment/custom 步骤直接在当前窗口
+                        # 用 fast_mode 发送，不再重复"搜索-切换-确认"。
+                        if not task.get("_chat_opened"):
+                            if not sender.open_chat(
+                                recipient,
+                                chat_delay=self.chat_delay,
+                                stop_event=self.stopped_event,
+                            ):
+                                self.signals.log.emit(
+                                    f"[{i+1}/{total_count}] ❌ 打开聊天窗口失败: {recipient}"
+                                )
+                                failed_tasks.append(task)
+                                break
+                            task["_chat_opened"] = True
+
                         step = task["pending_steps"][0]
                         step_type = step["type"]
                         start_index = step.get("index", 0)
@@ -810,7 +826,8 @@ class SendWorker(QThread):
                                 recipient,
                                 chat_delay=self.chat_delay,
                                 start_index=start_index,
-                                stop_event=self.stopped_event
+                                stop_event=self.stopped_event,
+                                fast_mode=True,
                             )
                             step["index"] = next_index
                         elif step_type == "text":
@@ -819,7 +836,8 @@ class SendWorker(QThread):
                                 recipient,
                                 chat_delay=self.chat_delay,
                                 start_index=start_index,
-                                stop_event=self.stopped_event
+                                stop_event=self.stopped_event,
+                                fast_mode=True,
                             )
                             step["index"] = next_index
                         elif step_type == "attachment":
@@ -827,6 +845,7 @@ class SendWorker(QThread):
                                 self.attachment,
                                 recipient,
                                 chat_delay=self.chat_delay,
+                                fast_mode=True,
                                 stop_event=self.stopped_event
                             )
                             if success:

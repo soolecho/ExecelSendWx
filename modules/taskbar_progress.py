@@ -63,14 +63,36 @@ class TaskbarProgress:
         self._hwnd = int(hwnd or 0)
         self._p = None  # ITaskbarList3 指针
         self._available = False
-        if not sys.platform.startswith("win"):
-            return
+        # 平滑动画相关
+        self._anim = None          # QVariantAnimation
+        self._cur_completed = 0.0  # 动画当前显示值
+        self._cur_total = 1        # 动画当前总分母
+        self._target_completed = 0
+        self._target_total = 1
         try:
             self._init_com()
         except Exception as exc:
             logger.debug("任务栏进度条初始化失败(将静默降级): %s", exc)
             self._p = None
             self._available = False
+        # COM 初始化成功后再尝试加载动画（确保非 Windows 也不误用）
+        if self._available:
+            self._init_animation()
+
+    def _init_animation(self) -> None:
+        """用 QVariantAnimation 做进度值平滑插值（无 Qt 时降级为直接设置）。"""
+        try:
+            from PyQt6.QtCore import QVariantAnimation, QEasingCurve
+        except Exception:
+            try:
+                from PyQt5.QtCore import QVariantAnimation, QEasingCurve
+            except Exception:
+                return
+        anim = QVariantAnimation()
+        anim.setDuration(450)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        anim.valueChanged.connect(self._on_anim_value)
+        self._anim = anim
 
     def _init_com(self) -> None:
         ole32 = ctypes.windll.ole32
@@ -123,12 +145,53 @@ class TaskbarProgress:
         self._hwnd = int(hwnd or 0)
 
     def set_value(self, completed: int, total: int) -> bool:
-        """更新进度值；自动进入绿色(NORMAL)状态。"""
+        """更新进度值；自动进入绿色(NORMAL)状态。
+
+        带平滑动画：从当前显示值插值到目标值，使任务栏进度条过渡更柔和明显。
+        """
+        if not self._available or not self._hwnd or total <= 0:
+            return False
+        completed = max(0, min(int(completed), int(total)))
+        self._target_completed = completed
+        self._target_total = int(total)
+        try:
+            self._SetProgressState(self._p, self._hwnd, TBPF_NORMAL)
+        except Exception as exc:
+            logger.debug("任务栏 set_state 失败: %s", exc)
+            return False
+
+        # 无动画能力或差值极小 → 直接设置
+        if self._anim is None or abs(completed - self._cur_completed) < 1:
+            return self._apply_value(completed, total)
+
+        # 启动/续接平滑动画：从当前显示值过渡到目标值
+        try:
+            self._anim.stop()
+            self._anim.setStartValue(self._cur_completed)
+            self._anim.setEndValue(float(completed))
+            # 到顶(100%)时缩短动画，避免结束时拖沓
+            if completed >= total:
+                self._anim.setDuration(200)
+            else:
+                self._anim.setDuration(450)
+            self._anim.start()
+            return True
+        except Exception as exc:
+            logger.debug("任务栏动画启动失败，降级直接设置: %s", exc)
+            return self._apply_value(completed, total)
+
+    def _on_anim_value(self, value) -> None:
+        """动画回调：将中间值实时写入任务栏。"""
+        self._cur_completed = float(value)
+        self._apply_value(int(round(self._cur_completed)), self._target_total)
+
+    def _apply_value(self, completed: int, total: int) -> bool:
         if not self._available or not self._hwnd or total <= 0:
             return False
         try:
             completed = max(0, min(int(completed), int(total)))
-            self._SetProgressState(self._p, self._hwnd, TBPF_NORMAL)
+            self._cur_completed = float(completed)
+            self._cur_total = int(total)
             self._SetProgressValue(
                 self._p, self._hwnd, ctypes.c_ulonglong(completed),
                 ctypes.c_ulonglong(total),
@@ -161,4 +224,10 @@ class TaskbarProgress:
 
     def clear(self) -> bool:
         """结束/空闲：清除任务栏进度条。"""
+        if self._anim is not None:
+            try:
+                self._anim.stop()
+            except Exception:
+                pass
+        self._cur_completed = 0.0
         return self.set_state(TBPF_NOPROGRESS)

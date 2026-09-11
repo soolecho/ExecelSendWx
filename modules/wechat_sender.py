@@ -429,6 +429,45 @@ class WeChatSender:
             self._press_esc_on_wechat()
             return False
 
+    def open_chat(self, recipient: str, chat_delay: float = 0.3,
+                  stop_event=None) -> bool:
+        """切换到收件人聊天窗口并等待就绪（含重试）。
+
+        供多内容发送时调用一次：之后的 text/image/attachment/custom 步骤
+        直接用 fast_mode 在当前窗口发送，不再重复搜索-切换-确认。
+        """
+        if not self.wx:
+            if not self.initialize():
+                return False
+        max_retries = 3
+        for attempt in range(max_retries):
+            if self._stop_requested(stop_event):
+                return False
+            switched = self._safe_chatwith(recipient, exact=False)
+            if not switched:
+                if attempt < max_retries - 1:
+                    self._ensure_window_on_screen(self.log)
+                    if self._wait_or_stopped(0.2, stop_event):
+                        return False
+                continue
+            if self._wait_or_stopped(chat_delay, stop_event):
+                return False
+            ok, chatinfo = self._safe_chatinfo()
+            if not ok:
+                if self.reconnect(self.log):
+                    if self._safe_chatwith(recipient, exact=False):
+                        self._wait_or_stopped(chat_delay, stop_event)
+                        ok, chatinfo = self._safe_chatinfo()
+            current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
+            if self._is_target_chat(current_chat, recipient):
+                return True
+            if attempt < max_retries - 1:
+                self._press_esc_on_wechat()
+                self._ensure_window_on_screen(self.log)
+                if self._wait_or_stopped(0.2, stop_event):
+                    return False
+        return False
+
     @staticmethod
     def _stop_requested(stop_event):
         return bool(stop_event and stop_event.is_set())
@@ -941,7 +980,8 @@ class WeChatSender:
         recipient,
         chat_delay=0.3,
         start_index=0,
-        stop_event=None
+        stop_event=None,
+        fast_mode=False
     ):
         image_paths = []
         next_index = start_index
@@ -962,7 +1002,8 @@ class WeChatSender:
                     image_path,
                     recipient,
                     chat_delay=chat_delay,
-                    fast_mode=(index > 0),
+                    # fast_mode=True 时所有图片都直接在当前窗口发（窗口已预切换）
+                    fast_mode=fast_mode or index > 0,
                     stop_event=stop_event
                 ):
                     return False, next_index
@@ -996,7 +1037,8 @@ class WeChatSender:
         recipient,
         chat_delay=0.2,
         start_index=0,
-        stop_event=None
+        stop_event=None,
+        fast_mode=False
     ):
         next_index = start_index
         for i in range(start_index, len(messages)):
@@ -1008,8 +1050,9 @@ class WeChatSender:
             if not self.send_message(
                 message,
                 recipient,
-                first_send=(i == 0),
+                first_send=(i == 0 and not fast_mode),
                 chat_delay=chat_delay,
+                fast_mode=fast_mode,
                 stop_event=stop_event
             ):
                 return False, next_index
