@@ -2274,6 +2274,9 @@ class TableFilterTab(QWidget):
             self.send_btn.setEnabled(True)
             self.start_send_btn.setEnabled(True)
             self.preview_selected_data()
+            # 选中人员后自动展开数据预览面板（若当前折叠）
+            if self.preview_group.is_collapsed():
+                self.preview_group.set_collapsed(False, animate=True)
         else:
             self.send_btn.setEnabled(False)
             # 列表还有人员时保持"开始发送"可点击（未选中时点击会弹提示）

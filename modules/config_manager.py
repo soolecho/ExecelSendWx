@@ -12,7 +12,7 @@ class ConfigError(ValueError):
 class ConfigManager:
     PROFILE_VERSION = 1
     MAX_RECENT = 10
-    VALID_SEND_MODES = {"text", "image", "image_text"}
+    VALID_SEND_MODES = {"text", "image", "image_text", "custom"}
 
     def __init__(self, base_dir=None):
         self.base_dir = self._create_base_dir(base_dir)
@@ -129,8 +129,25 @@ class ConfigManager:
                     send.get("custom_message_enabled", False)
                 ),
                 "custom_message": str(send.get("custom_message", "")),
+                "send_order": cls._normalize_send_order(send.get("send_order")),
+                "attachment": str(send.get("attachment", "")).strip(),
             },
         }
+
+    @staticmethod
+    def _normalize_send_order(raw_order):
+        """规范化发送顺序：只保留合法 key，去重保序。"""
+        valid = {"text", "image", "custom", "attachment"}
+        if not isinstance(raw_order, list):
+            return None
+        seen = set()
+        result = []
+        for k in raw_order:
+            k = str(k).strip()
+            if k in valid and k not in seen:
+                seen.add(k)
+                result.append(k)
+        return result or None
 
     def save_profile(self, path, data):
         profile = self.normalize_profile(data)
