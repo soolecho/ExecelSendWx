@@ -505,8 +505,6 @@ class WeChatSender:
                 self.log("❌ 微信探活失败且重连未成功")
                 return False
 
-        self.log(f"发送消息给 {recipient}")
-
         def attempt_once(allow_reconnect: bool) -> bool:
             try:
                 if first_send:
@@ -634,7 +632,7 @@ class WeChatSender:
             if not ok and not self.reconnect(self.log):
                 return False
 
-        self.log(f"发送文件 {file_path} 给 {recipient}")
+        self.log(f"发送文件: {file_path}")
 
         def attempt_once(allow_reconnect: bool) -> bool:
             try:

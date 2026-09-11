@@ -533,7 +533,7 @@ def acquire_instance_lock(lock_path=None):
 
 class WorkerSignals(QObject):
     error = pyqtSignal(str)
-    progress = pyqtSignal(int)
+    progress = pyqtSignal(int, int)  # current, total
     result = pyqtSignal(object)
     log = pyqtSignal(str)
 
@@ -792,7 +792,7 @@ class SendWorker(QThread):
                             break
                     
                     self.signals.log.emit(f"[{i+1}/{total_count}] 正在发送给 {recipient} ({name})...")
-                    self.signals.progress.emit(int((i + 1) / total_count * 100))
+                    self.signals.progress.emit(i + 1, total_count)
                     
                     messages = []
                     max_message_length = 2000
@@ -841,6 +841,9 @@ class SendWorker(QThread):
                             )
                             step["index"] = next_index
                         elif step_type == "attachment":
+                            self.signals.log.emit(
+                                f"[{i+1}/{total_count}] 发送附件给 {recipient}"
+                            )
                             success = sender.send_file(
                                 self.attachment,
                                 recipient,
@@ -853,6 +856,9 @@ class SendWorker(QThread):
                                     f"[{i+1}/{total_count}] 已发送附加文件"
                                 )
                         else:
+                            self.signals.log.emit(
+                                f"[{i+1}/{total_count}] 发送自定义消息给 {recipient}"
+                            )
                             success = sender.send_message(
                                 task["custom_msg"],
                                 recipient,
@@ -4209,8 +4215,8 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _on_table_progress_pct(self, pct):
-        self._update_send_progress(pct, 100)
+    def _on_table_progress_pct(self, current, total):
+        self._update_send_progress(current, total)
 
     def _on_table_result(self, r):
         failed = r[1] if isinstance(r, (list, tuple)) and len(r) > 1 else 0
