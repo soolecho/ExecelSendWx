@@ -65,10 +65,8 @@ class TaskbarProgress:
         self._available = False
         # 平滑动画相关
         self._anim = None          # QVariantAnimation
-        self._cur_completed = 0.0  # 动画当前显示值
-        self._cur_total = 1        # 动画当前总分母
-        self._target_completed = 0
-        self._target_total = 1
+        self._cur_pct = 0.0        # 动画当前显示百分比(0-1000)
+        self._target_pct = 0.0     # 目标百分比
         try:
             self._init_com()
         except Exception as exc:
@@ -147,30 +145,33 @@ class TaskbarProgress:
     def set_value(self, completed: int, total: int) -> bool:
         """更新进度值；自动进入绿色(NORMAL)状态。
 
-        带平滑动画：从当前显示值插值到目标值，使任务栏进度条过渡更柔和明显。
+        带平滑动画：内部用 0-1000 百分比刻度插值（而非直接用 completed/total），
+        避免 total 较小时（如 40 人）相邻两次进度差值仅为 1、round 后几乎
+        不变导致看不到动画的问题。
         """
         if not self._available or not self._hwnd or total <= 0:
             return False
         completed = max(0, min(int(completed), int(total)))
-        self._target_completed = completed
-        self._target_total = int(total)
+        # 目标百分比刻度（0-1000）
+        target_pct = completed / int(total) * 1000.0
+        self._target_pct = target_pct
         try:
             self._SetProgressState(self._p, self._hwnd, TBPF_NORMAL)
         except Exception as exc:
             logger.debug("任务栏 set_state 失败: %s", exc)
             return False
 
-        # 无动画能力或差值极小 → 直接设置
-        if self._anim is None or abs(completed - self._cur_completed) < 1:
-            return self._apply_value(completed, total)
+        # 无动画能力或差值极小(<0.5%) → 直接设置
+        if self._anim is None or abs(target_pct - self._cur_pct) < 0.5:
+            return self._apply_pct(target_pct)
 
-        # 启动/续接平滑动画：从当前显示值过渡到目标值
+        # 启动/续接平滑动画：从当前百分比过渡到目标百分比
         try:
             self._anim.stop()
-            self._anim.setStartValue(self._cur_completed)
-            self._anim.setEndValue(float(completed))
+            self._anim.setStartValue(self._cur_pct)
+            self._anim.setEndValue(target_pct)
             # 到顶(100%)时缩短动画，避免结束时拖沓
-            if completed >= total:
+            if target_pct >= 999.5:
                 self._anim.setDuration(200)
             else:
                 self._anim.setDuration(450)
@@ -178,23 +179,23 @@ class TaskbarProgress:
             return True
         except Exception as exc:
             logger.debug("任务栏动画启动失败，降级直接设置: %s", exc)
-            return self._apply_value(completed, total)
+            return self._apply_pct(target_pct)
 
     def _on_anim_value(self, value) -> None:
-        """动画回调：将中间值实时写入任务栏。"""
-        self._cur_completed = float(value)
-        self._apply_value(int(round(self._cur_completed)), self._target_total)
+        """动画回调：将中间百分比实时写入任务栏。"""
+        self._cur_pct = float(value)
+        self._apply_pct(self._cur_pct)
 
-    def _apply_value(self, completed: int, total: int) -> bool:
-        if not self._available or not self._hwnd or total <= 0:
+    def _apply_pct(self, pct: float) -> bool:
+        """按百分比刻度(0-1000)写入任务栏进度条。"""
+        if not self._available or not self._hwnd:
             return False
         try:
-            completed = max(0, min(int(completed), int(total)))
-            self._cur_completed = float(completed)
-            self._cur_total = int(total)
+            pct = max(0.0, min(1000.0, float(pct)))
+            self._cur_pct = pct
             self._SetProgressValue(
-                self._p, self._hwnd, ctypes.c_ulonglong(completed),
-                ctypes.c_ulonglong(total),
+                self._p, self._hwnd, ctypes.c_ulonglong(int(round(pct))),
+                ctypes.c_ulonglong(1000),
             )
             return True
         except Exception as exc:
@@ -229,5 +230,5 @@ class TaskbarProgress:
                 self._anim.stop()
             except Exception:
                 pass
-        self._cur_completed = 0.0
+        self._cur_pct = 0.0
         return self.set_state(TBPF_NOPROGRESS)
