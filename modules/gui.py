@@ -169,6 +169,7 @@ class ChipSection(QWidget):
         self._anim = QPropertyAnimation(self._content, b"maximumHeight", self)
         self._anim.finished.connect(self._on_anim_finished)
         self._anim_target_collapsed = False
+        self._no_accordion_close = False
         if collapsed:
             self.set_collapsed(True)
 
@@ -194,10 +195,19 @@ class ChipSection(QWidget):
             pass
         self._content.setMaximumHeight(16777215)
 
-    def set_collapsed(self, collapsed: bool, animate: bool = False) -> None:
+    def set_collapsed(self, collapsed: bool, animate: bool = False,
+                      accordion_close: bool = True) -> None:
+        """折叠/展开面板。
+
+        :param accordion_close: 手风琴排中，程序自动展开时传 False 可避免
+            挤掉用户正在查看/编辑的其他面板（如打字时脏检测弹出操作区）；
+            用户手动点芯片始终为 True，保持手风琴体验。
+        """
         collapsed = bool(collapsed)
         if collapsed == self._collapsed:
             return
+        # 一次性标志：供 ChipBar._on_section_changed 读取
+        self._no_accordion_close = not accordion_close and not collapsed
         if animate:
             self._animated_set_collapsed(collapsed)
             return
@@ -422,8 +432,12 @@ class ChipBar(QWidget):
         # 同步芯片选中态（用户点击 / 程序自动折叠都一致）
         if section._chip is not None:
             section._chip.setChecked(not collapsed)
+        # 程序自动展开且声明不挤掉其他面板（如打字中脏检测弹操作区）：跳过手风琴
+        no_close = getattr(section, "_no_accordion_close", False)
+        section._no_accordion_close = False
         # 手风琴：展开一个，自动收起同排其他面板
-        if self._exclusive and not collapsed and not self._syncing:
+        if (self._exclusive and not collapsed and not no_close
+                and not self._syncing):
             self._syncing = True
             try:
                 for other in self.sections:
@@ -3029,7 +3043,8 @@ class ScheduleTab(QWidget):
         lock_layout.addStretch()
         right_layout.addWidget(lock_group)
 
-        # 操作区 + 保存
+        # 操作区（默认收起：表单有改动/新建任务时自动弹出，也可手动点开）
+        action_group = right_bar.add_section("💾 保存 / 重置", collapsed=True)
         action_row = QHBoxLayout()
         self.save_task_btn = QPushButton("💾 保存当前任务")
         self.save_task_btn.setStyleSheet(
@@ -3039,7 +3054,8 @@ class ScheduleTab(QWidget):
         action_row.addWidget(self.save_task_btn)
         action_row.addWidget(self.reset_form_btn)
         action_row.addStretch()
-        right_layout.addLayout(action_row)
+        action_group.contentLayout().addLayout(action_row)
+        right_layout.addWidget(action_group)
 
         # 日志（共享主日志的回调，这里也放只读面板，方便查看）
         log_group = right_bar.add_section("📜 定时发送日志", collapsed=True)
@@ -3056,10 +3072,11 @@ class ScheduleTab(QWidget):
         # 注册所有可折叠面板，供全局精简开关遍历
         self._collapsible_groups = [
             list_group, save_group, base_group, repeat_group,
-            send_group, lock_group, log_group,
+            send_group, lock_group, action_group, log_group,
         ]
         self.list_group = list_group
         self.save_group = save_group
+        self.action_group = action_group
 
     def _collapse_groups(self, *groups):
         """批量折叠指定分组（忽略 None）。"""
@@ -3113,18 +3130,24 @@ class ScheduleTab(QWidget):
         self.sched_order_list.itemChanged.connect(lambda *a: mark())
 
     def _mark_form_dirty(self, *_args):
-        """表单被用户改动：置脏并自动弹出保存区（程序填充阶段忽略）。"""
+        """表单被用户改动：置脏并自动弹出左侧配置保存区+右侧保存/重置操作区
+        （程序填充阶段忽略）。"""
         if not self._form_ready or self._loading_form:
             return
         self._form_dirty = True
         if self.save_group.is_collapsed():
             self.save_group.set_collapsed(False, animate=True)
+        if self.action_group.is_collapsed():
+            self.action_group.set_collapsed(
+                False, animate=True, accordion_close=False)
 
     def _clear_form_dirty(self):
-        """保存/加载成功后清脏并自动收起保存区。"""
+        """保存/加载成功后清脏并自动收起保存区与操作区。"""
         self._form_dirty = False
         if not self.save_group.is_collapsed():
             self.save_group.set_collapsed(True, animate=True)
+        if not self.action_group.is_collapsed():
+            self.action_group.set_collapsed(True, animate=True)
 
     # ------------------------- 日志 -------------------------
     # 最大日志行数（交给 QTextDocument 原生裁剪，CPU/内存都更省）
@@ -3251,9 +3274,12 @@ class ScheduleTab(QWidget):
         finally:
             self._loading_form = False
         self._form_dirty = False
-        # 加载已有任务 = 干净状态：自动收起保存区（即时，避免连续切任务时动画打架）
+        # 加载已有任务 = 干净状态：自动收起保存区与操作区
+        # （即时，避免连续切任务时动画打架）
         if not self.save_group.is_collapsed():
             self.save_group.set_collapsed(True)
+        if not self.action_group.is_collapsed():
+            self.action_group.set_collapsed(True)
 
     def _reset_form(self):
         self._loading_form = True
@@ -3284,10 +3310,13 @@ class ScheduleTab(QWidget):
     def _on_new_task(self):
         self._reset_form()
         self.name_edit.setFocus()
-        # 新任务 = 待保存的新配置：自动弹出保存区
+        # 新任务 = 待保存的新配置：自动弹出左侧保存区+右侧操作区
         self._form_dirty = True
         if self.save_group.is_collapsed():
             self.save_group.set_collapsed(False, animate=True)
+        if self.action_group.is_collapsed():
+            self.action_group.set_collapsed(
+                False, animate=True, accordion_close=False)
 
     def _on_clone_task(self):
         task = self._form_to_task(new_id=True)
@@ -3566,10 +3595,12 @@ class ScheduleTab(QWidget):
         self.reload_tasks()
         self.log(f"[定时] 已导入 {len(loaded)} 个任务配置: {os.path.basename(path)}")
         QMessageBox.information(self, "导入成功", f"已导入 {len(loaded)} 个定时任务")
-        # 加载完成 = 干净状态：收起保存区
+        # 加载完成 = 干净状态：收起保存区与操作区
         self._form_dirty = False
         if not self.save_group.is_collapsed():
             self.save_group.set_collapsed(True)
+        if not self.action_group.is_collapsed():
+            self.action_group.set_collapsed(True)
 
     # ------------------------- 立即执行 -------------------------
     def _on_run_now(self):
@@ -4074,12 +4105,19 @@ class MainWindow(QMainWindow):
         """懒加载任务栏进度条（需要 native 窗口 HWND，show 之后才有效）。"""
         if self._taskbar is not None:
             return self._taskbar
+        hwnd = int(self.winId()) if self.winId() else 0
         try:
             from modules.taskbar_progress import TaskbarProgress
-            tb = TaskbarProgress(int(self.winId()))
-            self._taskbar = tb if tb.available else False
-        except Exception:
+            tb = TaskbarProgress(hwnd)
+            if tb.available:
+                self._taskbar = tb
+                self.log(f"[系统] 任务栏进度条已就绪(hwnd=0x{hwnd:X})")
+            else:
+                self._taskbar = False
+                self.log("[系统] 任务栏进度条不可用(ITaskbarList3 初始化失败，已静默降级)")
+        except Exception as exc:
             self._taskbar = False
+            self.log(f"[系统] 任务栏进度条初始化异常: {exc}")
         return self._taskbar if self._taskbar is not False else None
 
     def _begin_send_progress(self):
@@ -4087,6 +4125,9 @@ class MainWindow(QMainWindow):
         tb = self._ensure_taskbar()
         if tb:
             tb.set_indeterminate()
+            self.log("[系统] 任务栏进度条：开始显示发送进度")
+        else:
+            self.log("[系统] 任务栏进度条未就绪，仅在窗口标题和托盘显示进度")
         self.setWindowTitle(f"📤 发送中… - {APP_TITLE}")
         try:
             self.tray_icon.setToolTip(f"{APP_TITLE}\n📤 发送中…")
