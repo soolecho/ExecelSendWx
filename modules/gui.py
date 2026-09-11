@@ -1042,7 +1042,6 @@ class ScheduleSendWorker(QThread):
         self._log_cb = log_callback
         self.stopped_event = threading.Event()
         self._sender = None
-        self._first_send = True
 
     def stop(self):
         self.stopped_event.set()
@@ -1145,16 +1144,30 @@ class ScheduleSendWorker(QThread):
                 self.progress.emit(idx + 1, total)
 
                 text_ok = False
+                # 每个收件人只在第一个发送项前切换一次聊天窗口；后续
+                # 文字/附件直接在当前窗口用 fast_mode 发送，不再重复
+                # "搜索-切换-确认"（与数据发送 Tab 逻辑一致）。
+                chat_opened = False
                 # 按任务配置的发送顺序逐项发送；接收人成败以消息文字为准，附件失败不计入失败
                 for kind in self.send_order:
                     if self.stopped_event.is_set():
                         break
+                    if not chat_opened:
+                        if not self._sender.open_chat(
+                            recipient,
+                            chat_delay=self.chat_delay,
+                            stop_event=self.stopped_event,
+                        ):
+                            self.log(f"[定时] ✗ 打开聊天窗口失败: {recipient}")
+                            break
+                        chat_opened = True
                     if kind == "attachment":
                         if attachment_ok:
                             if not self._sender.send_file(
                                 self.attachment,
                                 recipient,
                                 chat_delay=self.chat_delay,
+                                fast_mode=True,
                                 stop_event=self.stopped_event,
                             ):
                                 self.log(f"[定时] ⚠ 附加文件发送失败: {recipient}")
@@ -1162,12 +1175,10 @@ class ScheduleSendWorker(QThread):
                         text_ok = self._sender.send_message(
                             content=self.message,
                             recipient=recipient,
-                            first_send=self._first_send,
                             chat_delay=self.chat_delay,
-                            fast_mode=False,
+                            fast_mode=True,
                             stop_event=self.stopped_event,
                         )
-                        self._first_send = False
                 ok = text_ok
                 if ok:
                     success += 1
