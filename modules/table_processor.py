@@ -61,7 +61,7 @@ class TableProcessor:
         if not table or len(table) == 0:
             return
         
-        self.headers = table[0]
+        self.headers = [str(h) for h in table[0]]
         self.rows = table[1:]
         
         logger.info(f"Parsed table with {len(self.headers)} columns and {len(self.rows)} rows")

@@ -741,7 +741,10 @@ class SendWorker(QThread):
             if not sender.initialize():
                 # 单例失败不影响下次，清空让后续尝试重新 new WeChat
                 WeChatSender.reset_shared_instance()
-                self.signals.error.emit("微信未登录或未打开")
+                # 只走 result 单通道（失败数=总数，支持一键重试）：
+                # 不能再额外 emit error，否则错误框与完成框叠加，且第一个框
+                # 关闭即 dismiss 定格状态，第二个框还在屏幕上导致状态与弹窗脱节
+                self.signals.log.emit("❌ 微信未登录或未打开，本次发送全部失败")
                 failed_tasks = list(self.tasks)
                 self.signals.result.emit((0, total_count, total_count, failed_tasks))
                 result_emitted = True
@@ -812,7 +815,8 @@ class SendWorker(QThread):
                                 self.signals.log.emit(
                                     f"[{i+1}/{total_count}] ❌ 打开聊天窗口失败: {recipient}"
                                 )
-                                failed_tasks.append(task)
+                                # 不在此重复 append：break 后由下方统一出口
+                                # （pending_steps 非空）记录一次失败，避免同一人出现两次
                                 break
                             task["_chat_opened"] = True
 
@@ -926,7 +930,8 @@ class SendWorker(QThread):
             import traceback
             self.signals.log.emit(f"❌ 发送线程异常: {str(e)}")
             self.signals.log.emit(f"详细错误: {traceback.format_exc()[:300]}")
-            self.signals.error.emit(str(e))
+            # 统一只走 result 单通道（错误详情已在上面日志给出）：
+            # 同时 emit error+result 会造成错误框与完成框叠加、定格状态被提前 dismiss
             if not result_emitted:
                 remaining_tasks = [
                     task for task in self.tasks
@@ -1217,6 +1222,8 @@ class TableFilterTab(QWidget):
         self.worker = None
         # 由 MainWindow 注入：worker 创建后回调，用于连接任务栏进度等全局信号
         self.worker_created_cb = None
+        # 由 MainWindow 注入：完成/错误弹窗被用户点掉后回调，用于恢复任务栏与标题
+        self.progress_dismissed_cb = None
         self.last_failed_tasks = []
         self.config_manager = ConfigManager()
         self.current_config_path = None
@@ -1754,6 +1761,13 @@ class TableFilterTab(QWidget):
         if self.wechat_column_combo.currentIndex() > 0:
             wechat_column = self.wechat_column_combo.currentText().strip()
 
+        # 序列化当前 UI 中的筛选条件（即使未点"应用筛选"也保存）
+        filter_conditions = []
+        for cond in self.build_filter_conditions():
+            filter_conditions.append(
+                {"column_name": cond.column_name, "operator": cond.operator, "value": cond.value}
+            )
+
         return {
             "version": ConfigManager.PROFILE_VERSION,
             "excel": {
@@ -1775,6 +1789,7 @@ class TableFilterTab(QWidget):
                 "custom_message": self.custom_msg_edit.toPlainText(),
                 "attachment": self.attachment_edit.text().strip(),
             },
+            "filter_conditions": filter_conditions,
         }
 
     def save_config(self):
@@ -2025,6 +2040,60 @@ class TableFilterTab(QWidget):
         self._set_send_order(order)
         self.custom_msg_checkbox.setChecked("custom" in order)
 
+        # 恢复筛选条件：先清空旧 UI 行，再按配置逐条重建
+        saved_filters = profile.get("filter_conditions", [])
+        # 直接清空旧筛选行（不用 clear_filter_conditions 避免其 refresh 副作用）
+        while self.filter_conditions_layout.count() > 0:
+            item = self.filter_conditions_layout.takeAt(0)
+            if item and item.widget():
+                item.widget().deleteLater()
+        self.filter_conditions = []
+
+        str_headers = [str(h) for h in (self.headers or [])]
+        for cond in saved_filters:
+            col = cond.get("column_name", "")
+            op = cond.get("operator", "")
+            val = cond.get("value", "")
+            if not (col and op):
+                continue
+            # 内联创建筛选行（不调用 add_filter_condition，绕过 processor 守卫）
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(2, 2, 2, 2)
+
+            col_combo = QComboBox()
+            col_combo.addItems(str_headers)
+            if col in str_headers:
+                col_combo.setCurrentText(col)
+            row_layout.addWidget(col_combo)
+
+            op_combo = QComboBox()
+            op_combo.addItems([name for name, _ in self.get_available_operators()])
+            for i, (_, key) in enumerate(self.get_available_operators()):
+                if key == op:
+                    op_combo.setCurrentIndex(i)
+                    break
+            row_layout.addWidget(op_combo)
+
+            value_edit = QLineEdit(val)
+            value_edit.setPlaceholderText("条件值")
+            row_layout.addWidget(value_edit)
+
+            remove_btn = QPushButton("×")
+            remove_btn.setStyleSheet("background-color: #f44336; color: white; padding: 2px 6px;")
+            row_layout.addWidget(remove_btn)
+            remove_btn.clicked.connect(
+                lambda checked=False, w=row_widget: self.remove_filter_condition(w)
+            )
+
+            col_combo.currentTextChanged.connect(self.on_filter_change)
+            op_combo.currentTextChanged.connect(self.on_filter_change)
+            value_edit.textChanged.connect(self.on_filter_change)
+
+            self.filter_conditions_layout.addWidget(row_widget)
+
+        self.apply_filter_btn.setEnabled(self.filter_conditions_layout.count() > 0)
+
         can_load_data = (
             name_column in self.headers
             and bool(self.selected_columns)
@@ -2035,10 +2104,9 @@ class TableFilterTab(QWidget):
         else:
             self.log("⚠ 配置已部分应用，请重新选择缺失的列")
 
-        # 配置加载成功后自动展开人员列表/数据预览/发送控制分组（若处于折叠状态）
-        for g in getattr(self, "_load_expand_groups", []):
-            if g is not None and g.is_collapsed():
-                g.set_collapsed(False)
+        # load_data 创建 processor 后再应用筛选，否则 apply_filter 因 processor=None 直接返回
+        if saved_filters:
+            self.apply_filter()
 
         if missing_settings:
             QMessageBox.warning(
@@ -2076,7 +2144,7 @@ class TableFilterTab(QWidget):
         row_layout.setContentsMargins(2, 2, 2, 2)
         
         col_combo = QComboBox()
-        col_combo.addItems(headers)
+        col_combo.addItems([str(h) for h in headers])
         row_layout.addWidget(col_combo)
         
         op_combo = QComboBox()
@@ -2270,10 +2338,10 @@ class TableFilterTab(QWidget):
     def apply_filter(self):
         if not self.processor:
             return
-        
+
         self.filter_conditions = self.build_filter_conditions()
         self.refresh_persons_list()
-        
+
         condition_descriptions = []
         for cond in self.filter_conditions:
             op_name = dict(self.get_available_operators()).get(cond.operator, cond.operator)
@@ -2281,11 +2349,22 @@ class TableFilterTab(QWidget):
                 condition_descriptions.append(f"{cond.column_name} {op_name}")
             else:
                 condition_descriptions.append(f"{cond.column_name} {op_name} '{cond.value}'")
-        
+
         if condition_descriptions:
             self.log(f"应用筛选条件: {'，'.join(condition_descriptions)}")
+            if self.persons_list.count() == 0:
+                self.log("⚠ 筛选结果为空，没有符合条件的人员，请调整筛选条件")
+                QMessageBox.information(
+                    self,
+                    "筛选结果为空",
+                    "当前筛选条件下没有匹配的人员，请调整或清除筛选条件后重试。",
+                )
         else:
             self.log("清除筛选条件，显示全部人员")
+
+        # 应用筛选后自动展开人员列表面板（筛选后面板可能处于折叠状态）
+        if self.persons_group.is_collapsed():
+            self.persons_group.set_collapsed(False)
 
     def refresh_persons_list(self):
         if not self.processor:
@@ -2433,7 +2512,7 @@ class TableFilterTab(QWidget):
 
         self.sheet_names = result['sheet_names']
         self.current_sheet = result['current_sheet']
-        self.headers = result['headers']
+        self.headers = [str(h) for h in result['headers']]
         self.table_data = result['data']
         self.current_excel_path = worker.file_path
 
@@ -2525,6 +2604,12 @@ class TableFilterTab(QWidget):
         self.log(f"数据加载完成！找到 {self.persons_list.count()} 个人")
         # 自动折叠左侧配置区，让人员列表和发送区更宽敞
         self._collapse_groups(self.config_group, self.url_group, self.filter_group)
+        # 自动展开人员列表/数据预览/发送进度/发送控制。
+        # 无论手动点“加载数据”还是加载配置后自动调用，都收敛到这一个入口，
+        # 保证两条路径加载后的视图状态一致。
+        for g in getattr(self, "_load_expand_groups", []):
+            if g is not None and g.is_collapsed():
+                g.set_collapsed(False)
 
     def log(self, message):
         self.log_text.append(message)
@@ -2630,6 +2715,7 @@ class TableFilterTab(QWidget):
         self.pause_send_btn.setEnabled(True)
         self.stop_send_btn.setEnabled(True)
         self.progress_bar.setValue(0)
+        self.progress_bar.setRange(0, len(tasks))
         self.progress_label.setText("正在发送...")
         self.last_send_order = list(send_order)
 
@@ -2693,6 +2779,7 @@ class TableFilterTab(QWidget):
         self.pause_send_btn.setEnabled(True)
         self.stop_send_btn.setEnabled(True)
         self.progress_bar.setValue(0)
+        self.progress_bar.setRange(0, len(failed_tasks))
         self.progress_label.setText("正在重试发送...")
         
         worker = SendWorker(
@@ -2729,16 +2816,31 @@ class TableFilterTab(QWidget):
             self.pause_send_btn.setText("⏸ 暂停")
         worker.deleteLater()
 
-    def on_send_progress(self, value):
-        self.progress_bar.setValue(value)
-        self.progress_label.setText(f"发送进度: {value}%")
+    def on_send_progress(self, current, total):
+        # 进度信号为 (当前人数, 总人数)；进度条范围在发送开始时已按总人数设置
+        total = max(1, int(total))
+        current = max(0, min(int(current), total))
+        self.progress_bar.setValue(current)
+        pct = int(current * 100 / total)
+        self.progress_label.setText(f"发送进度: {current}/{total} ({pct}%)")
 
     def on_send_result(self, result):
         success_count, failed_count, total_count, failed_tasks = result
         self.last_failed_tasks = failed_tasks
-        QMessageBox.information(self, "完成", f"发送完成！成功 {success_count}, 失败 {failed_count}, 总计 {total_count}")
+        # 弹窗前确保主窗口可见：发送过程中主窗口可能被微信窗口遮挡或已最小化到托盘，
+        # 若 parent 不可见，QMessageBox 仍弹出但可能不在任务栏闪烁/不置前，
+        # 用户看不到弹窗 → 门闩一直保持 → 从托盘恢复时才看到"已发送完成"定格态。
+        mw = self.window()
+        if mw and not mw.isVisible():
+            mw.showNormal()
+            mw.raise_()
+            mw.activateWindow()
+        QMessageBox.information(mw or self, "完成", f"发送完成！成功 {success_count}, 失败 {failed_count}, 总计 {total_count}")
+        # 用户点掉完成弹窗后，再恢复窗口标题并清除任务栏定格进度
+        if self.progress_dismissed_cb:
+            self.progress_dismissed_cb(failed_count)
         self.progress_label.setText(f"发送完成: 成功 {success_count}, 失败 {failed_count}")
-        
+
         if failed_tasks:
             self.retry_send_btn.setEnabled(True)
             self.log(f"⚠ 有 {len(failed_tasks)} 个发送失败，可点击'重试发送'按钮重新发送")
@@ -2746,7 +2848,15 @@ class TableFilterTab(QWidget):
             self.retry_send_btn.setEnabled(False)
 
     def on_send_error(self, error):
-        QMessageBox.critical(self, "错误", f"发送失败: {error}")
+        mw = self.window()
+        if mw and not mw.isVisible():
+            mw.showNormal()
+            mw.raise_()
+            mw.activateWindow()
+        QMessageBox.critical(mw or self, "错误", f"发送失败: {error}")
+        # 用户点掉错误弹窗后恢复任务栏与标题
+        if self.progress_dismissed_cb:
+            self.progress_dismissed_cb(1)
         self.log(f"发送失败: {error}")
         self.progress_label.setText("发送出错")
 
@@ -3964,8 +4074,11 @@ class MainWindow(QMainWindow):
         # 主窗口被微信窗口挡住时也能在任务栏看到发送进度
         self.table_filter_tab.worker_created_cb = self._attach_global_progress_table
         self.schedule_tab.worker_created_cb = self._attach_global_progress_schedule
+        self.table_filter_tab.progress_dismissed_cb = self._dismiss_send_progress
         self._taskbar = None
         self._send_progress_active = False
+        # 门闩：数据发送完成弹窗等待用户点击期间，禁止 worker.finished 提前清除任务栏
+        self._progress_waiting_dismiss = False
 
     def _current_tab_content(self) -> QWidget:
         """取当前 tab 内的真实业务页面（穿透 ElasticPage 包装层）。"""
@@ -4160,6 +4273,11 @@ class MainWindow(QMainWindow):
         return self._taskbar if self._taskbar is not False else None
 
     def _begin_send_progress(self):
+        # 终态门禁：完成/出错弹窗正等待用户点击时，忽略新的“开始”（如定时任务
+        # 恰好并发触发），不得把定格标题/任务栏冲回“发送中…”。新一轮正常发送
+        # 只会在弹窗关闭（门闩复位）后由用户手动启动。
+        if self._progress_waiting_dismiss:
+            return
         self._send_progress_active = True
         tb = self._ensure_taskbar()
         if tb:
@@ -4174,8 +4292,13 @@ class MainWindow(QMainWindow):
             pass
 
     def _update_send_progress(self, current, total):
+        # 终态门禁：定格期间迟到的 progress（队列残留/并发 worker）一律丢弃
+        if self._progress_waiting_dismiss:
+            return
         if not self._send_progress_active:
             self._begin_send_progress()
+        if self._progress_waiting_dismiss:
+            return
         try:
             current = max(0, int(current))
             total = max(1, int(total))
@@ -4192,7 +4315,62 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _show_send_done(self, success, failed, total):
+        """发送结束的“定格”展示：任务栏满进度（有失败变红），标题显示已发送。
+
+        该状态一直保持到用户点掉完成弹窗（_dismiss_send_progress），
+        不再像之前那样 result 一到就清除，导致弹窗还开着任务栏已无数。
+        """
+        if not self._send_progress_active:
+            self._begin_send_progress()
+        self._progress_waiting_dismiss = True
+        try:
+            success = max(0, int(success))
+            failed = max(0, int(failed))
+            total = max(1, int(total))
+        except Exception:
+            success, failed, total = 0, 0, 1
+        done = min(success + failed, total)
+        tb = self._ensure_taskbar()
+        if tb:
+            tb.set_value(done, total)
+            if failed:
+                tb.set_error()
+        if failed:
+            title = f"⚠ 发送完成 成功{success} 失败{failed}（共{total}）- {APP_TITLE}"
+        else:
+            title = f"✅ 已发送完成 共{total}人 - {APP_TITLE}"
+        self.setWindowTitle(title)
+        try:
+            self.tray_icon.setToolTip(f"{APP_TITLE}\n{title}")
+        except Exception:
+            pass
+
+    def _show_send_error(self):
+        """发送异常的“定格”展示：红色任务栏 + 标题提示，等用户点掉错误弹窗。"""
+        if not self._send_progress_active:
+            self._begin_send_progress()
+        self._progress_waiting_dismiss = True
+        tb = self._ensure_taskbar()
+        if tb:
+            tb.set_error()
+        title = f"❌ 发送出错 - {APP_TITLE}"
+        self.setWindowTitle(title)
+        try:
+            self.tray_icon.setToolTip(f"{APP_TITLE}\n{title}")
+        except Exception:
+            pass
+
+    def _dismiss_send_progress(self, failed=0):
+        """用户在完成/错误弹窗点击确定后调用：恢复标题、清除任务栏进度。"""
+        self._progress_waiting_dismiss = False
+        self._finish_send_progress(failed)
+
     def _finish_send_progress(self, failed=0):
+        # 门闩保护：完成弹窗仍在等待点击时（可能是并发的定时任务结束来清理），
+        # 不得提前清除定格状态；弹窗关闭时 _dismiss_send_progress 会统一收尾
+        if self._progress_waiting_dismiss:
+            return
         tb = self._ensure_taskbar()
         if tb and failed:
             tb.set_error()
@@ -4230,11 +4408,16 @@ class MainWindow(QMainWindow):
         self._update_send_progress(current, total)
 
     def _on_table_result(self, r):
-        failed = r[1] if isinstance(r, (list, tuple)) and len(r) > 1 else 0
-        self._finish_send_progress(failed)
+        # 不立即清除：定格在“已发送完成”状态，保持到用户点掉完成弹窗
+        if isinstance(r, (list, tuple)) and len(r) >= 3:
+            success, failed, total = r[0], r[1], r[2]
+        else:
+            success, failed, total = 0, 0, 1
+        self._show_send_done(success, failed, total)
 
     def _on_table_error(self, _e):
-        self._finish_send_progress(failed=1)
+        # 不立即清除：定格在出错红色状态，保持到用户点掉错误弹窗
+        self._show_send_error()
 
     def _attach_global_progress_schedule(self, worker):
         """定时发送 worker（进度信号为 current/total）。
@@ -4255,8 +4438,11 @@ class MainWindow(QMainWindow):
         self._finish_send_progress(fail)
 
     def _clear_progress_if_idle(self):
-        # finished 在 result/error 之后触发；仅当两者都未结束进度（异常退出兜底）才清除，
-        # 否则保留 result/error 设置的状态（如失败红色停留 4 秒）
+        # finished 在 result/error 之后触发，会借完成弹窗的局部事件循环投递到主线程。
+        # 若完成弹窗仍在等待用户点击，必须保留“已发送完成”定格状态，禁止提前清除；
+        # 仅在 result/error 都没到达的异常退出场景下做兜底清除。
+        if self._progress_waiting_dismiss:
+            return
         if self._send_progress_active:
             self._finish_send_progress(0)
 

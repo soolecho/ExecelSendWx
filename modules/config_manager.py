@@ -106,6 +106,10 @@ class ConfigManager:
         except (TypeError, ValueError) as exc:
             raise ConfigError("延迟设置必须是数字") from exc
 
+        filter_conditions = cls._normalize_filter_conditions(
+            data.get("filter_conditions", [])
+        )
+
         return {
             "version": cls.PROFILE_VERSION,
             "saved_at": str(data.get("saved_at", "")),
@@ -132,6 +136,7 @@ class ConfigManager:
                 "send_order": cls._normalize_send_order(send.get("send_order")),
                 "attachment": str(send.get("attachment", "")).strip(),
             },
+            "filter_conditions": filter_conditions,
         }
 
     @staticmethod
@@ -148,6 +153,29 @@ class ConfigManager:
                 seen.add(k)
                 result.append(k)
         return result or None
+
+    @staticmethod
+    def _normalize_filter_conditions(raw):
+        """规范化筛选条件：旧配置无此字段时返回空列表，保证向后兼容。"""
+        if not isinstance(raw, list):
+            return []
+        valid_ops = {
+            "equals", "contains", "not_contains", "empty", "not_empty",
+            "greater_than", "less_than", "equals_or_greater",
+            "equals_or_less", "date_equals", "date_after", "date_before",
+        }
+        result = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            col = str(item.get("column_name", "")).strip()
+            op = str(item.get("operator", "")).strip()
+            val = str(item.get("value", ""))
+            if col and op in valid_ops:
+                result.append(
+                    {"column_name": col, "operator": op, "value": val}
+                )
+        return result
 
     def save_profile(self, path, data):
         profile = self.normalize_profile(data)
