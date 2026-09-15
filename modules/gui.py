@@ -3560,6 +3560,8 @@ class TableFilterTab(QWidget):
             attachment=self.attachment_edit.text().strip()
         )
         self.worker = worker
+        # 记录本轮是否为自动发送（加载配置后无人值守）：完成后不弹模态确认框
+        self._current_send_auto = bool(auto)
         if self.worker_created_cb:
             try:
                 self.worker_created_cb(worker)
@@ -3623,6 +3625,8 @@ class TableFilterTab(QWidget):
             attachment=self.attachment_edit.text().strip()
         )
         self.worker = worker
+        # 重试均为用户手动操作，完成后正常弹确认框
+        self._current_send_auto = False
         if self.worker_created_cb:
             try:
                 self.worker_created_cb(worker)
@@ -3659,18 +3663,46 @@ class TableFilterTab(QWidget):
     def on_send_result(self, result):
         success_count, failed_count, total_count, failed_tasks = result
         self.last_failed_tasks = failed_tasks
+        mw = self.window()
+
+        # 自动发送（加载配置后无人值守）：不弹模态确认框，否则弹窗无人关闭，
+        # 窗口标题/任务栏会一直定格在发送态。改用托盘气泡提示 + 日志，并立即收尾。
+        if getattr(self, "_current_send_auto", False):
+            tip = f"自动发送完成：成功 {success_count}，失败 {failed_count}，总计 {total_count}"
+            self.log(f"⚡ {tip}")
+            try:
+                if mw is not None and getattr(mw, "tray_icon", None) is not None:
+                    icon = mw.style().standardIcon(
+                        QStyle.StandardPixmap.SP_DialogApplyButton)
+                    mw.tray_icon.showMessage("表格自动发送", tip, icon, 5000)
+            except Exception:
+                pass
+            # 无条件复位门闩并恢复标题/任务栏（失败时内部红色停留 4 秒）
+            if self.progress_dismissed_cb:
+                self.progress_dismissed_cb(failed_count)
+            self.progress_label.setText(f"自动发送完成: 成功 {success_count}, 失败 {failed_count}")
+            if failed_tasks:
+                self.retry_send_btn.setEnabled(True)
+                self.log(f"⚠ 有 {len(failed_tasks)} 个发送失败，可点击'重试发送'按钮重新发送")
+            else:
+                self.retry_send_btn.setEnabled(False)
+            return
+
         # 弹窗前确保主窗口可见：发送过程中主窗口可能被微信窗口遮挡或已最小化到托盘，
         # 若 parent 不可见，QMessageBox 仍弹出但可能不在任务栏闪烁/不置前，
         # 用户看不到弹窗 → 门闩一直保持 → 从托盘恢复时才看到"已发送完成"定格态。
-        mw = self.window()
         if mw and not mw.isVisible():
             mw.showNormal()
             mw.raise_()
             mw.activateWindow()
-        QMessageBox.information(mw or self, "完成", f"发送完成！成功 {success_count}, 失败 {failed_count}, 总计 {total_count}")
+        try:
+            QMessageBox.information(mw or self, "完成", f"发送完成！成功 {success_count}, 失败 {failed_count}, 总计 {total_count}")
+        finally:
+            # try/finally 兜底：无论弹窗是否成功弹出/关闭，都必须复位门闩，
+            # 否则标题和任务栏会永久停留在发送态
+            if self.progress_dismissed_cb:
+                self.progress_dismissed_cb(failed_count)
         # 用户点掉完成弹窗后，再恢复窗口标题并清除任务栏定格进度
-        if self.progress_dismissed_cb:
-            self.progress_dismissed_cb(failed_count)
         self.progress_label.setText(f"发送完成: 成功 {success_count}, 失败 {failed_count}")
 
         if failed_tasks:
@@ -3685,10 +3717,12 @@ class TableFilterTab(QWidget):
             mw.showNormal()
             mw.raise_()
             mw.activateWindow()
-        QMessageBox.critical(mw or self, "错误", f"发送失败: {error}")
-        # 用户点掉错误弹窗后恢复任务栏与标题
-        if self.progress_dismissed_cb:
-            self.progress_dismissed_cb(1)
+        try:
+            QMessageBox.critical(mw or self, "错误", f"发送失败: {error}")
+        finally:
+            # 同 on_send_result：错误弹窗异常时也必须复位门闩、恢复任务栏与标题
+            if self.progress_dismissed_cb:
+                self.progress_dismissed_cb(1)
         self.log(f"发送失败: {error}")
         self.progress_label.setText("发送出错")
 
@@ -5358,6 +5392,9 @@ class MainWindow(QMainWindow):
         if not self._send_progress_active:
             self._begin_send_progress()
         self._progress_waiting_dismiss = True
+        # 看门狗：完成弹窗若因窗口在托盘/系统异常/无人值守长时间未关闭，
+        # 60 秒后自动收尾，杜绝标题永久停在发送态
+        QTimer.singleShot(60000, self._dismiss_progress_if_waiting)
         try:
             success = max(0, int(success))
             failed = max(0, int(failed))
@@ -5385,6 +5422,8 @@ class MainWindow(QMainWindow):
         if not self._send_progress_active:
             self._begin_send_progress()
         self._progress_waiting_dismiss = True
+        # 看门狗：错误弹窗同样可能无人关闭，60 秒后自动收尾
+        QTimer.singleShot(60000, self._dismiss_progress_if_waiting)
         tb = self._ensure_taskbar()
         if tb:
             tb.set_error()
@@ -5399,6 +5438,12 @@ class MainWindow(QMainWindow):
         """用户在完成/错误弹窗点击确定后调用：恢复标题、清除任务栏进度。"""
         self._progress_waiting_dismiss = False
         self._finish_send_progress(failed)
+
+    def _dismiss_progress_if_waiting(self):
+        """看门狗兜底：弹窗超时未关闭时自动恢复标题/任务栏。"""
+        if self._progress_waiting_dismiss:
+            self._progress_waiting_dismiss = False
+            self._finish_send_progress(0)
 
     def _finish_send_progress(self, failed=0):
         # 门闩保护：完成弹窗仍在等待点击时（可能是并发的定时任务结束来清理），
@@ -5472,6 +5517,10 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_schedule_result(self, _ok, fail, _recipients):
+        # 定时任务（纯文字 / 配置链）没有完成确认弹窗，标题和任务栏必须在这里
+        # 无条件恢复：即便残留了手动发送的“等待关闭弹窗”门闩，也不能挡住定时收尾，
+        # 否则无人值守时窗口标题会永久停在“发送中…”。
+        self._progress_waiting_dismiss = False
         self._finish_send_progress(fail)
 
     def _clear_progress_if_idle(self):
