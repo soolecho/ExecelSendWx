@@ -1132,8 +1132,10 @@ class ScheduleSendWorker(QThread):
                 self.log(f"[定时] 本任务将附加发送文件: {os.path.basename(self.attachment)}")
             else:
                 self.log(f"[定时] ⚠ 附加文件不存在，跳过附件发送: {self.attachment}")
+        current_idx = 0
         try:
             for idx, recipient in enumerate(self.recipients):
+                current_idx = idx
                 if self.stopped_event.is_set():
                     self.log("[定时] 已手动停止")
                     failed_recipients.extend(self.recipients[idx:])
@@ -1197,6 +1199,13 @@ class ScheduleSendWorker(QThread):
                 self.log(f"[定时] ⚠ 发送循环异常中断: {exc}")
             except Exception:
                 pass
+            # 当前及之后的接收人都未完成，补入失败列表（去重）以便用户重试
+            existing = set(failed_recipients)
+            for r in self.recipients[current_idx:]:
+                r = str(r).strip()
+                if r and r not in existing:
+                    failed_recipients.append(r)
+                    existing.add(r)
         finally:
             if self._sender is not None:
                 # 整个定时任务结束后统一最小化微信窗口（任务级一次，按任务开关）
