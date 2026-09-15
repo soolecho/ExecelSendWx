@@ -1238,6 +1238,7 @@ class TableFilterTab(QWidget):
         self.sheet_names = []
         self.current_sheet = None
         self.headers = []
+        self._current_header_row = 1
         self.excel_worker = None
         self.worker = None
         # 由 MainWindow 注入：worker 创建后回调，用于连接任务栏进度等全局信号
@@ -1326,7 +1327,19 @@ class TableFilterTab(QWidget):
         self.sheet_combo.setPlaceholderText("请先选择Excel文件")
         self.sheet_combo.setEnabled(False)
         url_layout.addWidget(self.sheet_combo)
-        
+
+        url_layout.addWidget(QLabel("表头所在行:"))
+        self.header_row_spin = QSpinBox()
+        self.header_row_spin.setMinimum(1)
+        self.header_row_spin.setMaximum(1)
+        self.header_row_spin.setValue(1)
+        self.header_row_spin.setEnabled(False)
+        self.header_row_spin.setToolTip(
+            "分类标题（表头）所在的 Excel 行号，默认为第 1 行；\n"
+            "若表头在第 2 行或更靠下，请改成对应行号后再选择列、加载数据。"
+        )
+        url_layout.addWidget(self.header_row_spin)
+
         url_layout.addWidget(QLabel("人名所在列:"))
         self.name_column_combo = QComboBox()
         self.name_column_combo.setPlaceholderText("请先选择Excel文件")
@@ -1724,6 +1737,7 @@ class TableFilterTab(QWidget):
         self.reload_btn.clicked.connect(self.reload_excel_file)
         self.open_excel_btn.clicked.connect(self.open_current_excel)
         self.sheet_combo.currentIndexChanged.connect(self.on_sheet_changed)
+        self.header_row_spin.valueChanged.connect(self.on_header_row_changed)
         self.extract_columns_btn.clicked.connect(self.open_extract_columns_dialog)
         self.load_data_btn.clicked.connect(self.load_data)
         self.start_send_btn.clicked.connect(self.send_data)
@@ -1793,6 +1807,7 @@ class TableFilterTab(QWidget):
             "excel": {
                 "path": os.path.abspath(self.current_excel_path),
                 "sheet": self.sheet_combo.currentText().strip(),
+                "header_row": int(self.header_row_spin.value()),
                 "name_column": name_column,
                 "extract_columns": list(self.selected_columns),
                 "wechat_column": wechat_column,
@@ -1981,6 +1996,18 @@ class TableFilterTab(QWidget):
         if saved_sheet and saved_sheet != self.current_sheet:
             missing_settings.append(
                 f"Sheet“{saved_sheet}”不存在，已使用“{self.current_sheet}”"
+            )
+
+        # 表头行在 on_excel_read_result 已按配置静默应用；此处仅做越界提示
+        try:
+            saved_header_row = int(excel_settings.get("header_row", 1))
+        except (TypeError, ValueError):
+            saved_header_row = 1
+        total_rows = len(self.table_data or [])
+        if saved_header_row < 1 or saved_header_row > total_rows:
+            missing_settings.append(
+                f"表头行 {saved_header_row} 超出范围（共 {total_rows} 行），"
+                f"已回退到第 {self.header_row_spin.value()} 行"
             )
 
         name_column = excel_settings["name_column"]
@@ -2494,6 +2521,7 @@ class TableFilterTab(QWidget):
         self.sheet_combo.setEnabled(
             not loading and self.sheet_combo.count() > 0
         )
+        self.header_row_spin.setEnabled(not loading and bool(self.table_data))
         self.name_column_combo.setEnabled(not loading and has_data)
         self.extract_columns_btn.setEnabled(not loading and has_data)
         self.wechat_column_combo.setEnabled(not loading and has_data)
@@ -2532,8 +2560,17 @@ class TableFilterTab(QWidget):
 
         self.sheet_names = result['sheet_names']
         self.current_sheet = result['current_sheet']
-        self.headers = [str(h) for h in result['headers']]
         self.table_data = result['data']
+        # 表头行：加载配置时用配置中的行号；手动切换 Sheet/重新读取时保留用户选择
+        pending_hr = getattr(self, "_current_header_row", 1)
+        if self.pending_config:
+            try:
+                pending_hr = int(
+                    self.pending_config["profile"]["excel"].get("header_row", 1)
+                )
+            except (KeyError, TypeError, ValueError):
+                pending_hr = 1
+        self._apply_header_row(pending_hr)
         self.current_excel_path = worker.file_path
 
         self.current_file_label.setText(
@@ -2587,7 +2624,60 @@ class TableFilterTab(QWidget):
                 return
 
             self._load_excel_data(self.current_excel_path, sheet_name)
-    
+
+    def _apply_header_row(self, hr):
+        """按表头行号(1-based)设置 spin 并据该行重建 self.headers（静默，不重置选择）。"""
+        data = self.table_data or []
+        if not data:
+            return
+        try:
+            hr = int(hr)
+        except (TypeError, ValueError):
+            hr = 1
+        hr = max(1, min(hr, len(data)))
+        self.header_row_spin.blockSignals(True)
+        try:
+            self.header_row_spin.setMaximum(max(1, len(data)))
+            self.header_row_spin.setValue(hr)
+        finally:
+            self.header_row_spin.blockSignals(False)
+        self.headers = TableProcessor.derive_headers(data[hr - 1])
+        self._current_header_row = hr
+
+    def on_header_row_changed(self, hr):
+        """用户手动改表头行：列结构随之变化，重置列选择与已加载数据。"""
+        if not self.table_data:
+            return
+        if self.excel_worker and self.excel_worker.isRunning():
+            return
+        # 发送进行中改动表头行会导致进行中的任务数据错乱，直接回退
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(self, "警告", "发送进行中不能修改表头行")
+            self.header_row_spin.blockSignals(True)
+            self.header_row_spin.setValue(getattr(self, "_current_header_row", 1))
+            self.header_row_spin.blockSignals(False)
+            return
+
+        hr = max(1, min(int(hr), len(self.table_data)))
+        if hr != self.header_row_spin.value():
+            self.header_row_spin.blockSignals(True)
+            self.header_row_spin.setValue(hr)
+            self.header_row_spin.blockSignals(False)
+        self.headers = TableProcessor.derive_headers(self.table_data[hr - 1])
+        self._current_header_row = hr
+
+        self._update_column_combos()
+        self.processor = None
+        self.wechat_mapping = {}
+        self.persons_list.clear()
+        self.preview_text.clear()
+        self.send_btn.setEnabled(False)
+        self.start_send_btn.setEnabled(False)
+        self.last_failed_tasks = []
+        self.retry_send_btn.setEnabled(False)
+        self.clear_filter_conditions()
+        self.log(f"表头行已切换为第 {hr} 行，请重新选择列并点击“加载数据”")
+
     def _update_column_combos(self):
         self.name_column_combo.clear()
         self.name_column_combo.addItems(self.headers)
@@ -2611,7 +2701,10 @@ class TableFilterTab(QWidget):
             QMessageBox.warning(self, "警告", "请至少选择一列要提取的数据")
             return
         
-        self.processor = TableProcessor(self.table_data)
+        self.processor = TableProcessor(
+            self.table_data,
+            header_row=self.header_row_spin.value(),
+        )
         self.refresh_persons_list()
         
         if wechat_column:

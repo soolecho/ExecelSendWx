@@ -50,21 +50,43 @@ class FilterCondition:
 
 
 class TableProcessor:
-    def __init__(self, table_data):
+    def __init__(self, table_data, header_row=1):
         self.table_data = table_data
         self.headers = []
         self.rows = []
+        # 表头所在行（1-based，与 Excel 行号一致），默认首行
+        try:
+            self.header_row = max(1, int(header_row))
+        except (TypeError, ValueError):
+            self.header_row = 1
         if table_data and isinstance(table_data, list) and len(table_data) > 0:
             self._parse_table(table_data)
+
+    @staticmethod
+    def derive_headers(header_row_values):
+        """从表头行原始值生成列名：非字符串统一转 str，空白单元格用“列N”占位。"""
+        headers = []
+        for i, val in enumerate(header_row_values or []):
+            text = "" if val is None else str(val).strip()
+            headers.append(text if text else f"列{i + 1}")
+        return headers
 
     def _parse_table(self, table):
         if not table or len(table) == 0:
             return
-        
-        self.headers = [str(h) for h in table[0]]
-        self.rows = table[1:]
-        
-        logger.info(f"Parsed table with {len(self.headers)} columns and {len(self.rows)} rows")
+
+        total = len(table)
+        # 超出实际行数时回退到最后一行，避免索引错误
+        row_index = min(self.header_row, total) - 1
+        self.header_row = row_index + 1
+        self.headers = self.derive_headers(table[row_index])
+        # 表头行及其上方的标题/空行全部丢弃，数据只取表头行之后
+        self.rows = table[row_index + 1:]
+
+        logger.info(
+            f"Parsed table with header at row {self.header_row}, "
+            f"{len(self.headers)} columns and {len(self.rows)} rows"
+        )
 
     def get_headers(self):
         return self.headers

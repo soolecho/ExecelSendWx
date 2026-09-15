@@ -96,6 +96,13 @@ class ConfigManager:
         if not extract_columns:
             raise ConfigError("配置中没有提取列")
 
+        # 表头所在行（1-based）：旧配置无此字段时默认首行
+        try:
+            header_row = int(excel.get("header_row", 1))
+        except (TypeError, ValueError):
+            header_row = 1
+        header_row = max(1, header_row)
+
         send_mode = str(send.get("mode", "text")).strip()
         if send_mode not in cls.VALID_SEND_MODES:
             raise ConfigError(f"不支持的发送形式: {send_mode}")
@@ -116,6 +123,7 @@ class ConfigManager:
             "excel": {
                 "path": excel_path,
                 "sheet": str(excel.get("sheet", "")).strip(),
+                "header_row": header_row,
                 "name_column": name_column,
                 "extract_columns": extract_columns,
                 "wechat_column": str(
