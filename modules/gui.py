@@ -1190,6 +1190,13 @@ class ScheduleSendWorker(QThread):
                 else:
                     failed_recipients.append(recipient)
                     self.log(f"[定时] ✗ 发送失败: {recipient}")
+        except Exception as exc:
+            # 循环内任何未预期异常都不能让结束信号丢失，
+            # 否则主窗口标题会永远停在“发送中…”
+            try:
+                self.log(f"[定时] ⚠ 发送循环异常中断: {exc}")
+            except Exception:
+                pass
         finally:
             if self._sender is not None:
                 # 整个定时任务结束后统一最小化微信窗口（任务级一次，按任务开关）
@@ -1204,7 +1211,11 @@ class ScheduleSendWorker(QThread):
                         self._sender.log = _orig_sender_log
                     except Exception:
                         pass
-        self.finished_with_result.emit(success, len(failed_recipients), failed_recipients)
+            # 关键：无论正常结束、手动停止还是异常中断，都必须发出结束信号，
+            # 主线程据此恢复标题/清除任务栏进度
+            self.finished_with_result.emit(
+                success, len(failed_recipients), failed_recipients
+            )
 
 
 class TableFilterTab(QWidget):
@@ -4431,6 +4442,9 @@ class MainWindow(QMainWindow):
             self._progress_begin_signal.emit()
             worker.progress.connect(self._update_send_progress)
             worker.finished_with_result.connect(self._on_schedule_result)
+            # 兜底：若结束信号因任何原因未到达，QThread 结束时也恢复标题/清任务栏，
+            # 避免窗口标题永久停留在“发送中…”
+            worker.finished.connect(self._clear_progress_if_idle)
         except Exception:
             pass
 
