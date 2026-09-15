@@ -66,6 +66,10 @@ class ScheduleTask:
     # 发送顺序：["message", "attachment"] 等，勾选的内容才发送，列表顺序即发送先后。
     # 兼容旧字段 attach_order（before/after），读取时迁移。
     send_order: List[str] = field(default_factory=lambda: ["message"])
+    # 任务类型：message=发送纯文字/附件消息；profiles=顺序执行一个或多个表格配置文件
+    kind: str = "message"
+    # kind=profiles 时：配置文件（.json）绝对路径列表，按列表顺序串行执行
+    profile_paths: List[str] = field(default_factory=list)
     # 已触发记录：{ "YYYY-MM-DD": ["08:30", ...] }
     fired_log: Dict[str, List[str]] = field(default_factory=dict)
     created_at: str = ""
@@ -111,6 +115,15 @@ class ScheduleTask:
             if r and r not in recipients:
                 recipients.append(r)
 
+        kind = str(data.get("kind", "message") or "message")
+        if kind not in ("message", "profiles"):
+            kind = "message"
+        profile_paths: List[str] = []
+        for raw in safe_list(data.get("profile_paths"), str):
+            p = str(raw).strip()
+            if p and p not in profile_paths:
+                profile_paths.append(p)
+
         return cls(
             id=str(data.get("id", "")).strip() or _new_task_id(),
             name=str(data.get("name", "未命名任务")).strip() or "未命名任务",
@@ -130,6 +143,8 @@ class ScheduleTask:
             minimize_after=bool(data.get("minimize_after", True)),
             attachment=str(data.get("attachment", "") or ""),
             send_order=_normalize_send_order(data),
+            kind=kind,
+            profile_paths=profile_paths,
             fired_log=_normalize_fired_log(data.get("fired_log")),
             created_at=str(data.get("created_at", "")),
             updated_at=str(data.get("updated_at", "")),

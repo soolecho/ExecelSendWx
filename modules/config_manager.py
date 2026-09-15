@@ -81,7 +81,17 @@ class ConfigManager:
         excel_path = str(excel.get("path", "")).strip()
         name_column = str(excel.get("name_column", "")).strip()
         extract_columns = excel.get("extract_columns", [])
-        if not excel_path:
+
+        # 数据来源：local 本地文件（旧配置无此字段）/ wps_cloud 金山在线文档
+        source = str(excel.get("source", "local")).strip()
+        if source not in ("local", "wps_cloud"):
+            source = "local"
+        cloud_file_id = str(excel.get("cloud_file_id", "")).strip()
+        cloud_file_name = str(excel.get("cloud_file_name", "")).strip()
+        if source == "wps_cloud" and not cloud_file_id:
+            # 兼容：历史异常配置缺少 ID 时回退本地来源
+            source = "local"
+        if source == "local" and not excel_path:
             raise ConfigError("配置中没有 Excel 文件路径")
         if not name_column:
             raise ConfigError("配置中没有人员列")
@@ -129,6 +139,9 @@ class ConfigManager:
                 "wechat_column": str(
                     excel.get("wechat_column", "")
                 ).strip(),
+                "source": source,
+                "cloud_file_id": cloud_file_id,
+                "cloud_file_name": cloud_file_name,
             },
             "send": {
                 "manual_recipient": str(
@@ -143,6 +156,8 @@ class ConfigManager:
                 "custom_message": str(send.get("custom_message", "")),
                 "send_order": cls._normalize_send_order(send.get("send_order")),
                 "attachment": str(send.get("attachment", "")).strip(),
+                # 加载该配置后自动全选筛选人员并直接发送（无需手动点发送）
+                "auto_send": bool(send.get("auto_send", False)),
             },
             "filter_conditions": filter_conditions,
         }
