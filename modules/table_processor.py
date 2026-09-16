@@ -92,6 +92,11 @@ class TableProcessor:
         return self.headers
 
     def get_header_index(self, header_name):
+        # 第一轮：精确匹配（避免 "分类" 误匹到 "T2投诉原因一级分类"）
+        for i, header in enumerate(self.headers):
+            if header == header_name:
+                return i
+        # 第二轮：子串兜底（配置里的列名可能是表头的部分文字）
         for i, header in enumerate(self.headers):
             if header_name in header or header in header_name:
                 return i
