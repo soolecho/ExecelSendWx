@@ -45,6 +45,8 @@ cmd = [
     f"--jobs={workers}",
     # LTO 关闭：开发期打包提速；如果要正式版更小更快可以再打开
     "--lto=no",
+    # 函数内延迟导入的 Rust xlsx 引擎（大表格秒开，替代慢速 openpyxl），显式收进打包
+    "--include-package=python_calamine",
     "--output-dir=dist_nuitka_config",
     "--output-filename=表格自动发送By春风予Lu.exe",
     "main.py",

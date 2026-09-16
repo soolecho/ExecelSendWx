@@ -375,13 +375,112 @@ def cleanup_temp_file(path):
         pass
 
 
+def _calamine_workbook(file_path):
+    """优先使用 Rust 实现的 calamine 引擎（大文件速度比 openpyxl 快数倍，
+    且解析在原生层完成、不长时间持有 GIL，不会把界面卡成“未响应”）。
+    不可用时返回 None。"""
+    try:
+        from python_calamine import CalamineWorkbook
+        return CalamineWorkbook.from_path(file_path)
+    except Exception:
+        return None
+
+
+def _rows_from_calamine(sheet):
+    # calamine 的 None 统一转空串，与 pandas/openpyxl 分支口径一致
+    return [
+        [cell if cell is not None else "" for cell in row]
+        for row in sheet.to_python()
+    ]
+
+
+def read_sheet_names(file_path, log_fn=None):
+    """只读取工作簿的 sheet 名称列表（不加载数据），尽量轻量。"""
+    log = log_fn or (lambda msg: None)
+    wb = _calamine_workbook(file_path)
+    if wb is not None:
+        try:
+            return list(wb.sheet_names)
+        finally:
+            close = getattr(wb, "close", None)
+            if callable(close):
+                close()
+    try:
+        from openpyxl import load_workbook
+        wb2 = load_workbook(file_path, read_only=True, data_only=True)
+        try:
+            return list(wb2.sheetnames)
+        finally:
+            wb2.close()
+    except Exception as exc:
+        log(f"读取 sheet 名称失败: {exc}")
+        return []
+
+
+def read_one_sheet(file_path, sheet_name, log_fn=None):
+    """只读取指定 sheet → 二维数组。供配置链/auto_send 使用：
+    大工作簿（实测 37MB/13 sheet）全量读取要近 100 秒且吃满 GIL，
+    定向读取仅需 1~4 秒。sheet 不存在时返回 None。"""
+    log = log_fn or (lambda msg: None)
+    wb = _calamine_workbook(file_path)
+    if wb is not None:
+        try:
+            names = list(wb.sheet_names)
+            if sheet_name not in names:
+                return None
+            return _rows_from_calamine(wb.get_sheet_by_name(sheet_name))
+        except Exception as exc:
+            log(f"calamine 读取 sheet 失败: {exc}，尝试 pandas/openpyxl…")
+        finally:
+            close = getattr(wb, "close", None)
+            if callable(close):
+                close()
+    try:
+        import pandas as pd
+        df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+        df = df.fillna("")
+        return df.values.tolist()
+    except Exception as exc:
+        log(f"pandas 读取 sheet 失败: {exc}，尝试 openpyxl…")
+        try:
+            from openpyxl import load_workbook
+            wb2 = load_workbook(file_path, read_only=True, data_only=True)
+            try:
+                if sheet_name not in wb2.sheetnames:
+                    return None
+                ws = wb2[sheet_name]
+                return [
+                    [cell if cell is not None else "" for cell in row]
+                    for row in ws.iter_rows(values_only=True)
+                ]
+            finally:
+                wb2.close()
+        except Exception as exc2:
+            raise RuntimeError(f"工作表“{sheet_name}”读取失败: {exc2}") from exc
+
+
 def read_all_sheets(file_path, log_fn=None):
     """读取整个工作簿所有 sheet → {sheet_name: 二维数组}。
 
-    与 GUI 的 ExcelReadWorker._read_sheet_fast 保持同一套 pandas/openpyxl
-    兜底策略，但一次读完全部 sheet，便于下载后立刻删除临时文件。
+    优先 calamine（Rust，快且不长时间占用 GIL），失败再走
+    pandas/openpyxl 兜底。一次读完全部 sheet，便于下载后立刻删除临时文件。
     """
     log = log_fn or (lambda msg: None)
+
+    wb = _calamine_workbook(file_path)
+    if wb is not None:
+        try:
+            out = {}
+            for name in wb.sheet_names:
+                out[name] = _rows_from_calamine(wb.get_sheet_by_name(name))
+            if out:
+                return out
+        except Exception as exc:
+            log(f"calamine 读取失败: {exc}，尝试 pandas…")
+        finally:
+            close = getattr(wb, "close", None)
+            if callable(close):
+                close()
 
     def _with_openpyxl():
         from openpyxl import load_workbook

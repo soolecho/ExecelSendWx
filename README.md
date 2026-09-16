@@ -75,7 +75,7 @@ Inno Setup + Authenticode 自签名安装包发布流程。
 ## 安装依赖
 
 ```bash
-pip install PyQt6 pandas openpyxl wxauto4 requests nuitka
+pip install PyQt6 pandas openpyxl python-calamine wxauto4 requests nuitka
 ```
 
 ## 运行方式
@@ -235,7 +235,7 @@ wxauto/
 ## 技术栈
 
 - **GUI 框架**：PyQt6
-- **数据处理**：pandas + openpyxl
+- **数据处理**：python-calamine（Rust 高速引擎，大表格首选）+ pandas + openpyxl（兜底）
 - **云文档**：金山文档开放接口（`wps_sid` Cookie + requests）
 - **微信自动化**：wxauto4
 - **打包工具**：Nuitka 4.1.x（standalone + pyqt6/tk-inter 插件）

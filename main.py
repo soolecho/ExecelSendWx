@@ -87,7 +87,7 @@ def main():
         logger.exception("无法导入图形界面")
         if sys.stdout is not None:
             print(f"无法启动图形界面: {exc}")
-            print("请安装依赖: pip install PyQt6 pandas openpyxl wxauto4")
+            print("请安装依赖: pip install PyQt6 pandas openpyxl python-calamine wxauto4 requests")
         return 1
 
     run_gui()

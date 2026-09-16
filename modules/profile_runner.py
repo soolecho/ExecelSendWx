@@ -12,6 +12,7 @@
 """
 
 import os
+import time
 
 from modules.table_processor import TableProcessor, FilterCondition
 from modules.wps_cloud import (
@@ -19,7 +20,8 @@ from modules.wps_cloud import (
     WpsCloudClient,
     new_temp_xlsx_path,
     cleanup_temp_file,
-    read_all_sheets,
+    read_one_sheet,
+    read_sheet_names,
 )
 
 
@@ -104,7 +106,10 @@ def prepare_profile(profile, log_fn=None):
     source = excel.get("source", "local")
     temp_path = None
     try:
-        # 1) 读取工作簿（全部 sheet）
+        # 1) 读取工作簿：配置链/auto_send 只需要配置指定的那一个 sheet。
+        #    大工作簿（实测 37MB/13 sheet）全量解析近 100 秒并吃满 GIL，
+        #    会把界面拖成“未响应”；定向读取仅需数秒。
+        saved_sheet = (excel.get("sheet") or "").strip()
         if source == "wps_cloud":
             file_token = (excel.get("cloud_file_id") or "").strip()
             if not file_token:
@@ -114,7 +119,9 @@ def prepare_profile(profile, log_fn=None):
             store = WpsOAuthStore()
             client = WpsCloudClient(store, log_fn=log)
             temp_path = new_temp_xlsx_path()
+            t0 = time.time()
             client.download_to(file_token, temp_path)
+            log(f"云文档下载完成（{time.time() - t0:.0f}秒），正在解析工作表…")
             workbook_path = temp_path
         else:
             workbook_path = os.path.expandvars(excel.get("path", ""))
@@ -122,18 +129,27 @@ def prepare_profile(profile, log_fn=None):
                 raise ProfilePrepareError(f"Excel 文件不存在: {workbook_path}")
             title = os.path.splitext(os.path.basename(workbook_path))[0]
 
-        sheets = read_all_sheets(workbook_path, log_fn=log)
-        if not sheets:
-            raise ProfilePrepareError("工作簿中没有工作表")
-
-        saved_sheet = (excel.get("sheet") or "").strip()
-        if saved_sheet and saved_sheet in sheets:
-            sheet_name = saved_sheet
-        else:
-            sheet_name = list(sheets.keys())[0]
-            if saved_sheet:
+        t0 = time.time()
+        rows = None
+        sheet_name = saved_sheet
+        if saved_sheet:
+            rows = read_one_sheet(workbook_path, saved_sheet, log_fn=log)
+            if rows is None:
+                # 配置里的 sheet 名失效：列名单后取第一个，并提示
+                names = read_sheet_names(workbook_path, log_fn=log)
+                if not names:
+                    raise ProfilePrepareError("工作簿中没有工作表")
+                sheet_name = names[0]
                 log(f"配置的 Sheet“{saved_sheet}”不存在，使用“{sheet_name}”")
-        rows = sheets[sheet_name]
+                rows = read_one_sheet(workbook_path, sheet_name, log_fn=log)
+        else:
+            # 未指定 sheet：只取第一个（避免全量读取大工作簿）
+            names = read_sheet_names(workbook_path, log_fn=log)
+            if not names:
+                raise ProfilePrepareError("工作簿中没有工作表")
+            sheet_name = names[0]
+            rows = read_one_sheet(workbook_path, sheet_name, log_fn=log)
+        log(f"工作表“{sheet_name}”解析完成（{time.time() - t0:.0f}秒）")
         if not rows:
             raise ProfilePrepareError(f"工作表 {sheet_name} 为空")
 
