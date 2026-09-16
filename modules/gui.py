@@ -5105,8 +5105,15 @@ class MainWindow(QMainWindow):
 
         self.init_ui()
         self.init_tray()
-        self.schedule_dispatcher.start()
-        self.schedule_tab.dispatcher_status_label.setText("调度器状态: 运行中")
+        # 安全护栏：offscreen（自动化测试/无头环境）绝不启动真实调度器，
+        # 否则测试进程会加载并 mark_fired 用户真实的定时任务，导致当天任务被抢占
+        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+            self.schedule_tab.dispatcher_status_label.setText(
+                "调度器状态: 测试模式未启动"
+            )
+        else:
+            self.schedule_dispatcher.start()
+            self.schedule_tab.dispatcher_status_label.setText("调度器状态: 运行中")
 
     def init_ui(self):
         self.table_filter_tab = TableFilterTab()
@@ -5592,9 +5599,24 @@ class MainWindow(QMainWindow):
                 return
         except Exception:
             pass
+        # 主线程内容校验（调度器已校验一次，这里双保险，防止数据在窗口内被改坏）
+        problem = ScheduleDispatcher._validate_task_content(task)
+        if problem:
+            self._post_schedule_log_from_worker(
+                f"[定时] ⚠ 任务「{task.name}」时间点 {slot} 跳过执行：{problem}"
+            )
+            return
         if getattr(task, "kind", "message") == "profiles":
+            # 过滤掉已被移动/删除的配置：存在的照常链式执行，缺失的逐个告警
+            valid_paths, missing_paths = [], []
+            for p in (task.profile_paths or []):
+                (valid_paths if os.path.isfile(str(p)) else missing_paths).append(str(p))
+            for p in missing_paths:
+                self._post_schedule_log_from_worker(
+                    f"[定时] ⚠ 配置文件不存在，已跳过：{p}"
+                )
             worker = ProfileChainWorker(
-                profile_paths=list(task.profile_paths or []),
+                profile_paths=valid_paths,
                 log_callback=self._post_schedule_log_from_worker,
                 minimize_after=getattr(task, "minimize_after", True),
             )

@@ -381,6 +381,8 @@ class ScheduleDispatcher:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+        # 已告警过的 (任务id, 日期, 时间点)，避免同一 ±20 秒窗口内重复刷日志
+        self._warned_slots: set = set()
 
     def add_handler(self, handler) -> None:
         """handler(task: ScheduleTask, slot: str) -> None"""
@@ -454,11 +456,29 @@ class ScheduleDispatcher:
                     continue
                 if not self._in_time_window(now, slot):
                     continue
+                # 触发前内容校验：空任务不 mark_fired（不占用今日触发记录），
+                # 给出明确告警。常见于：旧版本程序把 profiles 任务的新字段抹掉、
+                # 配置文件被移动/删除后任务退化为空。
+                problem = self._validate_task_content(task)
+                if problem:
+                    warn_key = (task.id, today, slot)
+                    if warn_key not in self._warned_slots:
+                        self._warned_slots.add(warn_key)
+                        self._log(
+                            f"[定时] ⚠ 任务「{task.name}」时间点 {slot} 跳过执行：{problem}"
+                        )
+                    continue
                 self.store.mark_fired(task.id, today, slot)
-                self._log(
-                    f"[定时] 触发任务「{task.name}」时间点 {slot}，"
-                    f"接收人数 {len(task.recipients)}"
-                )
+                if getattr(task, "kind", "message") == "profiles":
+                    self._log(
+                        f"[定时] 触发任务「{task.name}」时间点 {slot}，"
+                        f"配置数 {len(task.profile_paths or [])}"
+                    )
+                else:
+                    self._log(
+                        f"[定时] 触发任务「{task.name}」时间点 {slot}，"
+                        f"接收人数 {len(task.recipients)}"
+                    )
                 with self._lock:
                     handlers = list(self._handlers)
                 for h in handlers:
@@ -476,6 +496,24 @@ class ScheduleDispatcher:
         if task.repeat_mode == "weekly":
             return now.isoweekday() in set(task.days)
         return False
+
+    @staticmethod
+    def _validate_task_content(task: ScheduleTask) -> str:
+        """返回空串表示可执行；否则返回不可执行原因（中文，用于日志/弹窗）。"""
+        kind = getattr(task, "kind", "message") or "message"
+        if kind == "profiles":
+            paths = list(getattr(task, "profile_paths", None) or [])
+            if not paths:
+                return ("任务类型为“执行表格配置”，但没有挂任何配置文件，"
+                        "请编辑任务重新添加配置")
+            missing = [p for p in paths if not os.path.isfile(str(p))]
+            if missing and len(missing) == len(paths):
+                return "挂载的配置文件全部不存在（可能已被移动/删除），请重新选择"
+            return ""
+        if not task.recipients:
+            return ("任务没有接收人。若本任务应执行表格配置，请把任务类型"
+                    "改为“执行表格配置”并添加配置文件")
+        return ""
 
     @staticmethod
     def _in_time_window(now: datetime, slot: str) -> bool:
