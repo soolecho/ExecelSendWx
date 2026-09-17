@@ -4900,10 +4900,16 @@ class ScheduleTab(QWidget):
                 msg += f"…等{len(failed_recipients)}人"
             msg += "）"
         self.log(msg)
+        # 强制兜底恢复标题/任务栏：立即执行路径同样不依赖进度信号是否正确到达
+        mw = self.window()
+        if mw is not None and hasattr(mw, "_force_finish_schedule_progress"):
+            try:
+                mw._force_finish_schedule_progress(failed)
+            except Exception:
+                pass
         # 按任务配置决定是否发送后锁定
         task = getattr(self, "_current_run_task", None)
         if task and getattr(task, "relock_after", False):
-            mw = self.window()
             if mw and hasattr(mw, "workstation_guard"):
                 try:
                     mw.workstation_guard.maybe_relock_after_task(mw.schedule_store)
@@ -5064,6 +5070,10 @@ class MainWindow(QMainWindow):
     _progress_begin_signal = pyqtSignal()
     # 定时触发因互斥跳过后，守护线程用它通知主线程恢复按钮状态
     _schedule_skipped_signal = pyqtSignal()
+    # 定时任务执行完毕（成功/超时/异常）后强制恢复标题/任务栏，
+    # 不依赖 worker 的 finished_with_result 信号是否正确到达，
+    # 避免无人值守时窗口标题永久停在“发送中…”
+    _schedule_done_signal = pyqtSignal(int)  # 参数：失败数量
 
     def __init__(self):
         super().__init__()
@@ -5097,6 +5107,8 @@ class MainWindow(QMainWindow):
         # 进度开始信号始终在主线程执行（receiver=MainWindow），保证 setWindowTitle/
         # winId()/COM/托盘 全部在主线程，避免调度线程跨线程操作 GUI
         self._progress_begin_signal.connect(self._begin_send_progress)
+        # 定时任务结束后强制恢复进度（兜底，不依赖 worker 结束信号）
+        self._schedule_done_signal.connect(self._force_finish_schedule_progress)
 
         # 电脑锁定守护：阻止定时发送期间电脑自动锁定，任务完成后自动锁回
         self.workstation_guard = WorkstationGuard(
@@ -5472,6 +5484,30 @@ class MainWindow(QMainWindow):
         if tb and failed:
             QTimer.singleShot(4000, lambda: tb.clear() if tb else None)
 
+    def _force_finish_schedule_progress(self, failed=0):
+        """定时任务结束后强制恢复标题/任务栏（兜底机制）。
+
+        不看门闩、不看 _send_progress_active，无条件清除，确保无人值守时
+        窗口标题和任务栏进度条不会永久停在“发送中…”。
+        _on_schedule_result 已做过正常收尾时这里是空操作，无副作用。
+        """
+        self._progress_waiting_dismiss = False
+        tb = self._ensure_taskbar()
+        if tb:
+            try:
+                tb.clear()
+            except Exception:
+                pass
+        try:
+            self.setWindowTitle(APP_TITLE)
+        except Exception:
+            pass
+        try:
+            self.tray_icon.setToolTip(APP_TITLE)
+        except Exception:
+            pass
+        self._send_progress_active = False
+
     def _attach_global_progress_table(self, worker):
         """数据发送 worker（进度信号为 0-100 百分比）。
 
@@ -5765,6 +5801,12 @@ class MainWindow(QMainWindow):
                 f"[定时] 任务「{task.name}」时间点 {slot} 完成："
                 f"成功{result['success']}，失败{result['failed']}"
             )
+            # 强制兜底恢复标题/任务栏：无论 worker 结束信号是否正确到达，
+            # finished.wait() 一定返回，这里无条件恢复，杜绝标题永久停“发送中”
+            try:
+                self._schedule_done_signal.emit(int(result.get("failed", 0)))
+            except Exception:
+                pass
             # 发送完成后：按任务配置决定是否锁定电脑
             if getattr(task, "relock_after", False):
                 try:
