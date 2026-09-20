@@ -3684,6 +3684,13 @@ class TableFilterTab(QWidget):
             if failed_tasks:
                 self.retry_send_btn.setEnabled(True)
                 self.log(f"⚠ 有 {len(failed_tasks)} 个发送失败，可点击'重试发送'按钮重新发送")
+                # auto_send 有失败时也自动展开日志面板
+                mw2 = self.window()
+                if mw2 is not None and hasattr(mw2, "_expand_log_on_failure"):
+                    try:
+                        mw2._expand_log_on_failure()
+                    except Exception:
+                        pass
             else:
                 self.retry_send_btn.setEnabled(False)
             return
@@ -3708,6 +3715,12 @@ class TableFilterTab(QWidget):
         if failed_tasks:
             self.retry_send_btn.setEnabled(True)
             self.log(f"⚠ 有 {len(failed_tasks)} 个发送失败，可点击'重试发送'按钮重新发送")
+            # 手动发送有失败时也自动展开日志面板
+            if mw is not None and hasattr(mw, "_expand_log_on_failure"):
+                try:
+                    mw._expand_log_on_failure()
+                except Exception:
+                    pass
         else:
             self.retry_send_btn.setEnabled(False)
 
@@ -3725,6 +3738,12 @@ class TableFilterTab(QWidget):
                 self.progress_dismissed_cb(1)
         self.log(f"发送失败: {error}")
         self.progress_label.setText("发送出错")
+        # 发送出错也自动展开日志面板
+        if mw is not None and hasattr(mw, "_expand_log_on_failure"):
+            try:
+                mw._expand_log_on_failure()
+            except Exception:
+                pass
 
 
 class MultiSelectDialog(QDialog):
@@ -4140,6 +4159,7 @@ class ScheduleTab(QWidget):
         self.list_group = list_group
         self.save_group = save_group
         self.action_group = action_group
+        self.schedule_log_group = log_group
 
     def _collapse_groups(self, *groups):
         """批量折叠指定分组（忽略 None）。"""
@@ -4907,6 +4927,15 @@ class ScheduleTab(QWidget):
                 mw._force_finish_schedule_progress(failed)
             except Exception:
                 pass
+        # 有失败时展开定时页日志面板（_force_finish_schedule_progress 内已有展开逻辑，
+        # 但加在这里做双重保证，且展开自身面板时用 set_collapsed 更快）
+        if failed and hasattr(self, "schedule_log_group"):
+            try:
+                lg = self.schedule_log_group
+                if lg is not None and lg.is_collapsed():
+                    lg.set_collapsed(False, animate=True)
+            except Exception:
+                pass
         # 按任务配置决定是否发送后锁定
         task = getattr(self, "_current_run_task", None)
         if task and getattr(task, "relock_after", False):
@@ -5507,6 +5536,34 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._send_progress_active = False
+        # 有失败时自动展开日志面板，确保用户能看到失败详情
+        if failed:
+            self._expand_log_on_failure()
+
+    def _expand_log_on_failure(self):
+        """发送有失败时自动展开对应日志面板，确保用户能看到结果。
+
+        手动发送/auto_send → 展开数据发送页日志面板；
+        定时任务/立即执行/配置链 → 展开定时页日志面板；
+        两个都展开以防当前不在对应 tab。
+        所有操作都在主线程（由信号排队触发），线程安全。
+        """
+        try:
+            tft = self.table_filter_tab
+            if tft is not None and hasattr(tft, "log_group"):
+                lg = tft.log_group
+                if lg is not None and lg.is_collapsed():
+                    lg.set_collapsed(False, animate=True)
+        except Exception:
+            pass
+        try:
+            st = self.schedule_tab
+            if st is not None and hasattr(st, "schedule_log_group"):
+                lg = st.schedule_log_group
+                if lg is not None and lg.is_collapsed():
+                    lg.set_collapsed(False, animate=True)
+        except Exception:
+            pass
 
     def _attach_global_progress_table(self, worker):
         """数据发送 worker（进度信号为 0-100 百分比）。
@@ -5561,10 +5618,13 @@ class MainWindow(QMainWindow):
 
     def _on_schedule_result(self, _ok, fail, _recipients):
         # 定时任务（纯文字 / 配置链）没有完成确认弹窗，标题和任务栏必须在这里
-        # 无条件恢复：即便残留了手动发送的“等待关闭弹窗”门闩，也不能挡住定时收尾，
-        # 否则无人值守时窗口标题会永久停在“发送中…”。
+        # 无条件恢复：即便残留了手动发送的"等待关闭弹窗"门闩，也不能挡住定时收尾，
+        # 否则无人值守时窗口标题会永久停在"发送中…"。
         self._progress_waiting_dismiss = False
         self._finish_send_progress(fail)
+        # 有失败时自动展开日志面板
+        if fail:
+            self._expand_log_on_failure()
 
     def _clear_progress_if_idle(self):
         # finished 在 result/error 之后触发，会借完成弹窗的局部事件循环投递到主线程。
