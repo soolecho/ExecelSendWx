@@ -415,6 +415,187 @@ class WeChatSender:
         except Exception:
             pass
 
+    def _send_enter_key(self):
+        """发送 Enter 键，用于点击微信弹窗的默认'确定'按钮。
+
+        复用 _press_esc_on_wechat 的 SendInput 模式，仅将 VK_ESC 改为 VK_RETURN。
+        """
+        try:
+            import ctypes
+
+            VK_RETURN = 0x0D
+            KEYEVENTF_KEYUP = 0x0002
+            INPUT_KEYBOARD = 1
+
+            class KEYBDINPUT(ctypes.Structure):
+                _fields_ = [
+                    ("wVk", ctypes.c_ushort),
+                    ("wScan", ctypes.c_ushort),
+                    ("dwFlags", ctypes.c_ulong),
+                    ("time", ctypes.c_ulong),
+                    ("dwExtraInfo", ctypes.c_void_p),
+                ]
+
+            class INPUT(ctypes.Structure):
+                class _IU(ctypes.Union):
+                    _fields_ = [("ki", KEYBDINPUT)]
+                _anonymous_ = ("iu",)
+                _fields_ = [("type", ctypes.c_ulong), ("iu", _IU)]
+
+            def _send_key(vk, key_up=False):
+                inp = INPUT()
+                inp.type = INPUT_KEYBOARD
+                inp.ki = KEYBDINPUT(
+                    vk, 0, KEYEVENTF_KEYUP if key_up else 0, 0, None
+                )
+                ctypes.windll.user32.SendInput(
+                    1, ctypes.byref(inp), ctypes.sizeof(INPUT)
+                )
+
+            _send_key(VK_RETURN)
+            time.sleep(0.05)
+            _send_key(VK_RETURN, key_up=True)
+            time.sleep(0.15)
+        except Exception:
+            pass
+
+    def _dismiss_send_failure_dialog(self) -> bool:
+        """检测并关闭微信'发送失败'弹窗。返回是否检测到并关闭了弹窗。
+
+        用 win32gui 枚举微信进程的可见顶层窗口，查找标题含'发送失败'等
+        关键词的对话框（或标准对话框类 #32770），找到后发送 Enter 键
+        点击默认'确定'按钮关闭，使后续发送不被阻塞。
+        """
+        try:
+            import win32gui
+            import win32process
+        except ImportError:
+            return False
+
+        # 找微信主窗口 hwnd 和 PID（复用现有 FindWindow 模式）
+        main_hwnd = 0
+        for cls_name in ("Qt51514QWindowIcon", "WeChatMainWndForPC"):
+            try:
+                main_hwnd = win32gui.FindWindow(cls_name, "微信")
+            except Exception:
+                main_hwnd = 0
+            if main_hwnd:
+                break
+        if not main_hwnd:
+            return False
+
+        try:
+            _, wechat_pid = win32process.GetWindowThreadProcessId(main_hwnd)
+        except Exception:
+            return False
+
+        found_dialogs = []
+
+        def _enum_callback(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            if hwnd == main_hwnd:
+                return True
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            except Exception:
+                return True
+            if pid != wechat_pid:
+                return True
+            try:
+                title = win32gui.GetWindowText(hwnd)
+                cls = win32gui.GetClassName(hwnd)
+            except Exception:
+                return True
+            # 仅匹配标题含关键词的弹窗，避免误关微信设置/关于等其他对话框
+            keywords = ("发送失败", "发送出错", "消息发送失败", "发送中断")
+            if any(k in title for k in keywords):
+                found_dialogs.append((hwnd, title, cls))
+            return True
+
+        try:
+            win32gui.EnumWindows(_enum_callback, None)
+        except Exception:
+            pass
+
+        if not found_dialogs:
+            return False
+
+        for hwnd, title, cls in found_dialogs:
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+            time.sleep(0.1)
+            self._send_enter_key()
+            time.sleep(0.2)
+            try:
+                self.log(f"⚠️ 检测到微信弹窗'{title}'，已自动点击确定关闭")
+            except Exception:
+                pass
+        return True
+
+    def _send_msg_with_dialog_retry(self, content, recipient, stop_event=None) -> bool:
+        """发送消息，检测发送失败弹窗并重试。最多 3 次。
+
+        弹窗失败通常因频率限制/网络问题，重试间隔 1 秒；
+        SendMsg 返回失败间隔 0.5 秒。
+        """
+        max_retries = 3
+        for attempt in range(max_retries):
+            if self._stop_requested(stop_event):
+                return False
+            resp = self.wx.SendMsg(content)
+            # 等待弹窗可能出现
+            if self._wait_or_stopped(0.3, stop_event):
+                return False
+            if self._dismiss_send_failure_dialog():
+                if attempt < max_retries - 1:
+                    self.log(f"⚠️ {recipient} 发送失败(微信弹窗)，第{attempt + 1}/{max_retries}次重试...")
+                    if self._wait_or_stopped(1.0, stop_event):
+                        return False
+                    continue
+                self.log(f"❌ {recipient} 弹窗重试{max_retries}次仍失败")
+                return False
+            if resp is not None and not resp:
+                if attempt < max_retries - 1:
+                    self.log(f"⚠️ {recipient} SendMsg返回失败({resp})，第{attempt + 1}/{max_retries}次重试...")
+                    if self._wait_or_stopped(0.5, stop_event):
+                        return False
+                    continue
+                self.log(f"❌ {recipient} SendMsg重试{max_retries}次仍失败")
+                return False
+            return True
+        return False
+
+    def _send_file_with_dialog_retry(self, file_path, recipient, stop_event=None) -> bool:
+        """发送文件，检测发送失败弹窗并重试。最多 3 次。"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            if self._stop_requested(stop_event):
+                return False
+            resp = self.wx.SendFiles(file_path)
+            if self._wait_or_stopped(0.3, stop_event):
+                return False
+            if self._dismiss_send_failure_dialog():
+                if attempt < max_retries - 1:
+                    self.log(f"⚠️ {recipient} 文件发送失败(微信弹窗)，第{attempt + 1}/{max_retries}次重试...")
+                    if self._wait_or_stopped(1.0, stop_event):
+                        return False
+                    continue
+                self.log(f"❌ {recipient} 文件弹窗重试{max_retries}次仍失败")
+                return False
+            if resp is not None and not resp:
+                if attempt < max_retries - 1:
+                    self.log(f"⚠️ {recipient} SendFiles返回失败({resp})，第{attempt + 1}/{max_retries}次重试...")
+                    if self._wait_or_stopped(0.5, stop_event):
+                        return False
+                    continue
+                self.log(f"❌ {recipient} SendFiles重试{max_retries}次仍失败")
+                return False
+            return True
+        return False
+
     def _safe_chatwith(self, recipient: str, exact: bool = False) -> bool:
         if not self.wx:
             return False
@@ -505,6 +686,9 @@ class WeChatSender:
                 self.log("❌ 微信探活失败且重连未成功")
                 return False
 
+        # 进入发送前，先清理可能残留的发送失败弹窗（上一次发送可能遗留）
+        self._dismiss_send_failure_dialog()
+
         def attempt_once(allow_reconnect: bool) -> bool:
             try:
                 if first_send:
@@ -524,16 +708,8 @@ class WeChatSender:
                     current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
                     if self._is_target_chat(current_chat, recipient):
                         self.log(f"当前窗口正确，直接发送")
-                        self.wx.SendMsg(content)
-
-                        message_length = len(content)
-                        if message_length > 500:
-                            time.sleep(1)
-                        elif message_length > 100:
-                            time.sleep(0.5)
-                        else:
-                            time.sleep(0.2)
-
+                        if not self._send_msg_with_dialog_retry(content, recipient, stop_event):
+                            return False
                         self.log(f"✅ 快速发送成功")
                         return True
                     else:
@@ -571,17 +747,8 @@ class WeChatSender:
                     self.log(f"当前窗口: {current_chat}")
 
                     if self._is_target_chat(current_chat, recipient):
-                        self.wx.SendMsg(content)
-
-                        message_length = len(content)
-                        if message_length > 500:
-                            self.log(f"消息较长({message_length}字符)，等待发送完成...")
-                            time.sleep(1)
-                        elif message_length > 100:
-                            time.sleep(0.5)
-                        else:
-                            time.sleep(0.2)
-
+                        if not self._send_msg_with_dialog_retry(content, recipient, stop_event):
+                            return False
                         self.log(f"✅ 消息发送成功")
                         return True
                     else:
@@ -634,6 +801,9 @@ class WeChatSender:
 
         self.log(f"发送文件: {file_path}")
 
+        # 进入发送前，先清理可能残留的发送失败弹窗（上一次发送可能遗留）
+        self._dismiss_send_failure_dialog()
+
         def attempt_once(allow_reconnect: bool) -> bool:
             try:
                 if fast_mode:
@@ -647,8 +817,8 @@ class WeChatSender:
                         return False
                     current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
                     if self._is_target_chat(current_chat, recipient):
-                        self.wx.SendFiles(file_path)
-                        time.sleep(0.3)
+                        if not self._send_file_with_dialog_retry(file_path, recipient, stop_event):
+                            return False
                         self.log(f"✅ 图片发送成功")
                         return True
 
@@ -682,8 +852,8 @@ class WeChatSender:
                     current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
                     self.log(f"当前窗口: {current_chat}")
                     if self._is_target_chat(current_chat, recipient):
-                        self.wx.SendFiles(file_path)
-                        time.sleep(0.3)
+                        if not self._send_file_with_dialog_retry(file_path, recipient, stop_event):
+                            return False
                         self.log(f"✅ 图片发送成功")
                         return True
 
