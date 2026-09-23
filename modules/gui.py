@@ -3674,7 +3674,7 @@ class TableFilterTab(QWidget):
                 ToastNotification.show_toast(
                     "表格自动发送", tip,
                     success=(failed_count == 0),
-                    duration=5000, parent=mw)
+                    duration=8000, parent=mw)
             except Exception:
                 pass
             # 无条件复位门闩并恢复标题/任务栏（失败时内部红色停留 4 秒）
@@ -3749,16 +3749,26 @@ class TableFilterTab(QWidget):
 class ToastNotification(QFrame):
     """右下角弹出的通知窗口（类似 Windows Toast / 其他软件通知）。
 
-    无边框、半透明圆角、自动消失、点击可关闭。主线程创建和操作，
-    所有信号都走主线程事件循环，线程安全。
+    无边框、80% 不透明圆角、跟随系统亮/暗配色、自动消失、点击可关闭。
+    主线程创建和操作，所有信号都走主线程事件循环，线程安全。
+    失败通知不自动隐藏，需手动关闭。
     """
 
     # 类属性：当前显示中的通知实例（用列表支持多个通知叠加）
     _active_instances: list = []
 
     @classmethod
+    def _is_dark_mode(cls) -> bool:
+        """检测系统当前是否暗色模式（通知是瞬时弹出的，无需监听切换）。"""
+        try:
+            return QGuiApplication.styleHints().colorScheme() == \
+                Qt.ColorScheme.Dark
+        except Exception:
+            return False
+
+    @classmethod
     def show_toast(cls, title: str, message: str, *,
-                    success: bool = True, duration: int = 5000,
+                    success: bool = True, duration: int = 8000,
                     parent=None):
         """弹出通知窗口。
 
@@ -3766,10 +3776,13 @@ class ToastNotification(QFrame):
             title: 通知标题
             message: 通知内容
             success: True=绿色成功图标，False=红色错误图标
-            duration: 自动消失毫秒数（0=手动关闭）
-            parent: 父 QWidget（用于获取屏幕几何，通常传 MainWindow）
+            duration: 成功通知自动消失毫秒数；失败通知强制不自动隐藏
+            parent: 父 QWidget（点击通知时把它带到前台，通常传 MainWindow）
         """
         try:
+            # 有发送失败的通知常驻，必须手动关闭
+            if not success:
+                duration = 0
             toast = cls(title, message, success=success,
                         duration=duration, parent=parent)
             cls._active_instances.append(toast)
@@ -3785,11 +3798,11 @@ class ToastNotification(QFrame):
             pass
 
     def __init__(self, title: str, message: str, *,
-                 success: bool = True, duration: int = 5000,
+                 success: bool = True, duration: int = 8000,
                  parent=None):
-        super().__init__(parent if parent is not None else
-                         QApplication.topLevelWidgets()[0]
-                         if QApplication.topLevelWidgets() else None)
+        # parent 用于点击时把主窗口带到前台；不强设为 Qt 父对象，避免窗口嵌入
+        self._main_window = parent
+        super().__init__(None)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.Tool |
@@ -3799,6 +3812,21 @@ class ToastNotification(QFrame):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._duration = duration
         self._closing = False
+        self._dark = self._is_dark_mode()
+
+        # 跟随系统亮/暗模式的配色（背景 alpha=204，即 80% 不透明）
+        if self._dark:
+            bg_rgba = "rgba(37, 38, 41, 204)"
+            border_rgba = "rgba(255, 255, 255, 0.14)"
+            title_color = "#f0f0f0"
+            msg_color = "#c9ccd1"
+            close_color = "#9aa0a6"
+        else:
+            bg_rgba = "rgba(255, 255, 255, 204)"
+            border_rgba = "rgba(0, 0, 0, 0.10)"
+            title_color = "#2c3e50"
+            msg_color = "#34495e"
+            close_color = "#95a5a6"
 
         # 布局
         layout = QHBoxLayout(self)
@@ -3810,7 +3838,7 @@ class ToastNotification(QFrame):
         icon_label.setFixedSize(32, 32)
         if success:
             icon_label.setStyleSheet(
-                "QLabel { background: #2ecc71; border-radius: 16px; "
+                "QLabel { background: #27ae60; border-radius: 16px; "
                 "color: white; font-size: 18px; font-weight: bold; }")
             icon_label.setText("✓")
             icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -3826,10 +3854,12 @@ class ToastNotification(QFrame):
         text_layout.setSpacing(4)
         title_label = QLabel(title)
         title_label.setStyleSheet(
-            "color: #2c3e50; font-size: 14px; font-weight: bold;")
+            f"color: {title_color}; font-size: 14px; "
+            f"font-weight: bold; background: transparent;")
         msg_label = QLabel(message)
         msg_label.setStyleSheet(
-            "color: #34495e; font-size: 12px;")
+            f"color: {msg_color}; font-size: 12px; "
+            f"background: transparent;")
         msg_label.setWordWrap(True)
         msg_label.setMaximumWidth(280)
         text_layout.addWidget(title_label)
@@ -3838,22 +3868,25 @@ class ToastNotification(QFrame):
         layout.addWidget(icon_label)
         layout.addLayout(text_layout, 1)
 
-        # 关闭按钮
+        # 关闭按钮（仅关闭，不带主窗口到前台）
         close_btn = QPushButton("✕")
         close_btn.setFixedSize(20, 20)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         close_btn.setStyleSheet(
-            "QPushButton { border: none; color: #95a5a6; "
-            "font-size: 14px; }"
+            f"QPushButton {{ border: none; color: {close_color}; "
+            f"font-size: 14px; background: transparent; }}"
             "QPushButton:hover { color: #e74c3c; }")
         close_btn.clicked.connect(self.close)
         layout.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignTop)
 
         # 整体样式
         self.setStyleSheet(
-            "ToastNotification { "
-            "background: rgba(255, 255, 255, 245); "
-            "border-radius: 10px; "
-            "border: 1px solid rgba(0,0,0,0.08); }")
+            f"ToastNotification {{ "
+            f"background: {bg_rgba}; "
+            f"border-radius: 10px; "
+            f"border: 1px solid {border_rgba}; }}")
+        # 鼠标手型，提示可点击
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedSize(380, max(70, 30 + 20 * (message.count('\n') + 1)))
 
         # 定位到右下角（叠加排列）
@@ -3871,9 +3904,30 @@ class ToastNotification(QFrame):
         y = geo.y() + geo.height() - self.height() - offset_y
         self.move(x, y)
 
-        # 自动消失定时器
+        # 自动消失定时器（失败通知 duration=0，常驻直到手动关闭）
         if duration > 0:
             QTimer.singleShot(duration, self._fade_out)
+
+    def _find_main_window(self):
+        """找到主窗口：优先 parent，其次顶层 MainWindow。"""
+        mw = self._main_window
+        if mw is not None:
+            return mw
+        for w in QApplication.topLevelWidgets():
+            if w.isWindow() and w.__class__.__name__ == "MainWindow":
+                return w
+        return None
+
+    def _bring_main_to_front(self):
+        """把主窗口从托盘/最小化恢复到前台。"""
+        try:
+            mw = self._find_main_window()
+            if mw is not None:
+                mw.showNormal()
+                mw.raise_()
+                mw.activateWindow()
+        except Exception:
+            pass
 
     def _animate_in(self):
         """入场动画：从右侧滑入 + 渐显。"""
@@ -3905,8 +3959,9 @@ class ToastNotification(QFrame):
         self._fade_out_anim.start()
 
     def mousePressEvent(self, event):
-        """点击通知区域也能关闭。"""
+        """点击通知区域：把主窗口带到前台并关闭通知。"""
         if event.button() == Qt.MouseButton.Left:
+            self._bring_main_to_front()
             self.close()
 
 
@@ -5796,13 +5851,17 @@ class MainWindow(QMainWindow):
         # 否则无人值守时窗口标题会永久停在"发送中…"。
         self._progress_waiting_dismiss = False
         self._finish_send_progress(fail)
-        # Toast 通知（定时任务完成）
+        # Toast 通知（定时任务完成；有失败时常驻等待手动关闭）
         try:
+            ok_n = int(_ok) if isinstance(_ok, (int, float)) else 0
+            if fail == 0:
+                toast_msg = f"定时任务发送成功，共 {ok_n} 条"
+            else:
+                toast_msg = f"定时任务完成：成功 {ok_n}，失败 {fail}（点击查看）"
             ToastNotification.show_toast(
-                "定时任务完成",
-                f"发送{'成功' if fail == 0 else '完成（有失败）'}",
+                "定时任务完成", toast_msg,
                 success=(fail == 0),
-                duration=5000, parent=self)
+                duration=8000, parent=self)
         except Exception:
             pass
         # 有失败时自动展开日志面板
