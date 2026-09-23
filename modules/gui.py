@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QProgressBar, QMessageBox, QSplitter, QTabWidget,
     QDoubleSpinBox, QDialog, QDialogButtonBox, QFileDialog,
     QMenu, QStyle, QSystemTrayIcon, QSpinBox, QTimeEdit, QStackedWidget,
-    QLayout, QRadioButton, QButtonGroup
+    QLayout, QRadioButton, QButtonGroup, QFrame
 )
 from PyQt6.QtCore import (
     Qt, pyqtSignal, QObject, QThread, QTimer, QLockFile, QStandardPaths,
@@ -3666,15 +3666,15 @@ class TableFilterTab(QWidget):
         mw = self.window()
 
         # 自动发送（加载配置后无人值守）：不弹模态确认框，否则弹窗无人关闭，
-        # 窗口标题/任务栏会一直定格在发送态。改用托盘气泡提示 + 日志，并立即收尾。
+        # 窗口标题/任务栏会一直定格在发送态。改用 Toast 通知 + 日志，并立即收尾。
         if getattr(self, "_current_send_auto", False):
             tip = f"自动发送完成：成功 {success_count}，失败 {failed_count}，总计 {total_count}"
             self.log(f"⚡ {tip}")
             try:
-                if mw is not None and getattr(mw, "tray_icon", None) is not None:
-                    icon = mw.style().standardIcon(
-                        QStyle.StandardPixmap.SP_DialogApplyButton)
-                    mw.tray_icon.showMessage("表格自动发送", tip, icon, 5000)
+                ToastNotification.show_toast(
+                    "表格自动发送", tip,
+                    success=(failed_count == 0),
+                    duration=5000, parent=mw)
             except Exception:
                 pass
             # 无条件复位门闩并恢复标题/任务栏（失败时内部红色停留 4 秒）
@@ -3695,18 +3695,18 @@ class TableFilterTab(QWidget):
                 self.retry_send_btn.setEnabled(False)
             return
 
-        # 弹窗前确保主窗口可见：发送过程中主窗口可能被微信窗口遮挡或已最小化到托盘，
-        # 若 parent 不可见，QMessageBox 仍弹出但可能不在任务栏闪烁/不置前，
-        # 用户看不到弹窗 → 门闩一直保持 → 从托盘恢复时才看到"已发送完成"定格态。
-        if mw and not mw.isVisible():
-            mw.showNormal()
-            mw.raise_()
-            mw.activateWindow()
+        # 手动发送完成：用 Toast 通知替代模态弹窗，避免无人值守时弹窗无人关闭
+        # 导致标题/任务栏永久卡在发送态。Toast 自动消失且不阻塞。
         try:
-            QMessageBox.information(mw or self, "完成", f"发送完成！成功 {success_count}, 失败 {failed_count}, 总计 {total_count}")
+            ToastNotification.show_toast(
+                "发送完成",
+                f"成功 {success_count}，失败 {failed_count}，总计 {total_count}",
+                success=(failed_count == 0),
+                duration=5000, parent=mw)
+        except Exception:
+            pass
         finally:
-            # try/finally 兜底：无论弹窗是否成功弹出/关闭，都必须复位门闩，
-            # 否则标题和任务栏会永久停留在发送态
+            # try/finally 兜底：无论 Toast 是否成功弹出，都必须复位门闩
             if self.progress_dismissed_cb:
                 self.progress_dismissed_cb(failed_count)
         # 用户点掉完成弹窗后，再恢复窗口标题并清除任务栏定格进度
@@ -3726,14 +3726,14 @@ class TableFilterTab(QWidget):
 
     def on_send_error(self, error):
         mw = self.window()
-        if mw and not mw.isVisible():
-            mw.showNormal()
-            mw.raise_()
-            mw.activateWindow()
         try:
-            QMessageBox.critical(mw or self, "错误", f"发送失败: {error}")
+            ToastNotification.show_toast(
+                "发送出错", f"发送失败: {error}",
+                success=False, duration=8000, parent=mw)
+        except Exception:
+            pass
         finally:
-            # 同 on_send_result：错误弹窗异常时也必须复位门闩、恢复任务栏与标题
+            # 同 on_send_result：Toast 异常时也必须复位门闩、恢复任务栏与标题
             if self.progress_dismissed_cb:
                 self.progress_dismissed_cb(1)
         self.log(f"发送失败: {error}")
@@ -3744,6 +3744,170 @@ class TableFilterTab(QWidget):
                 mw._expand_log_on_failure()
             except Exception:
                 pass
+
+
+class ToastNotification(QFrame):
+    """右下角弹出的通知窗口（类似 Windows Toast / 其他软件通知）。
+
+    无边框、半透明圆角、自动消失、点击可关闭。主线程创建和操作，
+    所有信号都走主线程事件循环，线程安全。
+    """
+
+    # 类属性：当前显示中的通知实例（用列表支持多个通知叠加）
+    _active_instances: list = []
+
+    @classmethod
+    def show_toast(cls, title: str, message: str, *,
+                    success: bool = True, duration: int = 5000,
+                    parent=None):
+        """弹出通知窗口。
+
+        Args:
+            title: 通知标题
+            message: 通知内容
+            success: True=绿色成功图标，False=红色错误图标
+            duration: 自动消失毫秒数（0=手动关闭）
+            parent: 父 QWidget（用于获取屏幕几何，通常传 MainWindow）
+        """
+        try:
+            toast = cls(title, message, success=success,
+                        duration=duration, parent=parent)
+            cls._active_instances.append(toast)
+            toast.destroyed.connect(
+                lambda *_: cls._active_instances.remove(toast)
+                if toast in cls._active_instances else None)
+            toast.show()
+            toast.raise_()
+            toast.activateWindow()
+            # 入场动画
+            toast._animate_in()
+        except Exception:
+            pass
+
+    def __init__(self, title: str, message: str, *,
+                 success: bool = True, duration: int = 5000,
+                 parent=None):
+        super().__init__(parent if parent is not None else
+                         QApplication.topLevelWidgets()[0]
+                         if QApplication.topLevelWidgets() else None)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.Tool |
+            Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._duration = duration
+        self._closing = False
+
+        # 布局
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(12)
+
+        # 图标
+        icon_label = QLabel()
+        icon_label.setFixedSize(32, 32)
+        if success:
+            icon_label.setStyleSheet(
+                "QLabel { background: #2ecc71; border-radius: 16px; "
+                "color: white; font-size: 18px; font-weight: bold; }")
+            icon_label.setText("✓")
+            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        else:
+            icon_label.setStyleSheet(
+                "QLabel { background: #e74c3c; border-radius: 16px; "
+                "color: white; font-size: 18px; font-weight: bold; }")
+            icon_label.setText("✕")
+            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # 文字区
+        text_layout = QVBoxLayout()
+        text_layout.setSpacing(4)
+        title_label = QLabel(title)
+        title_label.setStyleSheet(
+            "color: #2c3e50; font-size: 14px; font-weight: bold;")
+        msg_label = QLabel(message)
+        msg_label.setStyleSheet(
+            "color: #34495e; font-size: 12px;")
+        msg_label.setWordWrap(True)
+        msg_label.setMaximumWidth(280)
+        text_layout.addWidget(title_label)
+        text_layout.addWidget(msg_label)
+
+        layout.addWidget(icon_label)
+        layout.addLayout(text_layout, 1)
+
+        # 关闭按钮
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(20, 20)
+        close_btn.setStyleSheet(
+            "QPushButton { border: none; color: #95a5a6; "
+            "font-size: 14px; }"
+            "QPushButton:hover { color: #e74c3c; }")
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn, 0, Qt.AlignmentFlag.AlignTop)
+
+        # 整体样式
+        self.setStyleSheet(
+            "ToastNotification { "
+            "background: rgba(255, 255, 255, 245); "
+            "border-radius: 10px; "
+            "border: 1px solid rgba(0,0,0,0.08); }")
+        self.setFixedSize(380, max(70, 30 + 20 * (message.count('\n') + 1)))
+
+        # 定位到右下角（叠加排列）
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            geo = screen.availableGeometry()
+        else:
+            geo = self.geometry()
+        # 从右下角往上叠加
+        offset_y = 10
+        for prev in ToastNotification._active_instances:
+            if prev is not self and prev.isVisible():
+                offset_y += prev.height() + 8
+        x = geo.x() + geo.width() - self.width() - 16
+        y = geo.y() + geo.height() - self.height() - offset_y
+        self.move(x, y)
+
+        # 自动消失定时器
+        if duration > 0:
+            QTimer.singleShot(duration, self._fade_out)
+
+    def _animate_in(self):
+        """入场动画：从右侧滑入 + 渐显。"""
+        self._anim = QPropertyAnimation(self, b"pos")
+        start = self.pos()
+        end = QPoint(start.x() + 50, start.y())
+        # 渐显
+        self.setWindowOpacity(0.0)
+        self._fade_anim = QPropertyAnimation(self, b"windowOpacity")
+        self._fade_anim.setDuration(300)
+        self._fade_anim.setStartValue(0.0)
+        self._fade_anim.setEndValue(1.0)
+        self._fade_anim.start()
+        self._anim.setDuration(300)
+        self._anim.setStartValue(end)
+        self._anim.setEndValue(start)
+        self._anim.start()
+
+    def _fade_out(self):
+        """退场动画：渐隐后关闭。"""
+        if self._closing:
+            return
+        self._closing = True
+        self._fade_out_anim = QPropertyAnimation(self, b"windowOpacity")
+        self._fade_out_anim.setDuration(300)
+        self._fade_out_anim.setStartValue(1.0)
+        self._fade_out_anim.setEndValue(0.0)
+        self._fade_out_anim.finished.connect(self.close)
+        self._fade_out_anim.start()
+
+    def mousePressEvent(self, event):
+        """点击通知区域也能关闭。"""
+        if event.button() == Qt.MouseButton.Left:
+            self.close()
 
 
 class MultiSelectDialog(QDialog):
@@ -4920,6 +5084,16 @@ class ScheduleTab(QWidget):
                 msg += f"…等{len(failed_recipients)}人"
             msg += "）"
         self.log(msg)
+        # Toast 通知（立即执行完成）
+        mw = self.window()
+        try:
+            ToastNotification.show_toast(
+                "发送完成",
+                f"成功 {success}，失败 {failed}",
+                success=(failed == 0),
+                duration=5000, parent=mw)
+        except Exception:
+            pass
         # 强制兜底恢复标题/任务栏：立即执行路径同样不依赖进度信号是否正确到达
         mw = self.window()
         if mw is not None and hasattr(mw, "_force_finish_schedule_progress"):
@@ -5622,6 +5796,15 @@ class MainWindow(QMainWindow):
         # 否则无人值守时窗口标题会永久停在"发送中…"。
         self._progress_waiting_dismiss = False
         self._finish_send_progress(fail)
+        # Toast 通知（定时任务完成）
+        try:
+            ToastNotification.show_toast(
+                "定时任务完成",
+                f"发送{'成功' if fail == 0 else '完成（有失败）'}",
+                success=(fail == 0),
+                duration=5000, parent=self)
+        except Exception:
+            pass
         # 有失败时自动展开日志面板
         if fail:
             self._expand_log_on_failure()
