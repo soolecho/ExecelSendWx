@@ -64,6 +64,19 @@ function Invoke-InnoCompiler {
     return [int]$code
 }
 
+# Stage 0: 签名主程序 exe（必须在打包前完成，签名后的文件才会进入安装包）
+$mainExes = @(Get-ChildItem $sourceDir -File -Filter "*.exe" -ErrorAction Stop)
+if ($mainExes.Count -eq 0) { throw "Main program exe not found in: $sourceDir" }
+foreach ($exe in $mainExes) {
+    $exeSig = Get-AuthenticodeSignature $exe.FullName
+    if ($exeSig.Status -eq "Valid" -and $exeSig.SignerCertificate -and $exeSig.SignerCertificate.Thumbprint -eq $certificate.Thumbprint) {
+        Write-Tee ("Main exe already signed: {0}" -f $exe.Name)
+    } else {
+        Write-Tee ("Signing main exe: {0}" -f $exe.Name)
+        Set-CodeSignature -FilePath $exe.FullName
+    }
+}
+
 # Stage 1: 首次编译；SignedUninstaller=yes 时 ISCC 会以 exit!=0 提示签名 uninst*.e32
 Write-Tee "Stage 1: compile to generate unsigned uninstaller"
 $before = @(Get-ChildItem $outputDir -File -Filter "uninst*.e32" -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
