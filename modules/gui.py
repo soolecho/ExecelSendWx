@@ -3808,22 +3808,24 @@ class ToastNotification(QFrame):
             Qt.WindowType.Tool |
             Qt.WindowType.WindowStaysOnTopHint
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # WA_StyledBackground 确保 stylesheet 背景色在打包后也生效
+        # （WA_TranslucentBackground 在 Nuitka 打包后可能导致背景全透，弃用）
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._duration = duration
         self._closing = False
         self._dark = self._is_dark_mode()
 
-        # 跟随系统亮/暗模式的配色（背景 alpha=204，即 80% 不透明）
+        # 跟随系统亮/暗模式的配色（完全不透明，确保文字清晰可读）
         if self._dark:
-            bg_rgba = "rgba(37, 38, 41, 204)"
-            border_rgba = "rgba(255, 255, 255, 0.14)"
+            bg_color = "rgb(37, 38, 41)"
+            border_color = "rgba(255, 255, 255, 0.14)"
             title_color = "#f0f0f0"
             msg_color = "#c9ccd1"
             close_color = "#9aa0a6"
         else:
-            bg_rgba = "rgba(255, 255, 255, 204)"
-            border_rgba = "rgba(0, 0, 0, 0.10)"
+            bg_color = "rgb(255, 255, 255)"
+            border_color = "rgba(0, 0, 0, 0.10)"
             title_color = "#2c3e50"
             msg_color = "#34495e"
             close_color = "#95a5a6"
@@ -3882,12 +3884,16 @@ class ToastNotification(QFrame):
         # 整体样式
         self.setStyleSheet(
             f"ToastNotification {{ "
-            f"background: {bg_rgba}; "
+            f"background: {bg_color}; "
             f"border-radius: 10px; "
-            f"border: 1px solid {border_rgba}; }}")
+            f"border: 1px solid {border_color}; }}")
         # 鼠标手型，提示可点击
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedSize(380, max(70, 30 + 20 * (message.count('\n') + 1)))
+
+        # 非按钮子 widget 鼠标事件穿透，使点击通知任意区域都触发 QFrame.mousePressEvent
+        for w in (icon_label, title_label, msg_label):
+            w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         # 定位到右下角（叠加排列）
         screen = QApplication.primaryScreen()
@@ -3960,7 +3966,7 @@ class ToastNotification(QFrame):
 
     def mousePressEvent(self, event):
         """点击通知区域：把主窗口带到前台并关闭通知。"""
-        if event.button() == Qt.MouseButton.Left:
+        if event.button() == Qt.MouseButton.LeftButton:
             self._bring_main_to_front()
             self.close()
 
