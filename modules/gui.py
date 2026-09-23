@@ -1208,6 +1208,7 @@ class ProfileChainWorker(QThread):
 
     finished_with_result = pyqtSignal(int, int, list)  # success, failed, failed_names
     progress = pyqtSignal(int, int)  # 第几个配置 / 配置总数
+    send_progress = pyqtSignal(int, int, int, int)  # 链路当前, 链路总数, 发送当前, 发送总数
 
     def __init__(self, profile_paths, log_callback=None, minimize_after=True):
         super().__init__()
@@ -1323,7 +1324,8 @@ class ProfileChainWorker(QThread):
                         send_interval=prep["send_interval"],
                         chat_delay=prep["chat_delay"],
                         log=self.log,
-                        progress=lambda c, t: None,
+                        progress=lambda c, t: self.send_progress.emit(
+                            idx + 1, total, c, t),
                         stop_event=self.stopped_event,
                         label=f"{idx + 1}/{total}",
                     )
@@ -5666,6 +5668,37 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _update_schedule_send_progress(self, p_cur, p_total, s_cur, s_total):
+        """定时配置链发送进度：标题同时显示发送进度和链路进度。
+
+        格式：📤 发送中 5/10 (50%) 链路1/3 - {APP_TITLE}
+        """
+        # 终态门禁：定格期间迟到的 progress 一律丢弃
+        if self._progress_waiting_dismiss:
+            return
+        if not self._send_progress_active:
+            self._begin_send_progress()
+        if self._progress_waiting_dismiss:
+            return
+        try:
+            s_cur = max(0, int(s_cur))
+            s_total = max(1, int(s_total))
+            p_cur = max(0, int(p_cur))
+            p_total = max(1, int(p_total))
+            pct = int(s_cur * 100 / s_total)
+        except Exception:
+            return
+        tb = self._ensure_taskbar()
+        if tb:
+            tb.set_value(s_cur, s_total)
+        title = (f"📤 发送中 {s_cur}/{s_total} ({pct}%) "
+                 f"链路{p_cur}/{p_total} - {APP_TITLE}")
+        self.setWindowTitle(title)
+        try:
+            self.tray_icon.setToolTip(f"{APP_TITLE}\n{title}")
+        except Exception:
+            pass
+
     def _show_send_done(self, success, failed, total):
         """发送结束的“定格”展示：任务栏满进度（有失败变红），标题显示已发送。
 
@@ -5844,6 +5877,9 @@ class MainWindow(QMainWindow):
             # 保证本方法即便被调度线程调用也不会跨线程碰 GUI/COM
             self._progress_begin_signal.emit()
             worker.progress.connect(self._update_send_progress)
+            # 配置链特有的发送进度信号（链路当前, 链路总数, 发送当前, 发送总数）
+            if hasattr(worker, 'send_progress'):
+                worker.send_progress.connect(self._update_schedule_send_progress)
             worker.finished_with_result.connect(self._on_schedule_result)
             # 兜底：若结束信号因任何原因未到达，QThread 结束时也恢复标题/清任务栏，
             # 避免窗口标题永久停留在“发送中…”
