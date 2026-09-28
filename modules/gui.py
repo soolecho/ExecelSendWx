@@ -1,5 +1,6 @@
 import sys
 import os
+import logging
 import threading
 from typing import List, Optional, Set, Dict, Tuple, Any
 from PyQt6.QtWidgets import (
@@ -958,15 +959,21 @@ class _SenderLogCb:
     设计成类 + 闭包是因为：
     1) 需要可 pickle 弱引用（sender.log 可能被反复设置），lambda 容易循环引用；
     2) 吞掉所有异常，避免 wxauto4 调用链在 GUI 面板写入异常时被连带中断。
-    3) 只写入 GUI 面板，**不再**额外调用 logging。
-       WeChatSender 内部会自己再调 logger.info 写 app.log，两者分离、不重复。
+    3) 同时写入 GUI 面板和 app.log（logging）：
+       定时任务无人值守执行，仅写面板时一旦任务卡死/异常，事后无任何
+       文件日志可查（2026-09-28 孙中枢弹窗卡死事件即因此无日志定位）。
     """
-    __slots__ = ("_cb",)
+    __slots__ = ("_cb", "_lg")
 
     def __init__(self, cb):
         self._cb = cb
+        self._lg = logging.getLogger("wechat_sender").info
 
     def log(self, message):
+        try:
+            self._lg(str(message))
+        except Exception:
+            pass
         cb = self._cb
         if cb is None:
             return
@@ -5340,6 +5347,9 @@ class MainWindow(QMainWindow):
     # 不依赖 worker 的 finished_with_result 信号是否正确到达，
     # 避免无人值守时窗口标题永久停在“发送中…”
     _schedule_done_signal = pyqtSignal(int)  # 参数：失败数量
+    # 定时任务异常（超时强制停止等）需要弹常驻通知时，从调度线程
+    # 经此信号投递到主线程弹 Toast（msg, success）
+    _schedule_toast_signal = pyqtSignal(str, bool)
 
     def __init__(self):
         super().__init__()
@@ -5375,6 +5385,8 @@ class MainWindow(QMainWindow):
         self._progress_begin_signal.connect(self._begin_send_progress)
         # 定时任务结束后强制恢复进度（兜底，不依赖 worker 结束信号）
         self._schedule_done_signal.connect(self._force_finish_schedule_progress)
+        # 定时任务异常通知（超时强制停止等）在主线程弹 Toast
+        self._schedule_toast_signal.connect(self._show_schedule_toast)
 
         # 电脑锁定守护：阻止定时发送期间电脑自动锁定，任务完成后自动锁回
         self.workstation_guard = WorkstationGuard(
@@ -5808,6 +5820,16 @@ class MainWindow(QMainWindow):
         if failed:
             self._expand_log_on_failure()
 
+    def _show_schedule_toast(self, msg, success):
+        """定时任务异常通知（超时强制停止等），主线程弹 Toast。
+        success=False 时常驻等待手动关闭（ToastNotification 内强制）。"""
+        try:
+            ToastNotification.show_toast(
+                "定时任务", str(msg), success=bool(success),
+                duration=8000, parent=self)
+        except Exception:
+            pass
+
     def _expand_log_on_failure(self):
         """发送有失败时自动展开对应日志面板，确保用户能看到结果。
 
@@ -5893,13 +5915,19 @@ class MainWindow(QMainWindow):
         # 否则无人值守时窗口标题会永久停在"发送中…"。
         self._progress_waiting_dismiss = False
         self._finish_send_progress(fail)
-        # Toast 通知（定时任务完成；有失败时常驻等待手动关闭）
+        # Toast 通知（定时任务完成；有失败时常驻等待手动关闭，并列出失败人名）
         try:
             ok_n = int(_ok) if isinstance(_ok, (int, float)) else 0
             if fail == 0:
                 toast_msg = f"定时任务发送成功，共 {ok_n} 条"
             else:
-                toast_msg = f"定时任务完成：成功 {ok_n}，失败 {fail}（点击查看）"
+                names = [str(n) for n in (_recipients or []) if str(n).strip()]
+                toast_msg = f"定时任务完成：成功 {ok_n}，失败 {fail}"
+                if names:
+                    shown = names[:5]
+                    suffix = f" 等{len(names)}人" if len(names) > 5 else ""
+                    toast_msg += f"\n失败：{'、'.join(shown)}{suffix}"
+                toast_msg += "（点击查看）"
             ToastNotification.show_toast(
                 "定时任务完成", toast_msg,
                 success=(fail == 0),
@@ -6141,6 +6169,27 @@ class MainWindow(QMainWindow):
                     worker.wait(30000)
                 except Exception:
                     pass
+                # 超时（卡死）时 worker 的 finished_with_result 不会到达，
+                # _on_schedule_result 的完成通知也不会弹；这里补发常驻失败通知，
+                # 避免无人值守时任务挂了用户毫无感知（2026-09-28 弹窗卡死事件）
+                try:
+                    still_alive = worker.isRunning()
+                except Exception:
+                    still_alive = True
+                timeout_msg = (
+                    f"任务「{task.name}」执行超时已强制停止"
+                    f"（成功 {result['success']}，失败 {result['failed']}，"
+                    f"其余未发送），请查看日志"
+                )
+                if still_alive:
+                    timeout_msg += "；发送线程仍阻塞，建议重启程序"
+                try:
+                    self._schedule_toast_signal.emit(timeout_msg, False)
+                except Exception:
+                    pass
+                # 让 _schedule_done_signal 携带非零失败数，触发日志面板自动展开
+                if not result["failed"]:
+                    result["failed"] = 1
             self._post_schedule_log_from_worker(
                 f"[定时] 任务「{task.name}」时间点 {slot} 完成："
                 f"成功{result['success']}，失败{result['failed']}"

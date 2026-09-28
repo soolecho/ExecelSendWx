@@ -67,6 +67,12 @@ class WeChatSender:
         self._chatinfo_cache = None
         self._chatinfo_cache_ts = 0.0
         self._chatinfo_cache_ttl = 1.5  # 秒
+        # 发送失败弹窗守护线程：发送期间独立扫描关闭弹窗，
+        # 防止模态弹窗阻塞 SendMsg 导致整个批量任务卡死
+        self._dismiss_lock = threading.Lock()
+        self._watchdog_lock = threading.Lock()
+        self._watchdog_thread = None
+        self._watchdog_deadline = 0.0
 
     @classmethod
     def shared_instance(cls) -> "WeChatSender":
@@ -459,20 +465,16 @@ class WeChatSender:
         except Exception:
             pass
 
-    def _dismiss_send_failure_dialog(self) -> bool:
-        """检测并关闭微信'发送失败'弹窗。返回是否检测到并关闭了弹窗。
+    def _find_wechat_dialogs(self):
+        """枚举微信进程的所有可见顶层窗口，返回候选弹窗列表。
 
-        用 win32gui 枚举微信进程的可见顶层窗口，查找标题含'发送失败'等
-        关键词的对话框（或标准对话框类 #32770），找到后发送 Enter 键
-        点击默认'确定'按钮关闭，使后续发送不被阻塞。
+        返回 (main_hwnd, candidates)，candidates 元素为
+        (hwnd, title, class_name, width, height)。main_hwnd 为 0 表示
+        微信主窗口未找到（微信未启动），此时 candidates 为空。
         """
-        try:
-            import win32gui
-            import win32process
-        except ImportError:
-            return False
+        import win32gui
+        import win32process
 
-        # 找微信主窗口 hwnd 和 PID（复用现有 FindWindow 模式）
         main_hwnd = 0
         for cls_name in ("Qt51514QWindowIcon", "WeChatMainWndForPC"):
             try:
@@ -482,14 +484,14 @@ class WeChatSender:
             if main_hwnd:
                 break
         if not main_hwnd:
-            return False
+            return 0, []
 
         try:
             _, wechat_pid = win32process.GetWindowThreadProcessId(main_hwnd)
         except Exception:
-            return False
+            return 0, []
 
-        found_dialogs = []
+        candidates = []
 
         def _enum_callback(hwnd, _):
             if not win32gui.IsWindowVisible(hwnd):
@@ -505,35 +507,163 @@ class WeChatSender:
             try:
                 title = win32gui.GetWindowText(hwnd)
                 cls = win32gui.GetClassName(hwnd)
+                rect = win32gui.GetWindowRect(hwnd)
+                w, h = rect[2] - rect[0], rect[3] - rect[1]
+                candidates.append((hwnd, title or "", cls or "", w, h))
             except Exception:
                 return True
-            # 仅匹配标题含关键词的弹窗，避免误关微信设置/关于等其他对话框
-            keywords = ("发送失败", "发送出错", "消息发送失败", "发送中断")
-            if any(k in title for k in keywords):
-                found_dialogs.append((hwnd, title, cls))
             return True
 
         try:
             win32gui.EnumWindows(_enum_callback, None)
         except Exception:
             pass
+        return main_hwnd, candidates
 
-        if not found_dialogs:
+    # 发送失败类弹窗标题关键词（微信 3.x 多为 #32770 标准对话框，
+    # 4.0 多为 Qt 自绘弹窗，标题可能为空，需结合尺寸兜底判断）
+    _DIALOG_TITLE_KEYWORDS = (
+        "发送失败", "发送出错", "消息发送失败", "发送中断",
+        "操作频繁", "过于频繁", "无法发送", "重新发送", "网络错误",
+    )
+    _DIALOG_CONFIRM_TEXTS = ("确定", "OK", "好的", "知道了", "重试")
+
+    @classmethod
+    def _is_suspect_failure_dialog(cls, title, class_name, w, h):
+        """判断一个微信顶层窗口是否疑似'发送失败'类弹窗。"""
+        if any(k in title for k in cls._DIALOG_TITLE_KEYWORDS):
+            return True
+        # 兜底：标准对话框类(#32770) 或 Qt 弹窗，标题为空且尺寸较小
+        # （排除通话/朋友圈等大窗口），基本就是模态提示弹窗
+        if not title.strip() and w <= 620 and h <= 440:
+            if class_name == "#32770" or (class_name.startswith("Qt") and "QWindow" in class_name):
+                return True
+        return False
+
+    def _close_dialog_hwnd(self, hwnd, title, class_name) -> bool:
+        """关闭指定弹窗。优先 PostMessage 直接点击'确定'按钮（不依赖前台，
+        锁屏/远程桌面断开时也有效），失败再退回置前+SendInput Enter。"""
+        import win32gui
+        import win32con
+
+        # 1) 找'确定'按钮子窗口（#32770 标准对话框有真实 Button 子控件）
+        btn = 0
+
+        def _find_btn(child, _):
+            nonlocal btn
+            try:
+                if win32gui.GetClassName(child) == "Button":
+                    txt = win32gui.GetWindowText(child)
+                    if any(t in txt for t in self._DIALOG_CONFIRM_TEXTS):
+                        btn = child
+                        return False
+            except Exception:
+                pass
+            return True
+
+        try:
+            win32gui.EnumChildWindows(hwnd, _find_btn, None)
+        except Exception:
+            pass
+        if btn:
+            try:
+                win32gui.PostMessage(btn, win32con.BM_CLICK, 0, 0)
+                time.sleep(0.15)
+                if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                    return True
+            except Exception:
+                pass
+
+        # 2) 对弹窗本身发 Enter 键消息（Qt 自绘弹窗无 Button 子控件，
+        #    但默认按钮通常持有焦点，Enter 可触发）
+        try:
+            win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
+            win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
+            time.sleep(0.15)
+            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                return True
+        except Exception:
+            pass
+
+        # 3) 退回置前后发 SendInput Enter（需要交互桌面，锁屏时可能无效）
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        time.sleep(0.1)
+        self._send_enter_key()
+        time.sleep(0.15)
+        try:
+            return not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd)
+        except Exception:
+            return True
+
+    def _dismiss_send_failure_dialog(self) -> bool:
+        """检测并关闭微信'发送失败'类弹窗。返回是否检测到弹窗。
+
+        线程安全（_dismiss_lock 防重入），供发送线程与守护线程并发调用。
+        发现的候选窗口均记入日志（标题/类名/尺寸），便于事后定位弹窗特征。
+        """
+        try:
+            import win32gui  # noqa: F401
+            import win32process  # noqa: F401
+        except ImportError:
             return False
 
-        for hwnd, title, cls in found_dialogs:
+        with self._dismiss_lock:
             try:
-                win32gui.SetForegroundWindow(hwnd)
+                _, candidates = self._find_wechat_dialogs()
+            except Exception:
+                return False
+            if not candidates:
+                return False
+
+            found = False
+            for hwnd, title, cls, w, h in candidates:
+                if not self._is_suspect_failure_dialog(title, cls, w, h):
+                    continue
+                found = True
+                try:
+                    closed = self._close_dialog_hwnd(hwnd, title, cls)
+                    self.log(
+                        f"⚠️ 检测到微信弹窗(title={title!r}, class={cls!r}, "
+                        f"{w}x{h})，自动关闭{'成功' if closed else '可能失败'}"
+                    )
+                except Exception as exc:
+                    self.log(f"⚠️ 关闭微信弹窗异常: {exc}")
+            return found
+
+    def _ensure_dialog_watchdog(self):
+        """确保弹窗守护线程在运行。发送期间每 0.5 秒扫描一次弹窗，
+        空闲超过 15 秒（无发送调用）自动退出。
+
+        关键作用：微信'发送失败'弹窗是模态对话框，会阻塞 SendMsg 的
+        UIA 调用导致其不返回，发送线程内的'发送后检测'永远执行不到；
+        独立线程扫描可在 0.5 秒内关掉弹窗解除阻塞，防止批量任务卡死。
+        """
+        with self._watchdog_lock:
+            self._watchdog_deadline = time.time() + 15.0
+            t = self._watchdog_thread
+            if t is not None and t.is_alive():
+                return
+            self._watchdog_thread = threading.Thread(
+                target=self._dialog_watchdog_loop,
+                daemon=True,
+                name="wx-dialog-watchdog",
+            )
+            self._watchdog_thread.start()
+
+    def _dialog_watchdog_loop(self):
+        while True:
+            try:
+                self._dismiss_send_failure_dialog()
             except Exception:
                 pass
-            time.sleep(0.1)
-            self._send_enter_key()
-            time.sleep(0.2)
-            try:
-                self.log(f"⚠️ 检测到微信弹窗'{title}'，已自动点击确定关闭")
-            except Exception:
-                pass
-        return True
+            with self._watchdog_lock:
+                remaining = self._watchdog_deadline - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.5, max(0.1, remaining)))
 
     def _send_msg_with_dialog_retry(self, content, recipient, stop_event=None) -> bool:
         """发送消息，检测发送失败弹窗并重试。最多 3 次。
@@ -686,6 +816,9 @@ class WeChatSender:
                 self.log("❌ 微信探活失败且重连未成功")
                 return False
 
+        # 启动弹窗守护线程：发送期间独立扫描关闭'发送失败'模态弹窗，
+        # 防止其阻塞 SendMsg 的 UIA 调用导致批量任务整体卡死
+        self._ensure_dialog_watchdog()
         # 进入发送前，先清理可能残留的发送失败弹窗（上一次发送可能遗留）
         self._dismiss_send_failure_dialog()
 
@@ -801,6 +934,8 @@ class WeChatSender:
 
         self.log(f"发送文件: {file_path}")
 
+        # 启动弹窗守护线程（同 send_message，防止模态弹窗阻塞卡死）
+        self._ensure_dialog_watchdog()
         # 进入发送前，先清理可能残留的发送失败弹窗（上一次发送可能遗留）
         self._dismiss_send_failure_dialog()
 
