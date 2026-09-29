@@ -55,6 +55,10 @@ from modules.updater import (
 )
 
 
+# gui 模块自己的日志（Toast、定时触发/完成、跨线程信号等关键路径均需可追溯）
+logger = logging.getLogger(__name__)
+
+
 APP_TITLE = "表格自动发送By春风予Lu"
 INSTANCE_LOCK_NAME = "ExcelSendWx.lock"
 # 与 installer.iss 的 Run 键值名一致，确保安装器勾选和托盘菜单勾选操作同一注册表项
@@ -1652,12 +1656,22 @@ class TableFilterTab(QWidget):
 
         self.load_config_btn = QPushButton("加载配置")
         config_btn_layout.addWidget(self.load_config_btn)
+
+        self.edit_config_btn = QPushButton("编辑配置")
+        self.edit_config_btn.setToolTip(
+            "把配置加载到界面进行修改，但不触发自动发送（适合编辑"
+            "勾选了「加载后自动发送」的配置）；改完点「保存配置」即可"
+        )
+        config_btn_layout.addWidget(self.edit_config_btn)
         config_layout.addLayout(config_btn_layout)
 
-        config_layout.addWidget(QLabel("最近配置（双击加载）:"))
+        config_layout.addWidget(QLabel("最近配置（双击加载，右键可编辑）:"))
         self.recent_config_list = QListWidget()
         self.recent_config_list.setMinimumHeight(50)
         self.recent_config_list.setMaximumHeight(72)
+        # 右键菜单：加载 / 编辑（不自动发送）
+        self.recent_config_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu)
         config_layout.addWidget(self.recent_config_list)
 
         left_layout.addWidget(config_group)
@@ -2214,8 +2228,12 @@ class TableFilterTab(QWidget):
         self.save_config_btn.clicked.connect(self.save_config)
         self.save_as_config_btn.clicked.connect(self.save_config_as)
         self.load_config_btn.clicked.connect(self.load_config)
+        self.edit_config_btn.clicked.connect(self.edit_config)
         self.recent_config_list.itemDoubleClicked.connect(
             self.load_recent_config
+        )
+        self.recent_config_list.customContextMenuRequested.connect(
+            self._on_recent_config_context_menu
         )
         self.excel_btn.clicked.connect(self.select_excel_file)
         self.reload_btn.clicked.connect(self.reload_excel_file)
@@ -2406,7 +2424,19 @@ class TableFilterTab(QWidget):
     def load_config(self):
         if not self._can_load_config():
             return
+        config_path = self._pick_config_file("加载配置")
+        if config_path:
+            self._load_config_file(config_path)
 
+    def edit_config(self):
+        """选择一个配置以"编辑模式"加载：只还原到界面，不触发 auto_send。"""
+        if not self._can_load_config():
+            return
+        config_path = self._pick_config_file("编辑配置（不自动发送）")
+        if config_path:
+            self._load_config_file(config_path, trigger_auto_send=False)
+
+    def _pick_config_file(self, dialog_title):
         start_path = (
             os.path.dirname(self.current_config_path)
             if self.current_config_path
@@ -2414,23 +2444,46 @@ class TableFilterTab(QWidget):
         )
         config_path, _ = QFileDialog.getOpenFileName(
             self,
-            "加载配置",
+            dialog_title,
             start_path,
             "表格发送配置 (*.json)",
         )
-        if config_path:
-            self._load_config_file(config_path)
+        return config_path
 
     def load_recent_config(self, item):
         config_path = item.data(Qt.ItemDataRole.UserRole)
         if not config_path:
             return
+        self._load_recent_path(config_path, trigger_auto_send=True)
+
+    def edit_recent_config(self, item):
+        config_path = item.data(Qt.ItemDataRole.UserRole)
+        if not config_path:
+            return
+        self._load_recent_path(config_path, trigger_auto_send=False)
+
+    def _load_recent_path(self, config_path, *, trigger_auto_send):
         if not os.path.isfile(config_path):
             self.config_manager.remove_recent(config_path)
             self.refresh_recent_configs()
             QMessageBox.warning(self, "配置不存在", "该配置文件已被移动或删除")
             return
-        self._load_config_file(config_path)
+        self._load_config_file(
+            config_path, trigger_auto_send=trigger_auto_send)
+
+    def _on_recent_config_context_menu(self, pos):
+        item = self.recent_config_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        act_load = menu.addAction("加载配置（按配置自动发送）")
+        act_edit = menu.addAction("编辑配置（不自动发送）")
+        chosen = menu.exec(
+            self.recent_config_list.viewport().mapToGlobal(pos))
+        if chosen == act_load:
+            self.load_recent_config(item)
+        elif chosen == act_edit:
+            self.edit_recent_config(item)
 
     def _can_load_config(self):
         if self.excel_worker and self.excel_worker.isRunning():
@@ -2441,7 +2494,7 @@ class TableFilterTab(QWidget):
             return False
         return True
 
-    def _load_config_file(self, config_path):
+    def _load_config_file(self, config_path, *, trigger_auto_send=True):
         if not self._can_load_config():
             return False
 
@@ -2458,9 +2511,15 @@ class TableFilterTab(QWidget):
         self._set_current_config(config_path)
         self.config_manager.add_recent(self.current_config_path)
         self.refresh_recent_configs()
-        self.log(
-            f"正在加载配置: {os.path.basename(self.current_config_path)}"
-        )
+        if trigger_auto_send:
+            self.log(
+                f"正在加载配置: {os.path.basename(self.current_config_path)}"
+            )
+        else:
+            self.log(
+                f"正在以编辑模式加载配置（不会自动发送）: "
+                f"{os.path.basename(self.current_config_path)}"
+            )
 
         if source == "wps_cloud":
             file_token = excel_settings.get("cloud_file_id", "").strip()
@@ -2475,6 +2534,7 @@ class TableFilterTab(QWidget):
             self.pending_config = {
                 "profile": profile,
                 "excel_path": f"wps-cloud://{file_token}",
+                "suppress_auto_send": not trigger_auto_send,
             }
             sheet_name = excel_settings.get("sheet") or None
             if not self._load_cloud_data(file_token, file_name, sheet_name):
@@ -2503,6 +2563,7 @@ class TableFilterTab(QWidget):
         self.pending_config = {
             "profile": profile,
             "excel_path": os.path.abspath(excel_path),
+            "suppress_auto_send": not trigger_auto_send,
         }
         sheet_name = excel_settings.get("sheet") or None
         if not self._load_excel_data(excel_path, sheet_name):
@@ -2523,6 +2584,9 @@ class TableFilterTab(QWidget):
             return False
 
         profile = self.pending_config["profile"]
+        # 编辑模式加载时抑制本次 auto_send（标志随 pending_config 同生命周期）
+        suppress_auto_send = bool(
+            self.pending_config.get("suppress_auto_send", False))
         self.pending_config = None
         excel_settings = profile["excel"]
         send_settings = profile["send"]
@@ -2729,7 +2793,16 @@ class TableFilterTab(QWidget):
 
         # auto_send：配置要求加载后自动全选筛选人员并直接发送。
         # 延迟到本轮 UI 处理完成后再执行，确保列表已渲染、弹窗已关闭。
-        if can_load_data and bool(send_settings.get("auto_send", False)):
+        # 编辑模式加载（suppress_auto_send）只把配置还原到界面供修改，不触发发送。
+        if can_load_data and bool(send_settings.get("auto_send", False)) \
+                and suppress_auto_send:
+            self.log(
+                "⚙ 该配置勾选了「加载后自动发送」，当前为编辑模式，已跳过"
+                "自动发送；修改后请点「保存配置」"
+            )
+
+        if can_load_data and bool(send_settings.get("auto_send", False)) \
+                and not suppress_auto_send:
             def _auto_start_send():
                 try:
                     if not self.processor:
@@ -3391,6 +3464,7 @@ class TableFilterTab(QWidget):
         self.save_config_btn.setEnabled(not loading and has_data)
         self.save_as_config_btn.setEnabled(not loading and has_data)
         self.load_config_btn.setEnabled(not loading)
+        self.edit_config_btn.setEnabled(not loading)
         self.recent_config_list.setEnabled(not loading)
         if is_cloud:
             self.cloud_file_edit.setEnabled(not loading)
@@ -4188,11 +4262,32 @@ class ToastNotification(QFrame):
                 if toast in cls._active_instances else None)
             toast.show()
             toast.raise_()
-            toast.activateWindow()
+            # 注意：主窗口最小化到托盘时本进程没有前台窗口，Windows 前台锁定
+            # 会让 activateWindow() 失效甚至使窗口停留在不可见的"鬼影"状态。
+            # Toast 已带 WindowDoesNotAcceptFocus（WS_EX_NOACTIVATE），无需
+            # 也不能抢焦点，因此这里不再调用 activateWindow()。
+            # show 之后再用原生 API 强制置顶（后台进程首次 show 时 Qt 的
+            # WindowStaysOnTopHint 可能被 Windows 忽略）。
+            try:
+                import ctypes
+                hwnd = int(toast.winId())
+                # HWND_TOPMOST=-1；SWP_NOMOVE|NOSIZE|NOACTIVATE|SHOWWINDOW
+                ctypes.windll.user32.SetWindowPos(
+                    hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0010 | 0x0040)
+            except Exception:
+                pass
             # 入场动画
             toast._animate_in()
+            try:
+                logger.info(
+                    "[Toast] 显示通知 title=%s success=%s 位置=(%s,%s) 尺寸=%sx%s 可见=%s",
+                    title, success, toast.x(), toast.y(),
+                    toast.width(), toast.height(), toast.isVisible())
+            except Exception:
+                pass
         except Exception:
-            pass
+            # 不再静默吞掉：记录异常便于定位"通知不显示"类问题
+            logger.exception("[Toast] show_toast 失败 title=%s", title)
 
     def __init__(self, title: str, message: str, *,
                  success: bool = True, duration: int = 8000,
@@ -4205,7 +4300,11 @@ class ToastNotification(QFrame):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.Tool |
-            Qt.WindowType.WindowStaysOnTopHint
+            Qt.WindowType.WindowStaysOnTopHint |
+            # WS_EX_NOACTIVATE：主窗口隐藏到托盘、本进程无前台窗口时，
+            # Windows 前台锁定会阻止通知窗口显现；不接受焦点的窗口不受此
+            # 限制，可直接在右下角显示，且仍能正常接收鼠标点击。
+            Qt.WindowType.WindowDoesNotAcceptFocus
         )
         # WA_StyledBackground 确保 stylesheet 背景色在打包后也生效
         # （WA_TranslucentBackground 在 Nuitka 打包后可能导致背景全透，弃用）
@@ -5742,7 +5841,8 @@ class MainWindow(QMainWindow):
     # 定时任务执行完毕（成功/超时/异常）后强制恢复标题/任务栏，
     # 不依赖 worker 的 finished_with_result 信号是否正确到达，
     # 避免无人值守时窗口标题永久停在“发送中…”
-    _schedule_done_signal = pyqtSignal(int)  # 参数：失败数量
+    # 参数：失败数量, 成功数量, 失败人名列表（供兜底补发完成 Toast）
+    _schedule_done_signal = pyqtSignal(int, int, list)
     # 定时任务异常（超时强制停止等）需要弹常驻通知时，从调度线程
     # 经此信号投递到主线程弹 Toast（msg, success）
     _schedule_toast_signal = pyqtSignal(str, bool)
@@ -5768,6 +5868,10 @@ class MainWindow(QMainWindow):
         # 定时触发时并发串行化（避免同时多个任务抢微信窗口）
         self._schedule_running_lock = threading.Lock()
         self._schedule_worker = None
+        # 每次定时任务执行周期内"完成 Toast"只允许弹一次：
+        # 正常路径（_on_schedule_result）与兜底路径（_schedule_done_signal）
+        # 都会尝试弹，由该标志去重；新任务在主线程触发时复位
+        self._schedule_result_toast_shown = False
 
         # 关键：跨线程日志用 pyqtSignal 投递，不能用 QTimer.singleShot(0,...)
         # 因为子线程没有 Qt event loop，singleShot 永远不会触发
@@ -5779,8 +5883,9 @@ class MainWindow(QMainWindow):
         # 进度开始信号始终在主线程执行（receiver=MainWindow），保证 setWindowTitle/
         # winId()/COM/托盘 全部在主线程，避免调度线程跨线程操作 GUI
         self._progress_begin_signal.connect(self._begin_send_progress)
-        # 定时任务结束后强制恢复进度（兜底，不依赖 worker 结束信号）
-        self._schedule_done_signal.connect(self._force_finish_schedule_progress)
+        # 定时任务结束后强制恢复进度（兜底，不依赖 worker 结束信号），
+        # 并在正常 Toast 信号意外丢失时补发完成通知
+        self._schedule_done_signal.connect(self._on_schedule_done_fallback)
         # 定时任务异常通知（超时强制停止等）在主线程弹 Toast
         self._schedule_toast_signal.connect(self._show_schedule_toast)
 
@@ -6322,34 +6427,66 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _on_schedule_result(self, _ok, fail, _recipients):
-        # 定时任务（纯文字 / 配置链）没有完成确认弹窗，标题和任务栏必须在这里
-        # 无条件恢复：即便残留了手动发送的"等待关闭弹窗"门闩，也不能挡住定时收尾，
-        # 否则无人值守时窗口标题会永久停在"发送中…"。
-        self._progress_waiting_dismiss = False
-        self._finish_send_progress(fail)
-        # Toast 通知（定时任务完成；有失败时常驻等待手动关闭，并列出失败人名）
+    def _show_schedule_completion_toast(self, ok_n, fail, recipients):
+        """构造并弹出"定时任务完成"Toast；每个执行周期恰好一次（守卫去重）。
+
+        正常路径与 _schedule_done_signal 兜底路径都会调用本方法。
+        """
         try:
-            ok_n = int(_ok) if isinstance(_ok, (int, float)) else 0
+            if self._schedule_result_toast_shown:
+                return
+            self._schedule_result_toast_shown = True
+            ok_n = int(ok_n) if isinstance(ok_n, (int, float)) else 0
+            fail = int(fail) if isinstance(fail, (int, float)) else 0
             if fail == 0:
                 toast_msg = f"定时任务发送成功，共 {ok_n} 条"
             else:
-                names = [str(n) for n in (_recipients or []) if str(n).strip()]
+                names = [str(n) for n in (recipients or []) if str(n).strip()]
                 toast_msg = f"定时任务完成：成功 {ok_n}，失败 {fail}"
                 if names:
                     shown = names[:5]
                     suffix = f" 等{len(names)}人" if len(names) > 5 else ""
                     toast_msg += f"\n失败：{'、'.join(shown)}{suffix}"
                 toast_msg += "（点击查看）"
+            logger.info(
+                "[定时] 弹出完成通知：成功=%s 失败=%s 失败人数=%s",
+                ok_n, fail, len(recipients or []))
             ToastNotification.show_toast(
                 "定时任务完成", toast_msg,
                 success=(fail == 0),
                 duration=8000, parent=self)
         except Exception:
-            pass
+            logger.exception("[定时] 完成通知弹出失败")
+
+    def _on_schedule_result(self, _ok, fail, _recipients):
+        # 定时任务（纯文字 / 配置链）没有完成确认弹窗，标题和任务栏必须在这里
+        # 无条件恢复：即便残留了手动发送的"等待关闭弹窗"门闩，也不能挡住定时收尾，
+        # 否则无人值守时窗口标题会永久停在"发送中…"。
+        self._progress_waiting_dismiss = False
+        self._finish_send_progress(fail)
+        logger.info(
+            "[定时] worker 完成信号到达：成功=%s 失败=%s", _ok, fail)
+        # Toast 通知（定时任务完成；有失败时常驻等待手动关闭，并列出失败人名）
+        self._show_schedule_completion_toast(_ok, fail, _recipients)
         # 有失败时自动展开日志面板
         if fail:
             self._expand_log_on_failure()
+
+    def _on_schedule_done_fallback(self, failed, success, failed_names):
+        """_schedule_done_signal 的主线程槽：无条件收尾 + Toast 兜底。
+
+        正常情况下 _on_schedule_result 已先到（同为排队事件，emit 更早），
+        Toast 守卫会跳过这里的重复弹窗；若 worker 的 finished_with_result
+        排队事件意外丢失，则由这里补发，保证无人值守时通知不缺席。
+        """
+        try:
+            self._force_finish_schedule_progress(failed)
+        except Exception:
+            logger.exception("[定时] 兜底收尾异常")
+        if not self._schedule_result_toast_shown:
+            logger.warning(
+                "[定时] worker 完成信号未到达，由 _schedule_done_signal 兜底弹通知")
+            self._show_schedule_completion_toast(success, failed, failed_names)
 
     def _clear_progress_if_idle(self):
         # finished 在 result/error 之后触发，会借完成弹窗的局部事件循环投递到主线程。
@@ -6454,6 +6591,11 @@ class MainWindow(QMainWindow):
                 send_order=list(getattr(task, "send_order", None) or ["message"]),
             )
         self._schedule_worker = worker
+        # 新执行周期：复位完成 Toast 去重守卫
+        self._schedule_result_toast_shown = False
+        logger.info(
+            "[定时] 主线程创建 worker：任务=%s kind=%s 时间点=%s",
+            getattr(task, "name", ""), getattr(task, "kind", "message"), slot)
         # 后台触发的任务（尤其配置链可能跑很久）：启用停止按钮，
         # worker 结束后（finished 在主线程排队执行）恢复按钮状态
         try:
@@ -6598,6 +6740,11 @@ class MainWindow(QMainWindow):
                     timeout_msg += "；发送线程仍阻塞，建议重启程序"
                 try:
                     self._schedule_toast_signal.emit(timeout_msg, False)
+                    # 超时已弹专属常驻失败通知：阻止兜底路径再弹一个
+                    # "定时任务完成"通知，避免同一任务双弹窗。
+                    # 超时意味着 finished_with_result 永不到达，无并发槽竞争，
+                    # bool 赋值在 GIL 下原子，后台线程直接置位即可。
+                    self._schedule_result_toast_shown = True
                 except Exception:
                     pass
                 # 让 _schedule_done_signal 携带非零失败数，触发日志面板自动展开
@@ -6610,7 +6757,11 @@ class MainWindow(QMainWindow):
             # 强制兜底恢复标题/任务栏：无论 worker 结束信号是否正确到达，
             # finished.wait() 一定返回，这里无条件恢复，杜绝标题永久停“发送中”
             try:
-                self._schedule_done_signal.emit(int(result.get("failed", 0)))
+                self._schedule_done_signal.emit(
+                    int(result.get("failed", 0)),
+                    int(result.get("success", 0)),
+                    list(result.get("failed_list") or []),
+                )
             except Exception:
                 pass
             # 发送完成后：按任务配置决定是否锁定电脑
