@@ -198,6 +198,35 @@ def prepare_profile(profile, log_fn=None):
                 log(f"微信列“{wechat_column}”不存在，忽略")
         manual_recipient = (send.get("manual_recipient") or "").strip()
 
+        # 4.5) 联系人映射（recipient_mapping）：把"人员列"筛选出来的值
+        #      （可能是组名"装维组"等）映射到实际的微信接收人列表。
+        #      - 启用映射且命中 → 一个 person 可能展开为多个 task（一对多）
+        #      - 启用映射但未命中且有兜底 → 用兜底接收人
+        #      - 启用映射但未命中且无兜底 / 未启用映射 → 走原 wechat_column → manual_recipient → person 逻辑
+        mapping_cfg = profile.get("recipient_mapping") or {}
+        mapping_enabled = bool(mapping_cfg.get("enabled", False))
+        value_to_recipients = {}
+        if mapping_enabled:
+            for m in (mapping_cfg.get("mappings") or []):
+                src = str(m.get("source_value", "") or "").strip()
+                recips_raw = m.get("recipients") or []
+                if not isinstance(recips_raw, list):
+                    continue
+                recips = [
+                    str(r).strip()
+                    for r in recips_raw
+                    if str(r).strip()
+                ]
+                if src and recips:
+                    value_to_recipients[src] = recips
+            log(
+                f"联系人映射已启用：{len(value_to_recipients)} 条映射，"
+                f"兜底接收人={mapping_cfg.get('default_recipient', '') or '（无）'}"
+            )
+        default_recipient = str(
+            mapping_cfg.get("default_recipient", "") or ""
+        ).strip()
+
         custom_enabled = bool(send.get("custom_message_enabled", False))
         custom_msg = str(send.get("custom_message", "") or "") if custom_enabled else ""
         if custom_msg:
@@ -213,14 +242,29 @@ def prepare_profile(profile, log_fn=None):
                 log(f"未找到 {person} 的数据，跳过")
                 continue
             person_data = processor.format_table_data(table_data)
-            recipient = mapping.get(person) or manual_recipient or person
-            tasks.append({
-                "name": person,
-                "person_data": person_data,
-                "table_data": table_data,
-                "recipient": recipient,
-                "custom_msg": custom_msg,
-            })
+
+            if mapping_enabled and person in value_to_recipients:
+                # 启用映射且命中 → 按映射展开（一对多时产生多个 task）
+                recipients_list = value_to_recipients[person]
+            elif mapping_enabled and default_recipient:
+                # 启用映射未命中，但配置了兜底接收人 → 用兜底
+                recipients_list = [default_recipient]
+            else:
+                # 三种场景共用此分支：
+                #   1) 未启用映射（默认情况，向后兼容）
+                #   2) 启用映射但未命中且无兜底 → 回退到原"筛选列"逻辑
+                # 原逻辑：wechat_column 列映射 → manual_recipient → person 本身
+                r = mapping.get(person) or manual_recipient or person
+                recipients_list = [r]
+
+            for recipient in recipients_list:
+                tasks.append({
+                    "name": person,            # 日志/确认对话框显示用筛选值
+                    "person_data": person_data,
+                    "table_data": table_data,
+                    "recipient": recipient,    # 实际微信接收人
+                    "custom_msg": custom_msg,
+                })
 
         if not tasks:
             raise ProfilePrepareError("没有可发送的人员数据")

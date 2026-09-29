@@ -10,14 +10,15 @@ from PyQt6.QtWidgets import (
     QCheckBox, QProgressBar, QMessageBox, QSplitter, QTabWidget,
     QDoubleSpinBox, QDialog, QDialogButtonBox, QFileDialog,
     QMenu, QStyle, QSystemTrayIcon, QSpinBox, QTimeEdit, QStackedWidget,
-    QLayout, QRadioButton, QButtonGroup, QFrame
+    QLayout, QRadioButton, QButtonGroup, QFrame,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 from PyQt6.QtCore import (
     Qt, pyqtSignal, QObject, QThread, QTimer, QLockFile, QStandardPaths,
     QTime, QEvent, QSize, QRect, QPoint, QPropertyAnimation, QEasingCurve,
-    QAbstractAnimation, QVariantAnimation
+    QAbstractAnimation, QVariantAnimation, QUrl,
 )
-from PyQt6.QtGui import QAction, QFont, QIcon, QGuiApplication
+from PyQt6.QtGui import QAction, QFont, QIcon, QGuiApplication, QDesktopServices
 
 from modules.config_manager import ConfigError, ConfigManager
 from modules.wechat_sender import WeChatSender
@@ -1956,7 +1957,66 @@ class TableFilterTab(QWidget):
         send_layout.addWidget(self.send_btn)
         
         right_layout.addWidget(send_group)
-        
+
+        # 联系人映射面板：把"人员列"筛选出来的值（可能是组名）映射到微信接收人
+        recipient_group = right_bar.add_section("🔗 联系人映射", collapsed=True)
+        recipient_layout = recipient_group.contentLayout()
+
+        self.recipient_mapping_enabled_check = QCheckBox(
+            "启用联系人映射（启用后，下方映射表会替代\"微信接收人\"逻辑）"
+        )
+        self.recipient_mapping_enabled_check.setToolTip(
+            "勾选后：\n"
+            "  • 命中映射 → 按映射展开（一对多时一个组发给多个人，每人都收完整数据）\n"
+            "  • 未命中但有兜底接收人 → 用兜底\n"
+            "  • 未命中且无兜底 → 回退原\"筛选列\"逻辑（wechat_column / 手动 / 筛选值本身）\n"
+            "不勾选时本面板被忽略，完全走旧逻辑（向后兼容）。"
+        )
+        recipient_layout.addWidget(self.recipient_mapping_enabled_check)
+
+        recipient_layout.addWidget(QLabel("兜底接收人(未命中映射时使用，可选):"))
+        self.recipient_mapping_default_edit = QLineEdit()
+        self.recipient_mapping_default_edit.setPlaceholderText(
+            "未命中映射时的兜底接收人（可选）"
+        )
+        recipient_layout.addWidget(self.recipient_mapping_default_edit)
+
+        self.recipient_mapping_table = QTableWidget(0, 2)
+        self.recipient_mapping_table.setHorizontalHeaderLabels(
+            ["筛选值", "接收人(多人用 / 或 ; 分隔)"]
+        )
+        self.recipient_mapping_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        self.recipient_mapping_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.recipient_mapping_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.recipient_mapping_table.setMinimumHeight(140)
+        recipient_layout.addWidget(self.recipient_mapping_table)
+
+        rm_btn_row1 = QHBoxLayout()
+        self.rm_add_row_btn = QPushButton("➕ 添加行")
+        self.rm_del_row_btn = QPushButton("➖ 删除选中行")
+        self.rm_clear_btn = QPushButton("🗑 清空")
+        rm_btn_row1.addWidget(self.rm_add_row_btn)
+        rm_btn_row1.addWidget(self.rm_del_row_btn)
+        rm_btn_row1.addWidget(self.rm_clear_btn)
+        recipient_layout.addLayout(rm_btn_row1)
+
+        rm_btn_row2 = QHBoxLayout()
+        self.rm_import_btn = QPushButton("📥 导入表格")
+        self.rm_open_file_btn = QPushButton("📂 打开映射表")
+        self.rm_link_file_btn = QPushButton("🔗 关联文件")
+        rm_btn_row2.addWidget(self.rm_import_btn)
+        rm_btn_row2.addWidget(self.rm_open_file_btn)
+        rm_btn_row2.addWidget(self.rm_link_file_btn)
+        recipient_layout.addLayout(rm_btn_row2)
+
+        right_layout.addWidget(recipient_group)
+
         progress_group = right_bar.add_section("📊 发送进度", collapsed=True)
         progress_layout = progress_group.contentLayout()
         
@@ -2185,6 +2245,14 @@ class TableFilterTab(QWidget):
         self.order_down_btn.clicked.connect(lambda: self._move_order_item(1))
         self.send_order_list.itemChanged.connect(self._on_send_order_item_changed)
 
+        # 联系人映射面板按钮
+        self.rm_add_row_btn.clicked.connect(self._on_rm_add_row)
+        self.rm_del_row_btn.clicked.connect(self._on_rm_del_row)
+        self.rm_clear_btn.clicked.connect(self._on_rm_clear)
+        self.rm_import_btn.clicked.connect(self._on_rm_import_table)
+        self.rm_open_file_btn.clicked.connect(self._on_rm_open_mapping_file)
+        self.rm_link_file_btn.clicked.connect(self._on_rm_link_mapping_file)
+
     def refresh_recent_configs(self):
         self.recent_config_list.clear()
         for config_path in self.config_manager.get_recent_profiles():
@@ -2264,6 +2332,7 @@ class TableFilterTab(QWidget):
                 "auto_send": self.auto_send_check.isChecked(),
             },
             "filter_conditions": filter_conditions,
+            "recipient_mapping": self._collect_recipient_mapping_from_ui(),
         }
 
     def save_config(self):
@@ -2525,6 +2594,32 @@ class TableFilterTab(QWidget):
             bool(send_settings.get("auto_send", False))
         )
 
+        # 联系人映射：旧配置无此字段时按禁用+空表初始化（向后兼容）
+        rm_cfg = profile.get("recipient_mapping") or {}
+        self.recipient_mapping_enabled_check.setChecked(
+            bool(rm_cfg.get("enabled", False))
+        )
+        self.recipient_mapping_default_edit.setText(
+            str(rm_cfg.get("default_recipient", "") or "")
+        )
+        rm_file = str(rm_cfg.get("mapping_file", "") or "").strip()
+        self._rm_linked_file = rm_file
+        if rm_file:
+            self.rm_link_file_btn.setToolTip(f"已关联: {rm_file}")
+        else:
+            self.rm_link_file_btn.setToolTip("关联一个映射表文件路径")
+        # 把 mappings 列表（每项 source_value -> recipients）填到表格
+        merged = {}
+        for m in (rm_cfg.get("mappings") or []):
+            src = str(m.get("source_value", "") or "").strip()
+            recips_raw = m.get("recipients") or []
+            if not isinstance(recips_raw, list):
+                continue
+            recips = [str(r).strip() for r in recips_raw if str(r).strip()]
+            if src and recips:
+                merged[src] = recips
+        self._populate_recipient_mapping_table(merged)
+
         # 发送顺序：优先读新字段 send_order；旧配置从 mode 迁移
         custom_enabled = bool(send_settings.get("custom_message_enabled", False))
         attachment_path = self.attachment_edit.text().strip()
@@ -2747,6 +2842,258 @@ class TableFilterTab(QWidget):
     def _on_clear_attachment(self):
         self.attachment_edit.clear()
         self._set_order_item_checked("attachment", False)
+
+    # ------------------------- 联系人映射面板 -------------------------
+    _RM_SEPARATORS = ("/", ";", "、", "，", ",")
+
+    @classmethod
+    def _split_rm_values(cls, raw):
+        """按 / ; 、 ， , 拆分多值，去空白和空串。"""
+        if not raw:
+            return []
+        text = str(raw).strip()
+        if not text:
+            return []
+        for sep in cls._RM_SEPARATORS:
+            text = text.replace(sep, "\n")
+        return [s.strip() for s in text.split("\n") if s.strip()]
+
+    def _on_rm_add_row(self):
+        """添加一行空白映射，方便手动填写。"""
+        table = self.recipient_mapping_table
+        row = table.rowCount()
+        table.insertRow(row)
+        table.setItem(row, 0, QTableWidgetItem(""))
+        table.setItem(row, 1, QTableWidgetItem(""))
+        table.editItem(table.item(row, 0))
+
+    def _on_rm_del_row(self):
+        """删除选中的所有行。"""
+        table = self.recipient_mapping_table
+        rows = sorted(
+            {idx.row() for idx in table.selectedIndexes()},
+            reverse=True,
+        )
+        for r in rows:
+            table.removeRow(r)
+
+    def _on_rm_clear(self):
+        """清空映射表所有行。"""
+        self.recipient_mapping_table.setRowCount(0)
+
+    def _on_rm_link_mapping_file(self):
+        """关联一个映射表文件（.xlsx/.csv），保存到当前 profile 的 mapping_file 字段。"""
+        start_dir = ""
+        cur = self._rm_linked_file
+        if cur and os.path.isdir(os.path.dirname(cur)):
+            start_dir = os.path.dirname(cur)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择映射表文件",
+            start_dir,
+            "映射表 (*.xlsx *.xls *.csv);;所有文件 (*.*)",
+        )
+        if not path:
+            return
+        self._rm_linked_file = os.path.abspath(path)
+        self.rm_link_file_btn.setToolTip(f"已关联: {self._rm_linked_file}")
+        self.log(f"已关联映射表文件: {self._rm_linked_file}")
+
+    @property
+    def _rm_linked_file(self):
+        """当前 profile 关联的映射表文件路径（内存态，保存配置时持久化）。"""
+        return getattr(self, "_rm_linked_file_path", "") or ""
+
+    @_rm_linked_file.setter
+    def _rm_linked_file(self, path):
+        self._rm_linked_file_path = path or ""
+
+    def _on_rm_open_mapping_file(self):
+        """用系统默认编辑器（Excel/WPS）打开已关联的映射表文件。
+
+        若未关联则先弹出文件选择框，记下路径再打开。
+        """
+        path = self._rm_linked_file
+        if not path or not os.path.isfile(path):
+            # 未关联或文件丢失 → 让用户先选一个
+            start_dir = ""
+            if path and os.path.isdir(os.path.dirname(path)):
+                start_dir = os.path.dirname(path)
+            picked, _ = QFileDialog.getOpenFileName(
+                self,
+                "选择要打开的映射表文件",
+                start_dir,
+                "映射表 (*.xlsx *.xls *.csv);;所有文件 (*.*)",
+            )
+            if not picked:
+                return
+            path = os.path.abspath(picked)
+            self._rm_linked_file = path
+            self.rm_link_file_btn.setToolTip(f"已关联: {path}")
+        try:
+            # Windows: os.startfile；其他平台兜底用 QDesktopServices
+            if hasattr(os, "startfile"):
+                os.startfile(path)
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            self.log(f"已用系统默认程序打开映射表: {path}")
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "打开失败", f"无法打开映射表文件:\n{path}\n\n错误: {exc}"
+            )
+
+    def _on_rm_import_table(self):
+        """从 .xlsx/.csv 导入映射关系，合并到当前表格。
+
+        文件两列结构：
+          第一列 = 筛选值（可含 / 或 ; 分隔多个值，多个值共享同一组接收人）
+          第二列 = 接收人（可含 / 或 ; 分隔多人）
+
+        合并规则：同 source_value 已存在则覆盖，不存在则新增。
+        """
+        start_dir = ""
+        cur = self._rm_linked_file
+        if cur and os.path.isdir(os.path.dirname(cur)):
+            start_dir = os.path.dirname(cur)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择映射表文件",
+            start_dir,
+            "映射表 (*.xlsx *.xls *.csv);;所有文件 (*.*)",
+        )
+        if not path:
+            return
+
+        # 复用项目内的 read_one_sheet 读取（不依赖 pandas 直接调用 Qt 线程）
+        try:
+            from modules.wps_cloud import read_one_sheet, read_sheet_names
+        except ImportError as exc:
+            QMessageBox.critical(self, "导入失败", f"缺少必要模块: {exc}")
+            return
+
+        try:
+            rows = read_one_sheet(path, sheet_name=None, log_fn=self.log)
+        except TypeError:
+            # read_one_sheet 签名可能要求显式 sheet_name
+            try:
+                names = read_sheet_names(path, log_fn=self.log)
+                sheet_name = names[0] if names else None
+                rows = read_one_sheet(path, sheet_name, log_fn=self.log)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, "导入失败", f"读取映射表失败:\n{path}\n\n错误: {exc}"
+                )
+                return
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "导入失败", f"读取映射表失败:\n{path}\n\n错误: {exc}"
+            )
+            return
+
+        if not rows:
+            QMessageBox.warning(self, "导入失败", "映射表为空或无有效数据")
+            return
+
+        # 解析为 dict[source_value] -> list[recipients]，便于合并覆盖
+        merged = {}
+        # 先把当前 UI 中的映射读出来
+        for r in range(self.recipient_mapping_table.rowCount()):
+            src_item = self.recipient_mapping_table.item(r, 0)
+            rec_item = self.recipient_mapping_table.item(r, 1)
+            if not src_item:
+                continue
+            for s in self._split_rm_values(src_item.text()):
+                recips = self._split_rm_values(rec_item.text() if rec_item else "")
+                if s and recips:
+                    merged[s] = recips
+
+        # 合并导入的数据
+        imported_count = 0
+        for row in rows:
+            if not row or len(row) < 2:
+                continue
+            srcs = self._split_rm_values(row[0])
+            recips = self._split_rm_values(row[1])
+            if not srcs or not recips:
+                continue
+            for s in srcs:
+                merged[s] = list(recips)  # 覆盖式合并
+                imported_count += 1
+
+        # 写回表格
+        self._populate_recipient_mapping_table(merged)
+
+        # 记下文件路径，便于后续"打开"
+        self._rm_linked_file = os.path.abspath(path)
+        self.rm_link_file_btn.setToolTip(f"已关联: {self._rm_linked_file}")
+
+        self.log(
+            f"导入完成：合并后共 {len(merged)} 条映射"
+            f"（本次新增/覆盖 {imported_count} 条），来源: {path}"
+        )
+
+    def _populate_recipient_mapping_table(self, merged_dict):
+        """把 dict[source_value -> list[recipients]] 写到表格，每行一个 source_value。"""
+        table = self.recipient_mapping_table
+        table.setRowCount(0)
+        for src, recips in merged_dict.items():
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(src))
+            table.setItem(row, 1, QTableWidgetItem(" / ".join(recips)))
+
+    def _collect_recipient_mapping_from_ui(self):
+        """从 UI 收集联系人映射配置，返回与 profile JSON 一致的 dict。
+
+        返回 dict 中额外有 value_to_recipients 字段，方便发送逻辑直接使用。
+        """
+        enabled = self.recipient_mapping_enabled_check.isChecked()
+        default_recipient = self.recipient_mapping_default_edit.text().strip()
+
+        # UI 表格每行允许 raw 多值（含分隔符）；保存时按分隔符拆分两列，
+        # 每行的多个 source_value 共享同一组 recipients，最终序列化为扁平的 mappings。
+        merged = {}
+        for r in range(self.recipient_mapping_table.rowCount()):
+            src_item = self.recipient_mapping_table.item(r, 0)
+            rec_item = self.recipient_mapping_table.item(r, 1)
+            if not src_item:
+                continue
+            srcs = self._split_rm_values(src_item.text())
+            recips = self._split_rm_values(rec_item.text() if rec_item else "")
+            if not srcs or not recips:
+                continue
+            for s in srcs:
+                # 同 source_value 出现多次时，后者覆盖前者
+                merged[s] = list(recips)
+
+        mappings = [
+            {"source_value": s, "recipients": rs}
+            for s, rs in merged.items()
+        ]
+
+        return {
+            "enabled": enabled,
+            "default_recipient": default_recipient,
+            "mapping_file": self._rm_linked_file,
+            "mappings": mappings,
+            # 发送逻辑辅助字段（不持久化，仅内存使用）
+            "value_to_recipients": merged if enabled else {},
+        }
+
+    def _resolve_recipients_for_person(
+        self, name, value_to_recipients, default_recipient, mapping_enabled,
+        fallback_recipient,
+    ):
+        """统一的接收人解析：映射优先 → 兜底 → fallback。
+
+        fallback_recipient 通常来自原"筛选列"逻辑（wechat_mapping / manual_recipient / name）。
+        返回 list[str]（一对多时多个）。
+        """
+        if mapping_enabled and name in value_to_recipients:
+            return list(value_to_recipients[name])
+        if mapping_enabled and default_recipient:
+            return [default_recipient]
+        return [fallback_recipient] if fallback_recipient else []
 
     # ------------------------- 发送顺序 -------------------------
     def _get_send_order(self):
@@ -3494,35 +3841,50 @@ class TableFilterTab(QWidget):
         
         tasks = []
         missing_wechat = []
-        
+
+        # 联系人映射：从 UI 同步当前配置
+        rm_cfg = self._collect_recipient_mapping_from_ui()
+        value_to_recipients = rm_cfg.get("value_to_recipients", {})
+        default_recipient = rm_cfg.get("default_recipient", "")
+        mapping_enabled = rm_cfg.get("enabled", False)
+
         for item in selected_items:
             name = item.text()
             table_data = self.processor.get_person_table_data(
-                name, 
-                name_column, 
+                name,
+                name_column,
                 extract_columns,
                 self.filter_conditions
             )
-            
+
             if not table_data:
                 self.log(f"未找到 {name} 的数据，跳过")
                 continue
             person_data = self.processor.format_table_data(table_data)
-            
-            recipient = self.wechat_mapping.get(name, "")
-            if not recipient:
-                recipient = self.wechat_edit.text().strip()
-            
-            if not recipient:
-                recipient = name
-            
-            tasks.append({
-                "name": name,
-                "person_data": person_data,
-                "table_data": table_data,
-                "recipient": recipient,
-                "custom_msg": custom_msg
-            })
+
+            # 接收人解析：映射优先 → 兜底 → 原"筛选列"逻辑
+            fallback = (
+                self.wechat_mapping.get(name, "")
+                or self.wechat_edit.text().strip()
+                or name
+            )
+            recipients_list = self._resolve_recipients_for_person(
+                name, value_to_recipients, default_recipient,
+                mapping_enabled, fallback,
+            )
+            if not recipients_list:
+                # 全部兜底失败（仅当映射启用但未命中且无 fallback 时可能）
+                missing_wechat.append(name)
+                continue
+
+            for recipient in recipients_list:
+                tasks.append({
+                    "name": name,
+                    "person_data": person_data,
+                    "table_data": table_data,
+                    "recipient": recipient,
+                    "custom_msg": custom_msg,
+                })
         
         if missing_wechat:
             QMessageBox.warning(self, "警告", f"以下人员缺少微信接收人，已跳过:\n{', '.join(missing_wechat)}")

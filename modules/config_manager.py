@@ -127,6 +127,10 @@ class ConfigManager:
             data.get("filter_conditions", [])
         )
 
+        recipient_mapping = cls._normalize_recipient_mapping(
+            data.get("recipient_mapping")
+        )
+
         return {
             "version": cls.PROFILE_VERSION,
             "saved_at": str(data.get("saved_at", "")),
@@ -160,6 +164,7 @@ class ConfigManager:
                 "auto_send": bool(send.get("auto_send", False)),
             },
             "filter_conditions": filter_conditions,
+            "recipient_mapping": recipient_mapping,
         }
 
     @staticmethod
@@ -199,6 +204,55 @@ class ConfigManager:
                     {"column_name": col, "operator": op, "value": val}
                 )
         return result
+
+    @staticmethod
+    def _normalize_recipient_mapping(raw):
+        """规范化联系人映射：旧配置无此字段时返回禁用状态的空映射，保证向后兼容。
+
+        结构：
+            enabled: bool         是否启用映射
+            default_recipient: str  未命中映射且无 wechat_column 时的兜底接收人
+            mapping_file: str    关联的外部映射表文件路径（用于"打开映射表"按钮）
+            mappings: list       [{source_value, recipients: [str, ...]}]
+        """
+        if not isinstance(raw, dict):
+            return {
+                "enabled": False,
+                "default_recipient": "",
+                "mapping_file": "",
+                "mappings": [],
+            }
+        mappings = []
+        # 按 source_value 去重（后者覆盖前者），与发送逻辑保持一致
+        dedup = {}
+        for item in (raw.get("mappings") or []):
+            if not isinstance(item, dict):
+                continue
+            src = str(item.get("source_value", "")).strip()
+            recips_raw = item.get("recipients") or []
+            if not isinstance(recips_raw, list):
+                continue
+            recips = [
+                str(r).strip()
+                for r in recips_raw
+                if str(r).strip()
+            ]
+            if src and recips:
+                dedup[src] = recips
+        for src, recips in dedup.items():
+            mappings.append(
+                {"source_value": src, "recipients": recips}
+            )
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "default_recipient": str(
+                raw.get("default_recipient", "") or ""
+            ).strip(),
+            "mapping_file": str(
+                raw.get("mapping_file", "") or ""
+            ).strip(),
+            "mappings": mappings,
+        }
 
     def save_profile(self, path, data):
         profile = self.normalize_profile(data)
