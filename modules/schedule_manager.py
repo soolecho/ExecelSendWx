@@ -4,7 +4,7 @@ r"""
 职责：
 1. 独立存储定时任务到 %LOCALAPPDATA%\ExcelSendWx\schedules
 2. 提供新增/修改/删除/启用/禁用接口
-3. 定时调度：每 10 秒轮询当前时刻，匹配"每天/指定周几 + HH:MM"
+3. 定时调度：每 10 秒轮询当前时刻，匹配"每天/指定周几 + HH:MM"或"指定日期(一次性)"
 4. 防重复执行：按日期+任务ID+时间点去重
 5. 触发后通过信号交给 GUI 使用 WeChatSender 发送（含3次重试和模糊匹配）
 """
@@ -43,9 +43,11 @@ class ScheduleTask:
     id: str
     name: str
     enabled: bool = True
-    repeat_mode: str = "daily"  # daily | weekly
+    repeat_mode: str = "daily"  # daily | weekly | once
     # repeat_mode=daily 时 days 可为空；weekly 时 days 为 [1..7]
     days: List[int] = field(default_factory=list)
+    # repeat_mode=once 时：执行日期列表（YYYY-MM-DD），每个日期按 times 时间点触发一次
+    run_dates: List[str] = field(default_factory=list)
     # 多个时间点，HH:MM 字符串
     times: List[str] = field(default_factory=list)
     # 逗号/换行分隔的好友或群名
@@ -103,6 +105,26 @@ class ScheduleTask:
         days = safe_list(data.get("days"), int)
         days = sorted({d for d in days if 1 <= d <= 7})
 
+        # repeat_mode=once 时执行日期列表：仅接受合法 YYYY-MM-DD，去重排序；
+        # 旧版单值 run_date 字段自动迁移进列表
+        run_dates: List[str] = []
+        raw_dates = data.get("run_dates")
+        if not isinstance(raw_dates, list):
+            raw_dates = []
+        if not raw_dates:
+            legacy = str(data.get("run_date", "") or "").strip()
+            if legacy:
+                raw_dates = [legacy]
+        for raw in raw_dates:
+            d = str(raw).strip()
+            try:
+                datetime.strptime(d, "%Y-%m-%d")
+            except ValueError:
+                continue
+            if d not in run_dates:
+                run_dates.append(d)
+        run_dates.sort()
+
         times: List[str] = []
         for raw in safe_list(data.get("times"), str):
             t = _normalize_time(raw)
@@ -129,9 +151,10 @@ class ScheduleTask:
             name=str(data.get("name", "未命名任务")).strip() or "未命名任务",
             enabled=bool(data.get("enabled", True)),
             repeat_mode=str(data.get("repeat_mode", "daily"))
-            if data.get("repeat_mode") in ("daily", "weekly")
+            if data.get("repeat_mode") in ("daily", "weekly", "once")
             else "daily",
             days=days,
+            run_dates=run_dates,
             times=times,
             recipients=recipients,
             message=str(data.get("message", "")),
@@ -349,6 +372,48 @@ class ScheduleStore:
                 keep[day] = slots
         task.fired_log = keep
 
+    def auto_disable_once_task(self, task_id: str, day: str) -> bool:
+        """一次性任务（repeat_mode=once）全部执行日期已过且当天时间点全部触发后自动禁用。
+
+        多日期支持：只要还有未到的执行日期（未来日期），即使今天的时间点已全部
+        触发也不禁用，任务继续等待后续日期。返回 True 表示已执行禁用。
+        原子性：在存储锁内重新加载判断，避免与 mark_fired 的写盘交错。
+        """
+        try:
+            today = datetime.strptime(day, "%Y-%m-%d").date()
+        except ValueError:
+            return False
+        with self._lock:
+            tasks = self._load_all_unsafe()
+            changed = False
+            for t in tasks:
+                if t.id != task_id:
+                    continue
+                if getattr(t, "repeat_mode", "daily") != "once":
+                    return False
+                fired = set(t.fired_log.get(day, []))
+                if not t.times or not all(s in fired for s in t.times):
+                    return False
+                dates = getattr(t, "run_dates", None) or []
+                if not dates:
+                    return False
+                try:
+                    parsed = [datetime.strptime(d, "%Y-%m-%d").date() for d in dates]
+                except ValueError:
+                    return False
+                if any(d > today for d in parsed):
+                    return False
+                if not t.enabled:
+                    return False
+                t.enabled = False
+                t.updated_at = datetime.now().isoformat(timespec="seconds")
+                changed = True
+                break
+            if changed:
+                self._save_all(tasks)
+                return True
+            return False
+
     def _load_all_unsafe(self) -> List[ScheduleTask]:
         try:
             with self.index_file.open("r", encoding="utf-8") as fp:
@@ -451,6 +516,7 @@ class ScheduleDispatcher:
             if not self._match_today(task, now):
                 continue
             fired_today = set(task.fired_log.get(today, []))
+            triggered_any = False
             for slot in task.times:
                 if slot in fired_today:
                     continue
@@ -486,6 +552,18 @@ class ScheduleDispatcher:
                         h(task, slot)
                     except Exception as exc:
                         self._log(f"[定时] 调度回调异常: {exc}")
+                triggered_any = True
+            # 一次性任务：当天全部时间点触发完成后自动禁用，
+            # 避免用户误以为任务仍会在后续日期执行
+            if (
+                triggered_any
+                and getattr(task, "repeat_mode", "daily") == "once"
+                and self.store.auto_disable_once_task(task.id, today)
+            ):
+                self._log(
+                    f"[定时] 一次性任务「{task.name}」({'、'.join(task.run_dates or [])}) "
+                    f"所有执行日期已过，自动禁用"
+                )
         # 说明：普通扫描无命中时不输出日志，避免每 10 秒刷一次导致日志与 GUI 事件循环压力。
         # 只保留 fired/start/stop/error 这几类关键信息；如需要调试请手动看这里加 debug 输出。
 
@@ -495,6 +573,8 @@ class ScheduleDispatcher:
             return True
         if task.repeat_mode == "weekly":
             return now.isoweekday() in set(task.days)
+        if task.repeat_mode == "once":
+            return now.strftime("%Y-%m-%d") in set(getattr(task, "run_dates", None) or [])
         return False
 
     @staticmethod

@@ -334,6 +334,10 @@ class WorkstationGuard:
                     if task.repeat_mode == "weekly":
                         if now.isoweekday() not in set(task.days):
                             continue
+                    elif task.repeat_mode == "once":
+                        # 一次性任务只有执行日期当天才会触发
+                        if now.strftime("%Y-%m-%d") not in set(getattr(task, "run_dates", None) or []):
+                            continue
                     for slot in task.times:
                         try:
                             hh, mm = slot.split(":", 1)

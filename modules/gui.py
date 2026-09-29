@@ -9,13 +9,14 @@ from PyQt6.QtWidgets import (
     QComboBox, QListWidget, QListWidgetItem, QGroupBox,
     QCheckBox, QProgressBar, QMessageBox, QSplitter, QTabWidget,
     QDoubleSpinBox, QDialog, QDialogButtonBox, QFileDialog,
-    QMenu, QStyle, QSystemTrayIcon, QSpinBox, QTimeEdit, QStackedWidget,
+    QMenu, QStyle, QSystemTrayIcon, QSpinBox, QTimeEdit, QDateEdit,
+    QStackedWidget,
     QLayout, QRadioButton, QButtonGroup, QFrame,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
 )
 from PyQt6.QtCore import (
     Qt, pyqtSignal, QObject, QThread, QTimer, QLockFile, QStandardPaths,
-    QTime, QEvent, QSize, QRect, QPoint, QPropertyAnimation, QEasingCurve,
+    QTime, QDate, QEvent, QSize, QRect, QPoint, QPropertyAnimation, QEasingCurve,
     QAbstractAnimation, QVariantAnimation, QUrl,
 )
 from PyQt6.QtGui import QAction, QFont, QIcon, QGuiApplication, QDesktopServices
@@ -4656,6 +4657,7 @@ class ScheduleTab(QWidget):
         self.repeat_mode_combo = QComboBox()
         self.repeat_mode_combo.addItem("每天", "daily")
         self.repeat_mode_combo.addItem("每周指定日期", "weekly")
+        self.repeat_mode_combo.addItem("指定日期执行(一次)", "once")
         row1.addWidget(self.repeat_mode_combo, 1)
         repeat_layout.addLayout(row1)
 
@@ -4667,6 +4669,24 @@ class ScheduleTab(QWidget):
             self.weekday_checks[idx] = cb
             weekday_layout.addWidget(cb)
         repeat_layout.addWidget(self.weekday_group_box)
+
+        self.date_group_box = QGroupBox("执行日期(一次性模式生效，可添加多个):")
+        date_layout = QVBoxLayout(self.date_group_box)
+        self.date_list = QListWidget()
+        self.date_list.setMaximumHeight(72)
+        date_layout.addWidget(self.date_list)
+        date_row = QHBoxLayout()
+        self.run_date_edit = QDateEdit()
+        self.run_date_edit.setCalendarPopup(True)
+        self.run_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.run_date_edit.setDate(QDate.currentDate())
+        date_row.addWidget(self.run_date_edit)
+        self.add_date_btn = QPushButton("添加")
+        self.del_date_btn = QPushButton("删除选中")
+        date_row.addWidget(self.add_date_btn)
+        date_row.addWidget(self.del_date_btn)
+        date_layout.addLayout(date_row)
+        repeat_layout.addWidget(self.date_group_box)
         self._on_repeat_mode_changed(self.repeat_mode_combo.currentIndex())
 
         time_group = QGroupBox("发送时间点(HH:MM)，点击右侧按钮新增/删除:")
@@ -4907,6 +4927,8 @@ class ScheduleTab(QWidget):
         self.reset_form_btn.clicked.connect(self._reset_form)
         self.add_time_btn.clicked.connect(self._on_add_time)
         self.del_time_btn.clicked.connect(self._on_del_time)
+        self.add_date_btn.clicked.connect(self._on_add_date)
+        self.del_date_btn.clicked.connect(self._on_del_date)
         self.repeat_mode_combo.currentIndexChanged.connect(self._on_repeat_mode_changed)
         self.attach_pick_btn.clicked.connect(self._on_pick_attachment)
         self.attach_clear_btn.clicked.connect(self._on_clear_attachment)
@@ -4936,6 +4958,8 @@ class ScheduleTab(QWidget):
             cb.stateChanged.connect(mark)
         self.time_list.model().rowsInserted.connect(lambda *a: mark())
         self.time_list.model().rowsRemoved.connect(lambda *a: mark())
+        self.date_list.model().rowsInserted.connect(lambda *a: mark())
+        self.date_list.model().rowsRemoved.connect(lambda *a: mark())
         self.recipients_edit.textChanged.connect(mark)
         self.message_edit.textChanged.connect(mark)
         self.default_city_edit.textChanged.connect(mark)
@@ -5018,6 +5042,9 @@ class ScheduleTab(QWidget):
         mark = "●" if task.enabled else "○"
         if task.repeat_mode == "daily":
             rule = "每天"
+        elif task.repeat_mode == "once":
+            dates = getattr(task, "run_dates", None) or []
+            rule = f"一次: {'、'.join(dates) if dates else '未指定日期'}"
         else:
             days = ",".join(WEEKDAY_NAMES[d - 1] for d in task.days) if task.days else "未选"
             rule = f"每周: {days}"
@@ -5070,8 +5097,13 @@ class ScheduleTab(QWidget):
         try:
             self.name_edit.setText(task.name)
             self.enabled_check.setChecked(task.enabled)
-            idx = 0 if task.repeat_mode == "daily" else 1
-            self.repeat_mode_combo.setCurrentIndex(idx)
+            mode_index = {"daily": 0, "weekly": 1, "once": 2}.get(
+                getattr(task, "repeat_mode", "daily"), 0
+            )
+            self.repeat_mode_combo.setCurrentIndex(mode_index)
+            self.date_list.clear()
+            for rd in (getattr(task, "run_dates", None) or []):
+                self.date_list.addItem(rd)
             for d, cb in self.weekday_checks.items():
                 cb.setChecked(d in set(task.days))
             self.time_list.clear()
@@ -5102,7 +5134,7 @@ class ScheduleTab(QWidget):
             self.kind_combo.setCurrentIndex(kind_idx)
             self._set_profile_paths(getattr(task, "profile_paths", None) or [])
             self._on_kind_changed()
-            self._on_repeat_mode_changed(idx)
+            self._on_repeat_mode_changed(mode_index)
         finally:
             self._loading_form = False
         self._form_dirty = False
@@ -5120,6 +5152,8 @@ class ScheduleTab(QWidget):
             self.name_edit.clear()
             self.enabled_check.setChecked(True)
             self.repeat_mode_combo.setCurrentIndex(0)
+            self.run_date_edit.setDate(QDate.currentDate())
+            self.date_list.clear()
             for cb in self.weekday_checks.values():
                 cb.setChecked(False)
             self.time_list.clear()
@@ -5208,10 +5242,23 @@ class ScheduleTab(QWidget):
         name = self.name_edit.text().strip() or "未命名任务"
         repeat_mode = self.repeat_mode_combo.currentData()
         days: List[int] = []
+        run_dates: List[str] = []
         if repeat_mode == "weekly":
             days = sorted([d for d, cb in self.weekday_checks.items() if cb.isChecked()])
             if not days:
                 raise ValueError("每周模式请至少选择一个周几")
+        elif repeat_mode == "once":
+            from datetime import datetime as _dt
+            for i in range(self.date_list.count()):
+                d = self.date_list.item(i).text().strip()
+                try:
+                    _dt.strptime(d, "%Y-%m-%d")
+                except ValueError:
+                    continue
+                if d not in run_dates:
+                    run_dates.append(d)
+            if not run_dates:
+                raise ValueError("请至少添加一个执行日期")
         times: List[str] = []
         for i in range(self.time_list.count()):
             slot = _normalize_time(self.time_list.item(i).text())
@@ -5243,6 +5290,7 @@ class ScheduleTab(QWidget):
             enabled=self.enabled_check.isChecked(),
             repeat_mode=repeat_mode,
             days=days,
+            run_dates=run_dates,
             times=times,
             recipients=recipients,
             message=message,
@@ -5433,8 +5481,11 @@ class ScheduleTab(QWidget):
 
     # ------------------------- 重复模式/时间点 -------------------------
     def _on_repeat_mode_changed(self, index):
-        weekly = self.repeat_mode_combo.currentData() == "weekly"
+        mode = self.repeat_mode_combo.currentData()
+        weekly = mode == "weekly"
+        once = mode == "once"
         self.weekday_group_box.setEnabled(weekly)
+        self.date_group_box.setVisible(once)
 
     def _on_add_time(self):
         t = self.time_edit.time().toString("HH:mm")
@@ -5449,6 +5500,17 @@ class ScheduleTab(QWidget):
     def _on_del_time(self):
         for item in list(self.time_list.selectedItems()):
             self.time_list.takeItem(self.time_list.row(item))
+
+    def _on_add_date(self):
+        d = self.run_date_edit.date().toString("yyyy-MM-dd")
+        for i in range(self.date_list.count()):
+            if self.date_list.item(i).text() == d:
+                return
+        self.date_list.addItem(d)
+
+    def _on_del_date(self):
+        for item in list(self.date_list.selectedItems()):
+            self.date_list.takeItem(self.date_list.row(item))
 
     # ------------------------- 配置保存/加载（独立 JSON 文件）-------------------------
     def _collect_all_tasks(self):
