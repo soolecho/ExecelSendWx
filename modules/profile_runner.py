@@ -25,6 +25,52 @@ from modules.wps_cloud import (
 )
 
 
+# 联系人映射多值分隔符（与 gui._split_rm_values 保持一致）
+_RM_SEPARATORS = ("/", ";", "、", "，", ",")
+
+
+def _split_rm_values(raw):
+    """按 / ; 、 ， , 拆分多值，去空白和空串。"""
+    if not raw:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+    for sep in _RM_SEPARATORS:
+        text = text.replace(sep, "\n")
+    return [s.strip() for s in text.splitlines() if s.strip()]
+
+
+def _load_mappings_from_file(path, log):
+    """从映射表文件读取两列 → list[{source_value, recipients}]。
+
+    文件两列：A=筛选值（可多值分隔），B=接收人（可多值分隔）。
+    读取失败返回 None，调用方用配置里的快照 mappings 兜底。
+    """
+    try:
+        names = read_sheet_names(path, log_fn=log)
+        if not names:
+            log(f"⚠ 映射表无工作表: {path}")
+            return None
+        rows = read_one_sheet(path, names[0], log_fn=log)
+    except Exception as exc:
+        log(f"⚠ 读取映射表失败，使用配置快照: {exc}")
+        return None
+    if not rows:
+        return None
+    merged = {}
+    for row in rows:
+        if not row or len(row) < 2:
+            continue
+        srcs = _split_rm_values(row[0])
+        recips = _split_rm_values(row[1])
+        if not srcs or not recips:
+            continue
+        for s in srcs:
+            merged[s] = list(recips)
+    return [{"source_value": s, "recipients": r} for s, r in merged.items()]
+
+
 class ProfilePrepareError(Exception):
     """配置无法执行（文件缺失/列不匹配/数据为空等）。"""
 
@@ -207,7 +253,16 @@ def prepare_profile(profile, log_fn=None):
         mapping_enabled = bool(mapping_cfg.get("enabled", False))
         value_to_recipients = {}
         if mapping_enabled:
-            for m in (mapping_cfg.get("mappings") or []):
+            mappings = list(mapping_cfg.get("mappings") or [])
+            # 关联了映射表文件 → 发送前自动读取最新内容，
+            # 用户改了文件不用手动"导入表格"再保存配置
+            mapping_file = str(mapping_cfg.get("mapping_file", "") or "").strip()
+            if mapping_file and os.path.isfile(mapping_file):
+                fresh = _load_mappings_from_file(mapping_file, log)
+                if fresh:
+                    mappings = fresh
+                    log(f"已从关联文件自动加载 {len(mappings)} 条映射: {mapping_file}")
+            for m in mappings:
                 src = str(m.get("source_value", "") or "").strip()
                 recips_raw = m.get("recipients") or []
                 if not isinstance(recips_raw, list):

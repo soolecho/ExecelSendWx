@@ -2972,19 +2972,17 @@ class TableFilterTab(QWidget):
             QMessageBox.critical(self, "导入失败", f"缺少必要模块: {exc}")
             return
 
+        # read_one_sheet 对 sheet_name=None 会返回 None（None 不在 sheet 列表里），
+        # 必须先取 sheet 名称列表，再显式指定第一个 sheet 读取
         try:
-            rows = read_one_sheet(path, sheet_name=None, log_fn=self.log)
-        except TypeError:
-            # read_one_sheet 签名可能要求显式 sheet_name
-            try:
-                names = read_sheet_names(path, log_fn=self.log)
-                sheet_name = names[0] if names else None
-                rows = read_one_sheet(path, sheet_name, log_fn=self.log)
-            except Exception as exc:
+            names = read_sheet_names(path, log_fn=self.log)
+            if not names:
                 QMessageBox.warning(
-                    self, "导入失败", f"读取映射表失败:\n{path}\n\n错误: {exc}"
+                    self, "导入失败",
+                    "无法读取工作表名称，文件可能为空或格式不支持"
                 )
                 return
+            rows = read_one_sheet(path, names[0], log_fn=self.log)
         except Exception as exc:
             QMessageBox.warning(
                 self, "导入失败", f"读取映射表失败:\n{path}\n\n错误: {exc}"
@@ -3848,6 +3846,24 @@ class TableFilterTab(QWidget):
         value_to_recipients = rm_cfg.get("value_to_recipients", {})
         default_recipient = rm_cfg.get("default_recipient", "")
         mapping_enabled = rm_cfg.get("enabled", False)
+        # 关联了映射表文件 → 发送前自动读取最新内容，
+        # 用户改了文件不用手动"导入表格"
+        if mapping_enabled:
+            mapping_file = str(rm_cfg.get("mapping_file", "") or "").strip()
+            if mapping_file and os.path.isfile(mapping_file):
+                try:
+                    from modules.profile_runner import _load_mappings_from_file
+                    fresh = _load_mappings_from_file(mapping_file, self.log)
+                    if fresh:
+                        value_to_recipients = {
+                            m["source_value"]: list(m["recipients"])
+                            for m in fresh
+                        }
+                        self.log(
+                            f"已从关联文件自动加载 {len(value_to_recipients)} 条映射: {mapping_file}"
+                        )
+                except Exception as exc:
+                    self.log(f"⚠ 自动读取映射表失败，使用 UI 当前数据: {exc}")
 
         for item in selected_items:
             name = item.text()
