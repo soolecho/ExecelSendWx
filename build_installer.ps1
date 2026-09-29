@@ -116,6 +116,26 @@ Export-Certificate -Cert $certificate -FilePath $publicCert -Type CERT -Force | 
 
 $hash = Get-FileHash $installer.FullName -Algorithm SHA256
 $sig = Get-AuthenticodeSignature $installer.FullName
+
+# 生成 GitHub Release 校验清单（供客户端自动更新时校验 SHA256）。
+# 注意：文件名必须与 GitHub 发布资产名（ASCII）一致，哈希取签名后的最终安装包。
+$verMatch = [regex]::Match($installer.Name, '_v(\d+\.\d+\.\d+)\.exe$')
+if ($verMatch.Success) {
+    $pubVersion = $verMatch.Groups[1].Value
+    $sumsPath = Join-Path $outputDir "SHA256SUMS.txt"
+    $sumsLine = "{0}  ExcelSendWx_v{1}_setup.exe" -f $hash.Hash.ToLower(), $pubVersion
+    [IO.File]::WriteAllText($sumsPath, $sumsLine + "`n", [Text.Encoding]::ASCII)
+    Write-Tee ("SHA256SUMS: {0}" -f $sumsLine)
+
+    # 同时复制一份 ASCII 文件名的安装包（GitHub 发布资产名），
+    # 自动更新按此名称下载；中文名只保留在本地输出。
+    $asciiName = "ExcelSendWx_v{0}_setup.exe" -f $pubVersion
+    $asciiPath = Join-Path $outputDir $asciiName
+    Copy-Item $installer.FullName $asciiPath -Force
+    Write-Tee ("Publish asset (ASCII copy): {0}" -f $asciiPath)
+} else {
+    Write-Tee "WARN: cannot parse version from installer name, SHA256SUMS not generated"
+}
 Write-Tee ""
 Write-Tee "Installer build completed."
 Write-Tee ("Path: {0}" -f $installer.FullName)

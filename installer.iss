@@ -1,5 +1,5 @@
 #define MyAppName "表格自动发送By春风予Lu"
-#define MyAppVersion "1.3.0"
+#define MyAppVersion "1.3.1"
 #define MyAppPublisher "春风予Lu"
 #define MyAppURL "https://github.com/soolecho/ExecelSendWx"
 #define MyAppExeName "表格自动发送By春风予Lu.exe"
@@ -83,4 +83,25 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "ExcelSendWx"; Flags: deletevalue; Tasks: not autostart
 
 [Run]
+; 交互式安装：最后一页勾选后启动（静默安装时跳过）
 Filename: "{app}\{#MyAppExeName}"; Description: "运行 {#MyShortcutName}"; Flags: nowait postinstall skipifsilent
+; 在线更新场景：程序以 /SILENT 启动安装器前会在 %%TEMP%% 写重启标记文件，
+; 检测到标记时静默安装结束后自动启动新版（交互安装不受影响）
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait; Check: ShouldLaunchAfterSilent
+
+[Code]
+function ShouldLaunchAfterSilent: Boolean;
+var
+  FlagPath: String;
+begin
+  Result := False;
+  if WizardSilent then
+  begin
+    FlagPath := AddBackslash(GetEnv('TEMP')) + 'excel_send_wx_restart.flag';
+    if FileExists(FlagPath) then
+    begin
+      DeleteFile(FlagPath);
+      Result := True;
+    end;
+  end;
+end;

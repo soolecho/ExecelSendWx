@@ -45,6 +45,13 @@ from modules.wps_cloud import (
     cleanup_temp_file,
     read_all_sheets,
 )
+from modules import updater
+from modules.updater import (
+    APP_VERSION,
+    UpdateCheckWorker,
+    UpdateDialog,
+    UpdateState,
+)
 
 
 APP_TITLE = "表格自动发送By春风予Lu"
@@ -3778,7 +3785,7 @@ class ToastNotification(QFrame):
     @classmethod
     def show_toast(cls, title: str, message: str, *,
                     success: bool = True, duration: int = 8000,
-                    parent=None):
+                    parent=None, on_click=None):
         """弹出通知窗口。
 
         Args:
@@ -3787,13 +3794,15 @@ class ToastNotification(QFrame):
             success: True=绿色成功图标，False=红色错误图标
             duration: 成功通知自动消失毫秒数；失败通知强制不自动隐藏
             parent: 父 QWidget（点击通知时把它带到前台，通常传 MainWindow）
+            on_click: 可选点击回调；提供时点击通知执行回调（由回调负责
+                关闭通知和后续动作），不提供则保持默认“带到前台并关闭”
         """
         try:
             # 有发送失败的通知常驻，必须手动关闭
             if not success:
                 duration = 0
             toast = cls(title, message, success=success,
-                        duration=duration, parent=parent)
+                        duration=duration, parent=parent, on_click=on_click)
             cls._active_instances.append(toast)
             toast.destroyed.connect(
                 lambda *_: cls._active_instances.remove(toast)
@@ -3808,9 +3817,11 @@ class ToastNotification(QFrame):
 
     def __init__(self, title: str, message: str, *,
                  success: bool = True, duration: int = 8000,
-                 parent=None):
+                 parent=None, on_click=None):
         # parent 用于点击时把主窗口带到前台；不强设为 Qt 父对象，避免窗口嵌入
         self._main_window = parent
+        # 自定义点击回调（如“发现新版本”点击后打开更新对话框）
+        self._on_click = on_click
         super().__init__(None)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
@@ -3974,8 +3985,14 @@ class ToastNotification(QFrame):
         self._fade_out_anim.start()
 
     def mousePressEvent(self, event):
-        """点击通知区域：把主窗口带到前台并关闭通知。"""
+        """点击通知区域：有自定义回调走回调；默认把主窗口带到前台并关闭。"""
         if event.button() == Qt.MouseButton.LeftButton:
+            if self._on_click is not None:
+                try:
+                    self._on_click()
+                except Exception:
+                    logger.exception("Toast 点击回调执行失败")
+                return
             self._bring_main_to_front()
             self.close()
 
@@ -5395,6 +5412,16 @@ class MainWindow(QMainWindow):
 
         self.init_ui()
         self.init_tray()
+
+        # ---- 在线更新状态 ----
+        # 首次运行检查一次 + 长运行每满 24 小时检查一次；
+        # 同一新版本自动提醒只弹一次，用户可跳过；手动检查不受限制
+        self._update_state = UpdateState.load()
+        self._update_check_worker: Optional[UpdateCheckWorker] = None
+        self._update_dialog: Optional[UpdateDialog] = None
+        self._update_auto_timer = QTimer(self)
+        self._update_auto_timer.setInterval(updater.AUTO_TICK_MS)
+        self._update_auto_timer.timeout.connect(self._on_update_timer_tick)
         # 安全护栏：offscreen（自动化测试/无头环境）绝不启动真实调度器，
         # 否则测试进程会加载并 mark_fired 用户真实的定时任务，导致当天任务被抢占
         if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
@@ -5494,6 +5521,13 @@ class MainWindow(QMainWindow):
         if not self._startup_fit_done:
             self._startup_fit_done = True
             QTimer.singleShot(0, lambda: self.fit_to_content(True))
+            # 首次运行：延迟后自动检查一次更新（避开启动高峰）；
+            # offscreen 测试环境不发起真实网络请求
+            if os.environ.get("QT_QPA_PLATFORM", "").lower() != "offscreen":
+                QTimer.singleShot(
+                    updater.STARTUP_CHECK_DELAY_MS,
+                    lambda: self._start_update_check(manual=False))
+                self._update_auto_timer.start()
 
     def _animate_window_geometry(self, target: QRect) -> None:
         """平滑动画过渡到目标窗口几何（折叠/展开时的果冻弹性跟随）。"""
@@ -6268,6 +6302,11 @@ class MainWindow(QMainWindow):
         self.tray_menu.addAction(self.autostart_action)
         self.tray_menu.addSeparator()
 
+        self.check_update_action = QAction("检查更新", self)
+        self.check_update_action.triggered.connect(self._manual_check_update)
+        self.tray_menu.addAction(self.check_update_action)
+        self.tray_menu.addSeparator()
+
         self.exit_action = QAction("退出程序", self)
         self.exit_action.triggered.connect(self.request_exit)
         self.tray_menu.addAction(self.exit_action)
@@ -6291,6 +6330,127 @@ class MainWindow(QMainWindow):
             self.autostart_action.setChecked(not checked)
             self.autostart_action.blockSignals(False)
             QMessageBox.warning(self, "设置失败", "无法修改开机自启动设置，请检查权限。")
+
+    # ------------------------- 在线更新 -------------------------
+    def _manual_check_update(self):
+        """托盘菜单“检查更新”：手动强制检查，不受间隔/跳过状态限制。"""
+        self._start_update_check(manual=True)
+
+    def _on_update_timer_tick(self):
+        """长运行期间每小时 tick：距上次成功检查满 24 小时则自动检查。"""
+        try:
+            if self._update_state.should_periodic_check():
+                self._start_update_check(manual=False)
+        except Exception:
+            logger.exception("定时更新检查 tick 异常")
+
+    def _start_update_check(self, manual: bool):
+        # 同一时刻只允许一个检查线程
+        if self._update_check_worker is not None \
+                and self._update_check_worker.isRunning():
+            if manual:
+                QMessageBox.information(self, "检查更新", "正在检查更新，请稍候…")
+            return
+        if manual:
+            self.log(f"[更新] 正在检查更新（当前版本 v{APP_VERSION}）…")
+            self.check_update_action.setEnabled(False)
+
+        worker = UpdateCheckWorker(
+            log_fn=self._post_schedule_log_from_worker, parent=self)
+        # 信号跨线程自动排队到主线程；槽内只做 GUI/状态操作
+        worker.succeeded.connect(
+            lambda info: self._on_update_check_result(info, manual))
+        worker.failed.connect(
+            lambda msg: self._on_update_check_failed(msg, manual))
+        worker.finished.connect(self._on_update_check_finished)
+        self._update_check_worker = worker
+        worker.start()
+
+    def _on_update_check_finished(self):
+        """检查线程结束后的统一清理（成功/失败都会到这里）。"""
+        try:
+            self.check_update_action.setEnabled(True)
+        except Exception:
+            pass
+        worker = self._update_check_worker
+        self._update_check_worker = None
+        if worker is not None:
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+
+    def _on_update_check_result(self, info, manual: bool):
+        # 成功拿到服务端结果（无论有无新版）都算一次成功检查
+        self._update_state.mark_checked()
+        if info is None:
+            if manual:
+                QMessageBox.information(
+                    self, "检查更新", f"当前已是最新版本 v{APP_VERSION}。")
+            else:
+                self.log(f"[更新] 已是最新版本 v{APP_VERSION}")
+            return
+
+        if not manual:
+            # 自动检查：跳过的版本、已提醒过的版本不再打扰
+            if self._update_state.skipped_version == info.version:
+                self.log(f"[更新] 新版本 v{info.version} 已被跳过，不再提醒")
+                return
+            if self._update_state.last_prompted_version == info.version:
+                return
+            self._update_state.last_prompted_version = info.version
+            self._update_state.save()
+            self._show_update_toast(info)
+        else:
+            self.log(f"[更新] 发现新版本 v{info.version}，请查看更新对话框")
+            self._show_update_dialog(info)
+
+    def _on_update_check_failed(self, msg: str, manual: bool):
+        # 失败不刷新 last_check_at：下个 tick（1 小时后）自动重试
+        self.log(f"[更新] 检查更新失败: {msg}")
+        if manual:
+            QMessageBox.warning(
+                self, "检查更新失败",
+                f"无法连接更新服务器：\n{msg}\n\n"
+                f"请检查网络后重试（将自动尝试 GitHub 直连与国内镜像）。")
+
+    def _show_update_toast(self, info):
+        """自动检查发现新版：轻量 Toast，点击后打开更新对话框。"""
+        def _on_click():
+            try:
+                self.show_main_window()
+            finally:
+                self._show_update_dialog(info)
+
+        ToastNotification.show_toast(
+            f"🔄 发现新版本 v{info.version}",
+            "点击查看更新内容并立即更新",
+            success=True,
+            duration=15000,
+            parent=self,
+            on_click=_on_click,
+        )
+
+    def _show_update_dialog(self, info):
+        """打开（或前置）更新对话框；非模态，不阻断主界面与日志查看。"""
+        existing = self._update_dialog
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        dlg = UpdateDialog(
+            info,
+            self._update_state,
+            is_busy_cb=self._is_other_send_running,
+            log_fn=self.log,
+            parent=self,
+        )
+        self._update_dialog = dlg
+        dlg.finished.connect(lambda *_: setattr(self, "_update_dialog", None)
+                             if self._update_dialog is dlg else None)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
 
     def show_main_window(self):
         if self._closing_requested:
