@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # ============================== 常量 ==============================
 
 # 当前客户端版本（与 installer.iss 的 MyAppVersion 保持一致）
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 
 REPO_OWNER = "soolecho"
 REPO_NAME = "ExecelSendWx"
@@ -110,6 +110,11 @@ AUTO_TICK_MS = 60 * 60 * 1000
 
 # 签名发布者关键词（下载的安装包必须由此主体签名）
 SIGNER_KEYWORD = "春风予Lu"
+# 预置签名证书 SHA1 指纹（CN=春风予Lu 自签名证书）。
+# 自签名证书未导入系统信任链时（用户机器没运行 install_cert.bat），
+# 用指纹比对防伪造：攻击者要伪造签名必须拥有私钥，
+# 仅伪造主体名无法通过——证书指纹是整个证书内容的 SHA1 哈希，必然不同。
+EXPECTED_THUMBPRINT = "191C64E4EC07377CA032878878D0A45F554C8146"
 
 # 静默安装后通知安装器自动重启本程序的 flag 文件
 RESTART_FLAG_NAME = "excel_send_wx_restart.flag"
@@ -420,11 +425,16 @@ def verify_sha256(path: str, expected: str) -> tuple:
 
 
 def verify_authenticode(path: str) -> tuple:
-    """校验 Windows Authenticode 数字签名：必须 Valid 且发布者含春风予Lu。
+    """校验 Windows Authenticode 数字签名。
 
-    使用系统自带 PowerShell 的 Get-AuthenticodeSignature，
-    避免引入额外依赖；仅在下载完成后调用一次。
-    返回 (是否通过, 说明)。
+    判定规则（按顺序）：
+      1) 必须有签名且签名者主体含「春风予Lu」
+      2) 系统已信任（Status=Valid，本机已导入证书）→ 直接通过
+      3) 系统未信任（自签名证书未导入）→ 比对 SignerCertificate.Thumbprint
+         与预置指纹 EXPECTED_THUMBPRINT，匹配即通过
+
+    用 PowerShell 的 Get-AuthenticodeSignature，避免引入额外依赖；
+    仅在下载完成后调用一次。返回 (是否通过, 说明)。
     """
     # 路径经环境变量传递，避免中文文件名（表格自动发送By春风予Lu.exe）
     # 在命令行中遭遇 JSON 转义（\uXXXX）或引号转义问题
@@ -433,7 +443,8 @@ def verify_authenticode(path: str) -> tuple:
         "$s=Get-AuthenticodeSignature -LiteralPath $env:ESW_VERIFY_PATH;"
         "Write-Output ('STATUS=' + $s.Status);"
         "if ($s.SignerCertificate) { "
-        "Write-Output ('SIGNER=' + $s.SignerCertificate.Subject) }"
+        "Write-Output ('SIGNER=' + $s.SignerCertificate.Subject);"
+        "Write-Output ('THUMBPRINT=' + $s.SignerCertificate.Thumbprint) }"
     )
     env = os.environ.copy()
     env["ESW_VERIFY_PATH"] = path
@@ -460,16 +471,39 @@ def verify_authenticode(path: str) -> tuple:
     err = _decode(proc.stderr or b"")
     status = ""
     signer = ""
+    thumbprint = ""
     for line in out.splitlines():
         if line.startswith("STATUS="):
             status = line[7:].strip()
         elif line.startswith("SIGNER="):
             signer = line[7:].strip()
-    if status != "Valid":
-        return False, f"签名状态无效: {status or '未知'}（{err.strip()[:120]}）"
-    if SIGNER_KEYWORD not in signer:
-        return False, f"签名发布者不受信: {signer}"
-    return True, f"数字签名有效，发布者: {signer}"
+        elif line.startswith("THUMBPRINT="):
+            thumbprint = line[11:].strip().upper()
+
+    # 1) 文件未签名 / 签名异常
+    if status in ("NotSigned", "NoSignature", "UnknownError", ""):
+        return False, f"文件未签名或签名异常: {status or '未知'}（{err.strip()[:120]}）"
+
+    # 2) 签名者主体必须含春风予Lu（防伪造主体名）
+    if not signer or SIGNER_KEYWORD not in signer:
+        return False, f"签名发布者不受信: {signer or '（无）'}"
+
+    # 3) 系统已信任（用户运行过 install_cert.bat）→ 直接通过
+    if status == "Valid":
+        return True, f"数字签名有效（系统已信任），发布者: {signer}"
+
+    # 4) 自签名证书未导入系统信任链 → 比对证书指纹防伪造
+    #    攻击者即便伪造 CN=春风予Lu 主体名，证书指纹也必然不同
+    #    （指纹是整个证书内容的 SHA1 哈希）
+    if thumbprint and thumbprint == EXPECTED_THUMBPRINT.upper():
+        return True, (f"数字签名有效（自签名证书指纹匹配），发布者: {signer}"
+                      f"，状态: {status}")
+
+    return False, (
+        f"签名证书指纹不匹配: 期望 {EXPECTED_THUMBPRINT[:16]}…，"
+        f"实际 {thumbprint[:16] + '…' if thumbprint else '（无）'}，"
+        f"状态: {status}"
+    )
 
 
 def installer_dest_path(version: str) -> str:
