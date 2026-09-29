@@ -83,3 +83,6 @@ browser_storage.json
 
 # Nuitka crash reports
 nuitka-crash-report.xml
+
+# Trae IDE local documents (design notes, internal analysis)
+.trae/documents/
