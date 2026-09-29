@@ -12,7 +12,6 @@ import os
 import sys
 import subprocess
 from datetime import datetime
-from concurrent.futures import ProcessPoolExecutor
 
 PROJECT = os.path.dirname(os.path.abspath(__file__))
 os.chdir(PROJECT)
@@ -29,10 +28,47 @@ env["NUITKA_CACHE_DIR"] = os.path.join(PROJECT, "nuitka_cache")
 # 首次编译如果没装 C/C++ 编译器，让 Nuitka 静默自动下载 winlibs
 env.setdefault("NUITKA_NON_INTERACTIVE", "1")
 
-try:
-    workers = ProcessPoolExecutor()._max_workers  # type: ignore[attr-defined]
-except Exception:
-    workers = max(2, (os.cpu_count() or 4) // 2)
+# 编译并发数：cc1 编译大模块时单进程峰值可达 2GB+，jobs 过高会在
+# 多模块并行时 OOM（"cc1.exe: out of memory"）。按可用物理内存估算
+# （每进程预留 2.5GB），并支持 NUITKA_JOBS 环境变量手动覆盖。
+def _decide_jobs():
+    forced = os.environ.get("NUITKA_JOBS", "").strip()
+    cpu = os.cpu_count() or 4
+    avail_gb = float(cpu)
+    try:
+        import ctypes
+
+        class _MemStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = _MemStatus()
+        stat.dwLength = ctypes.sizeof(_MemStatus)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+        # 综合可用物理内存和可用提交内存，取较小值更保险
+        avail_gb = min(stat.ullAvailPhys, stat.ullAvailPageFile) / (1024 ** 3)
+    except Exception:
+        pass
+    if forced:
+        try:
+            return max(1, int(forced)), avail_gb
+        except ValueError:
+            pass
+    by_mem = int(avail_gb // 2.5)
+    return max(1, min(cpu, by_mem)), avail_gb
+
+workers, free_gb = _decide_jobs()
+print(f"[nuitka] jobs={workers} (cpu={os.cpu_count()}, "
+      f"avail_mem~{free_gb:.1f}GB, override via NUITKA_JOBS)", flush=True)
 
 cmd = [
     sys.executable, "-m", "nuitka",
