@@ -32,7 +32,7 @@ from typing import Callable, Optional
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QProgressBar, QTextEdit, QApplication,
+    QProgressBar, QTextEdit, QApplication, QComboBox,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # ============================== 常量 ==============================
 
 # 当前客户端版本（与 installer.iss 的 MyAppVersion 保持一致）
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 
 REPO_OWNER = "soolecho"
 REPO_NAME = "ExecelSendWx"
@@ -50,17 +50,50 @@ REPO = f"{REPO_OWNER}/{REPO_NAME}"
 ASSET_TEMPLATE = "ExcelSendWx_v{version}_setup.exe"
 SUMS_ASSET_NAME = "SHA256SUMS.txt"
 
-# 检查源（按顺序尝试）：GitHub API 直连 → gh-proxy 镜像
-_API_PATH = f"https://api.github.com/repos/{REPO}/releases/latest"
-CHECK_URLS = [
-    _API_PATH,
-    f"https://gh-proxy.org/{_API_PATH}",
+# 下载镜像源（国内加速）：镜像为个人/小团队免费运营，可能随时关停，
+# 因此必须多镜像 + GitHub 直连兜底；安全性由 SHA256 + 签名双校验保证。
+# 元组: (显示名, URL 前缀)；前缀为 DIRECT_KEY 表示 GitHub 直连。
+DIRECT_KEY = "DIRECT"
+MIRROR_OPTIONS = [
+    ("gh-proxy 镜像（推荐）", "https://gh-proxy.org/"),
+    ("ghfast.top 镜像", "https://ghfast.top/"),
+    ("GitHub 直连", DIRECT_KEY),
 ]
 
-# 下载源（按顺序尝试）：GitHub release 直链 → gh-proxy 镜像
-def build_download_urls(tag: str, asset: str) -> list:
+_API_PATH = f"https://api.github.com/repos/{REPO}/releases/latest"
+
+
+def _ordered_mirror_urls(direct_url: str, preferred: str = "") -> list:
+    """把 GitHub 直链展开成按序尝试列表。
+
+    preferred 取值：
+      ""        → 默认：镜像优先，直连兜底
+      DIRECT_KEY→ 用户显式选直连：直连第一，镜像兜底
+      <前缀>    → 该镜像第一 → 其余镜像 → 直连兜底
+    """
+    prefixes = [p for _n, p in MIRROR_OPTIONS if p != DIRECT_KEY]
+    direct_first = (preferred == DIRECT_KEY)
+    ordered = []
+    if not direct_first and preferred in prefixes:
+        ordered.append(preferred)
+    ordered.extend(p for p in prefixes if p != preferred)
+    urls = [f"{p}{direct_url}" for p in ordered]
+    if direct_first:
+        urls.insert(0, direct_url)
+    else:
+        urls.append(direct_url)
+    return urls
+
+
+def build_check_urls(preferred_prefix: str = "") -> list:
+    """检查源：默认镜像优先，GitHub 直连兜底；用户可选直连优先。"""
+    return _ordered_mirror_urls(_API_PATH, preferred_prefix)
+
+
+# 下载源（按顺序尝试）：默认镜像优先，GitHub 直连兜底；用户可选直连优先
+def build_download_urls(tag: str, asset: str, preferred_prefix: str = "") -> list:
     direct = (f"https://github.com/{REPO}/releases/download/{tag}/{asset}")
-    return [direct, f"https://gh-proxy.org/{direct}"]
+    return _ordered_mirror_urls(direct, preferred_prefix)
 
 # 网络参数
 CHECK_TIMEOUT = 10          # 检查接口超时（秒/源）
@@ -128,6 +161,7 @@ class UpdateState:
     last_check_at: str = ""          # ISO8601 本地时间
     last_prompted_version: str = ""  # 已自动提醒过的版本（同版本不重复打扰）
     skipped_version: str = ""        # 用户手动跳过的版本
+    preferred_mirror: str = ""       # 下载镜像 URL 前缀；""=默认镜像优先，DIRECT_KEY=直连优先
 
     @classmethod
     def _state_path(cls) -> str:
@@ -148,6 +182,7 @@ class UpdateState:
                 last_check_at=str(data.get("last_check_at", "")),
                 last_prompted_version=str(data.get("last_prompted_version", "")),
                 skipped_version=str(data.get("skipped_version", "")),
+                preferred_mirror=str(data.get("preferred_mirror", "")),
             )
         except (OSError, ValueError):
             return cls()
@@ -213,7 +248,13 @@ def _http_json(url: str, timeout: int, log_fn: Optional[Callable] = None):
         raise UpdateCheckError(str(exc)) from exc
 
 
-def _parse_release(data: dict, log_fn: Optional[Callable] = None) -> Optional[UpdateInfo]:
+def _mirrorize(url: str, preferred_prefix: str = "") -> list:
+    """把一个 GitHub 直链 URL 展开成按序尝试序列（与下载源同一套规则）。"""
+    return _ordered_mirror_urls(url, preferred_prefix)
+
+
+def _parse_release(data: dict, log_fn: Optional[Callable] = None,
+                   preferred_mirror: str = "") -> Optional[UpdateInfo]:
     """从 GitHub release API 响应解析更新信息；无有效安装包资产返回 None。"""
     if data.get("draft") or data.get("prerelease"):
         return None
@@ -246,16 +287,22 @@ def _parse_release(data: dict, log_fn: Optional[Callable] = None) -> Optional[Up
     sums = next((a for a in assets
                  if str(a.get("name", "")).upper() == SUMS_ASSET_NAME.upper()), None)
     if sums is not None:
-        try:
-            with _http_open(str(sums["browser_download_url"]), CHECK_TIMEOUT) as r:
-                content = r.read().decode("utf-8", errors="replace")
-            for line in content.splitlines():
-                parts = line.split()
-                if len(parts) >= 2 and parts[1].lower() == asset_name.lower():
-                    sha256 = parts[0].lower()
-                    break
-        except Exception:
-            logger.exception("[更新] SHA256SUMS 解析失败（将仅依赖签名校验）")
+        sums_urls = _mirrorize(str(sums["browser_download_url"]), preferred_mirror)
+        for sums_url in sums_urls:
+            try:
+                with _http_open(sums_url, CHECK_TIMEOUT) as r:
+                    content = r.read().decode("utf-8", errors="replace")
+                for line in content.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1].lower() == asset_name.lower():
+                        sha256 = parts[0].lower()
+                        break
+                break  # 下载成功即停（即使没匹配到当前资产的行）
+            except Exception:
+                logger.warning("[更新] SHA256SUMS 下载失败: %s", sums_url)
+                continue
+        if not sha256:
+            logger.warning("[更新] SHA256SUMS 未取到哈希（将仅依赖签名校验）")
 
     return UpdateInfo(
         version=version,
@@ -264,19 +311,20 @@ def _parse_release(data: dict, log_fn: Optional[Callable] = None) -> Optional[Up
         release_notes=str(data.get("body", "") or ""),
         asset_name=asset_name,
         size=int(setup.get("size", 0) or 0),
-        download_urls=build_download_urls(tag, asset_name),
+        download_urls=build_download_urls(tag, asset_name, preferred_mirror),
         sha256=sha256,
         published_at=str(data.get("published_at", "") or "")[:10],
     )
 
 
-def check_for_update(log_fn: Optional[Callable] = None) -> Optional[UpdateInfo]:
+def check_for_update(log_fn: Optional[Callable] = None,
+                     preferred_mirror: str = "") -> Optional[UpdateInfo]:
     """检查是否有新版本。返回 None 表示已是最新；失败抛 UpdateCheckError。"""
     last_error = None
-    for url in CHECK_URLS:
+    for url in build_check_urls(preferred_mirror):
         try:
             data = _http_json(url, CHECK_TIMEOUT, log_fn)
-            info = _parse_release(data, log_fn)
+            info = _parse_release(data, log_fn, preferred_mirror)
             if info is None:
                 if log_fn:
                     try:
@@ -475,13 +523,15 @@ class UpdateCheckWorker(QThread):
     succeeded = pyqtSignal(object)
     failed = pyqtSignal(str)
 
-    def __init__(self, log_fn: Optional[Callable] = None, parent=None):
+    def __init__(self, log_fn: Optional[Callable] = None, parent=None,
+                 preferred_mirror: str = ""):
         super().__init__(parent)
         self._log_fn = log_fn
+        self._preferred_mirror = preferred_mirror
 
     def run(self):
         try:
-            info = check_for_update(self._log_fn)
+            info = check_for_update(self._log_fn, self._preferred_mirror)
             self.succeeded.emit(info)
         except UpdateError as exc:
             self.failed.emit(str(exc))
@@ -595,6 +645,25 @@ class UpdateDialog(QDialog):
         self.progress.setTextVisible(True)
         layout.addWidget(self.progress)
 
+        # 下载源选择：镜像优先可显著加速国内下载；选择持久化，
+        # 下载失败时其余镜像与 GitHub 直连会自动兜底
+        mirror_row = QHBoxLayout()
+        mirror_row.addWidget(QLabel("下载源："))
+        self.mirror_combo = QComboBox()
+        for name, prefix in MIRROR_OPTIONS:
+            self.mirror_combo.addItem(name, prefix)
+        saved_idx = self.mirror_combo.findData(self.state.preferred_mirror)
+        self.mirror_combo.setCurrentIndex(saved_idx if saved_idx >= 0 else 0)
+        self.mirror_combo.setToolTip(
+            "镜像下载通常比 GitHub 直连快很多；\n"
+            "所选源失败时会自动尝试其余镜像与 GitHub 直连兜底。"
+        )
+        self.mirror_combo.currentIndexChanged.connect(self._on_mirror_changed)
+        mirror_row.addWidget(self.mirror_combo, 1)
+        layout.addLayout(mirror_row)
+        # 应用一次保存的偏好，确保 download_urls 顺序与下拉框一致
+        self._apply_mirror(self.mirror_combo.currentData() or "", persist=False)
+
         self.status_label = QLabel("")
         self.status_label.setWordWrap(True)
         self.status_label.setStyleSheet("color: #c0392b;")
@@ -623,6 +692,18 @@ class UpdateDialog(QDialog):
         self.update_btn.setEnabled(enabled)
         self.skip_btn.setEnabled(enabled)
         self.later_btn.setEnabled(enabled)
+        self.mirror_combo.setEnabled(enabled)
+
+    def _on_mirror_changed(self, _idx: int):
+        self._apply_mirror(self.mirror_combo.currentData() or "", persist=True)
+
+    def _apply_mirror(self, prefix: str, persist: bool):
+        """按所选镜像重排下载源列表；persist=True 时写入状态文件。"""
+        self.info.download_urls = build_download_urls(
+            self.info.tag_name, self.info.asset_name, prefix)
+        if persist and prefix != self.state.preferred_mirror:
+            self.state.preferred_mirror = prefix
+            self.state.save()
 
     def _on_skip(self):
         self.state.skipped_version = self.info.version

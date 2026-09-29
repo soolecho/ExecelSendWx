@@ -2102,6 +2102,7 @@ class TableFilterTab(QWidget):
             config_group, url_group, filter_group,
             persons_group, preview_group,
             send_group, progress_group, log_group, control_group,
+            recipient_group,
         ]
         # 保存各面板引用（自动折叠/发送时自动切换视图用）
         self.config_group = config_group
@@ -6718,7 +6719,8 @@ class MainWindow(QMainWindow):
             self.check_update_action.setEnabled(False)
 
         worker = UpdateCheckWorker(
-            log_fn=self._post_schedule_log_from_worker, parent=self)
+            log_fn=self._post_schedule_log_from_worker, parent=self,
+            preferred_mirror=UpdateState.load().preferred_mirror)
         # 信号跨线程自动排队到主线程；槽内只做 GUI/状态操作
         worker.succeeded.connect(
             lambda info: self._on_update_check_result(info, manual))

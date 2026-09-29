@@ -1,11 +1,20 @@
-# 表格自动发送By春风予Lu
+﻿# 表格自动发送By春风予Lu
 
 基于 PyQt6 开发的 Excel 表格数据自动提取并通过微信发送的自动化工具，
 内置定时调度器、托盘驻留、单实例锁、Nuitka standalone 打包与
 Inno Setup + Authenticode 自签名安装包发布流程。
 
-当前版本：**v1.3.2**（春风予Lu 自签名 SHA256 证书，指纹
+当前版本：**v1.3.3**（春风予Lu 自签名 SHA256 证书，指纹
 `191C64E4EC07377CA032878D0A45F554C8146`）。
+
+## v1.3.3 更新内容
+
+- **更新下载加速**：更新检查与安装包下载改为「镜像优先、GitHub 直连
+  兜底」，默认经 gh-proxy / ghfast.top 国内镜像下载，速度显著提升；
+  任一源失败自动按序切换其余源，安全性仍由 SHA256 + 数字签名双校验保证
+- **更新对话框新增下载源选择**：可手动在 gh-proxy 镜像 / ghfast.top
+  镜像 / GitHub 直连之间切换，选择持久化保存，下次更新自动沿用
+- **修复**：点击发送后「联系人映射」面板未随其他面板自动折叠的问题
 
 ## v1.3.2 更新内容
 
@@ -152,8 +161,8 @@ python build_nuitka_now.py
 
 脚本会自动执行两阶段编译（生成未签名 uninstaller → 签名 → 重编 →
 签名安装包），日志写入 `logs/build_installer_YYYYMMDD_HHMMSS.log`，
-最终产物在 `installer_output/表格自动发送安装包_v1.3.2.exe`；
-同目录另生成自动更新发布用的 ASCII 名副本 `ExcelSendWx_v1.3.2_setup.exe`
+最终产物在 `installer_output/表格自动发送安装包_v1.3.3.exe`；
+同目录另生成自动更新发布用的 ASCII 名副本 `ExcelSendWx_v1.3.3_setup.exe`
 与 SHA256 校验清单 `SHA256SUMS.txt`（后两者需一并上传到 GitHub Release）。
 
 签名使用 `CurrentUser\My` 中指纹为
@@ -284,7 +293,7 @@ wxauto/
 5. Nuitka 版本必须携带整个 `main.dist` 目录运行
 6. 点击窗口右上角关闭按钮只会隐藏到托盘
 7. 完全退出程序请右键托盘图标并选择「退出程序」
-8. 安装包通过 `表格自动发送安装包_v1.3.2.exe` 安装，可在安装时勾选
+8. 安装包通过 `表格自动发送安装包_v1.3.3.exe` 安装，可在安装时勾选
    「开机自启动」，安装后通过控制面板卸载；卸载器同样已签名
 
 ## License
