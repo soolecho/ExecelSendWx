@@ -102,11 +102,12 @@ class MonitorWorker(QThread):
         try:
             outcome = self._process_file(task, latest, log_prefix)
             if outcome is None:
-                pass  # 无新增/文件未变 → 跳过：既不算成功也不算失败（避免"无新增"误报发送失败）
-            else:
-                # outcome = (成功接收人数, 失败接收人数)
-                success += outcome[0]
-                failed += outcome[1]
+                # 无新增/文件未变：_process_file 已打出原因日志，不发完成信号
+                # （避免每轮「成功 0 / 失败 0」噪音，无新增不涉及发送结果）
+                return
+            # outcome = (成功接收人数, 失败接收人数)
+            success += outcome[0]
+            failed += outcome[1]
         except Exception as exc:
             failed += 1
             logger.exception("监控处理文件失败 %s", latest)
@@ -158,10 +159,15 @@ class MonitorWorker(QThread):
                 headers, rows, prev_keys, key_columns
             )
             if not new_rows:
-                return None  # 相对上一份无新增，跳过（不算成功也不算失败）
+                # 相对上一份无新增：打日志说明原因，避免"无新增"被误认为发送失败
+                cols = "、".join(key_columns) if key_columns else "全部列"
+                self.emit(f"{log_prefix} 任务「{task.name}」文件「{name}」无新增数据：与上一份文件对比（对比列: {cols}）无新行，跳过")
+                return None  # 无新增，跳过（不算成功也不算失败）
         else:
             # 关闭对比：文件未见过/指纹变 → 视为新文件
             if not monitor_engine.is_new_file(task.seen_files, fp):
+                # 文件未变化：打日志说明原因，避免被误认为发送失败
+                self.emit(f"{log_prefix} 任务「{task.name}」文件「{name}」文件未变化（大小/修改时间相同），跳过")
                 return None  # 文件未变化，无新内容，跳过（不算失败）
             new_keys = monitor_engine.build_baseline(headers, rows, key_columns)
 
