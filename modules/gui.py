@@ -6463,48 +6463,35 @@ class MonitorTab(QWidget):
         self._col_combos.setdefault(id(list_widget), combo)
 
     def _selected_cols(self, list_widget) -> List[str]:
-        return [list_widget.item(i).text() for i in range(list_widget.count())
-                if list_widget.item(i).isSelected()]
+        """返回某个列设置列表的全部项。
+
+        自 v1.4.2 后列表体只放用户显式添加/配置的列，故保存一律取列表全部内容，
+        不再依赖 isSelected() 选中态——避免三个列表内容相同导致选中态互相污染串台。
+        """
+        return [list_widget.item(i).text() for i in range(list_widget.count())]
 
     def _fill_columns_list(self, list_widget, headers, selected):
         """填充某个列设置列表。
 
-        关键：已配置/选中的列按用户录入顺序排在顶部，其余未选中表头随后，
-        保证保存后重载不改变用户设定的列顺序（_selected_cols 按列表顺序返回）。
-        headers 传入为空时仅显示已配置列（避免与其它列表串台成同一组列）。
+        关键设计：列表体只显示用户显式添加/已配置的列（保序去重），
+        不再把全部表头塞进列表体。表头仅作为各列表下拉候选供用户挑选添加
+        （在 _add_col_input_row / _on_read_headers 里维护）。这样三个列表
+        各自只含自己配置的列，天然隔离、不会串台，且顺序 = 用户录入顺序。
+        headers 参数保留仅为兼容调用点，不再用于列表体填充。
         """
-        selected_set = set()
-        selected_ordered = []
+        seen = set()
+        order = []
         for c in (selected or []):
             cs = str(c).strip()
-            if cs and cs not in selected_set:
-                selected_set.add(cs)
-                selected_ordered.append(cs)
-        # 表头候选去重保序
-        head = []
-        seen_h = set()
-        for h in headers:
-            hs = str(h).strip()
-            if hs and hs not in seen_h:
-                seen_h.add(hs)
-                head.append(hs)
-        # 显示顺序 = 已配置列(保序)在前，其余未选中表头随后
-        order = []
-        seen = set()
-        for c in selected_ordered:
-            if c not in seen:
-                seen.add(c)
-                order.append(c)
-        for h in head:
-            if h not in seen:
-                seen.add(h)
-                order.append(h)
+            if cs and cs not in seen:
+                seen.add(cs)
+                order.append(cs)
         list_widget.blockSignals(True)
         list_widget.clear()
         for name in order:
             it = QListWidgetItem(name)
             list_widget.addItem(it)
-            it.setSelected(name in selected_set)
+            it.setSelected(True)
         list_widget.blockSignals(False)
 
     def _current_headers(self) -> List[str]:
