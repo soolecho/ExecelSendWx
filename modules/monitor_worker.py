@@ -101,10 +101,12 @@ class MonitorWorker(QThread):
         failed = 0
         try:
             outcome = self._process_file(task, latest, log_prefix)
-            if outcome:
-                success += 1
+            if outcome is None:
+                pass  # 无新增/文件未变 → 跳过：既不算成功也不算失败（避免"无新增"误报发送失败）
             else:
-                failed += 1
+                # outcome = (成功接收人数, 失败接收人数)
+                success += outcome[0]
+                failed += outcome[1]
         except Exception as exc:
             failed += 1
             logger.exception("监控处理文件失败 %s", latest)
@@ -156,11 +158,11 @@ class MonitorWorker(QThread):
                 headers, rows, prev_keys, key_columns
             )
             if not new_rows:
-                return False  # 相对上一份无新增，跳过
+                return None  # 相对上一份无新增，跳过（不算成功也不算失败）
         else:
             # 关闭对比：文件未见过/指纹变 → 视为新文件
             if not monitor_engine.is_new_file(task.seen_files, fp):
-                return False
+                return None  # 文件未变化，无新内容，跳过（不算失败）
             new_keys = monitor_engine.build_baseline(headers, rows, key_columns)
 
         # 有新内容 → 清洗/校验 → 按提取列裁剪 → 生成并推送
@@ -195,7 +197,8 @@ class MonitorWorker(QThread):
 
         self.emit(f"{log_prefix} 任务「{task.name}」文件「{name}」检出新增 {len(new_rows)} 条，清洗后保留 {len(clean_rows)} 条，开始推送…")
 
-        delivered = 0
+        msg_delivered = 0
+        msg_failed = 0
         for person in task.recipients:
             if self._stop or not person or not clean_rows:
                 continue
@@ -206,8 +209,9 @@ class MonitorWorker(QThread):
                     self._send_file(person, png_path, task, log_prefix)
                 if out_file and os.path.exists(out_file):
                     self._send_file(person, out_file, task, log_prefix)
-                delivered += 1
+                msg_delivered += 1
             except Exception as exc:
+                msg_failed += 1
                 logger.exception("推送失败 %s", person)
                 self.emit(f"{log_prefix} → 「{person}」推送失败: {exc}")
 
@@ -227,11 +231,13 @@ class MonitorWorker(QThread):
                     os.remove(tmp)
                 except OSError:
                     pass
-        if delivered:
-            self.emit(f"{log_prefix} 任务「{task.name}」推送完成，接收人 {delivered} 个")
+        if msg_delivered:
+            self.emit(f"{log_prefix} 任务「{task.name}」推送完成，接收人 {msg_delivered} 个")
+        elif msg_failed:
+            self.emit(f"{log_prefix} 任务「{task.name}」所有接收人推送均失败")
         else:
             self.emit(f"{log_prefix} 任务「{task.name}」无可用接收人，跳过发送；已记录处理进度")
-        return True
+        return (msg_delivered, msg_failed)
 
     def _send_text(self, person: str, text: str, task: MonitorTask, prefix: str) -> None:
         sender = WeChatSender.shared_instance()
