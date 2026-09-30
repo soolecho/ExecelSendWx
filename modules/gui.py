@@ -1,5 +1,6 @@
 import sys
 import os
+import glob
 import logging
 import threading
 from typing import List, Optional, Set, Dict, Tuple, Any
@@ -36,6 +37,8 @@ from modules.workstation_guard import (
     WorkstationGuard,
     is_workstation_locked,
 )
+from modules.monitor_config import MonitorManager, MonitorTask
+from modules.monitor_worker import MonitorWorker
 from modules import wps_cloud
 from modules.wps_cloud import (
     WpsOAuthStore,
@@ -5891,6 +5894,778 @@ def _parse_recipients(text: str) -> List[str]:
     return recipients
 
 
+class MonitorTab(QWidget):
+    """📡 监控 标签页：本地目录监控 → 筛选/增量对比 → 推送微信。
+
+    任务列表(左) + 编辑表单(右，芯片排面板)。持有一个常驻轮询 MonitorWorker，
+    可手动"立即执行一次"。日志经信号投递回主线程写入面板与 app.log。
+    """
+
+    # worker 线程日志 → 信号投递回主线程再写面板（遵循 ScheduleTab 跨线程惯例）
+    _worker_log_signal = pyqtSignal(str)
+
+    def __init__(self, store: MonitorManager, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.tasks: Dict[str, MonitorTask] = {}
+        self.current_task_id: Optional[str] = None
+        self._one_shot_worker: Optional[MonitorWorker] = None
+        self._poll_worker: Optional[MonitorWorker] = None
+        self._log_max_applied = False
+        self._loading_form = False
+        # 接收 MainWindow 的统一日志回调，外部赋值（复用定时页主面板汇总）
+        self.log_callback = None
+        self._worker_log_signal.connect(self._on_worker_log)
+        self.filter_column_loaded = False
+        self.init_ui()
+        self.connect_signals()
+        self.reload_tasks()
+        # 每次启动都重建常驻轮询线程，保证与 UI 同生命周期的干净状态
+        self._start_polling()
+
+    # ----------------------------- UI -----------------------------
+    def init_ui(self):
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
+
+        # --- 左侧：任务列表 + 操作按钮 ---
+        left_panel = QWidget()
+        left_column = QVBoxLayout(left_panel)
+        left_column.setContentsMargins(0, 0, 0, 0)
+        left_column.setSpacing(6)
+        left_bar = ChipBar(exclusive=False)
+        left_column.addWidget(left_bar)
+
+        list_group = left_bar.add_section("📋 监控任务")
+        left_layout = list_group.contentLayout()
+
+        self.task_list = QListWidget()
+        self.task_list.setMinimumWidth(240)
+        left_layout.addWidget(self.task_list)
+
+        left_btn1 = QHBoxLayout()
+        self.add_task_btn = QPushButton("新增监控")
+        self.delete_btn = QPushButton("删除")
+        self.toggle_btn = QPushButton("启用/禁用")
+        left_btn1.addWidget(self.add_task_btn)
+        left_btn1.addWidget(self.delete_btn)
+        left_btn1.addWidget(self.toggle_btn)
+        left_layout.addLayout(left_btn1)
+
+        self.run_once_btn = QPushButton("立即执行一次")
+        left_layout.addWidget(self.run_once_btn)
+
+        self.poll_status_label = QLabel("轮询状态: 运行中")
+        self.poll_status_label.setStyleSheet("color:#666; font-size:11px;")
+        left_layout.addWidget(self.poll_status_label)
+
+        left_layout.addStretch()
+        main_layout.addWidget(left_panel, 0)
+
+        # --- 右侧：编辑表单（芯片排，可同开，简洁纵向布局） ---
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(6)
+        right_bar = ChipBar(exclusive=False)
+        right_layout.addWidget(right_bar)
+
+        # 1. 基本设置
+        base_group = right_bar.add_section("📌 基本设置")
+        base_layout = base_group.contentLayout()
+        row = QHBoxLayout()
+        row.addWidget(QLabel("名称:"))
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("例如：群文件监控")
+        row.addWidget(self.name_edit, 1)
+        base_layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("监控目录:"))
+        self.watch_path_edit = QLineEdit()
+        row.addWidget(self.watch_path_edit, 1)
+        self.browse_btn = QPushButton("浏览")
+        row.addWidget(self.browse_btn)
+        base_layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("文件匹配:"))
+        self.pattern_edit = QLineEdit("*.xlsx;*.xls")
+        self.pattern_edit.setPlaceholderText("多个用分号;分隔，如 *.xlsx;*.xls")
+        row.addWidget(self.pattern_edit, 1)
+        base_layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("扫描周期(分钟):"))
+        self.interval_spin = QSpinBox()
+        self.interval_spin.setRange(1, 1440)
+        self.interval_spin.setValue(5)
+        row.addWidget(self.interval_spin, 1)
+        base_layout.addLayout(row)
+        right_layout.addWidget(base_group)
+
+        # 2. 筛选与对比
+        filter_group = right_bar.add_section("🔍 筛选与对比")
+        filter_layout = filter_group.contentLayout()
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Sheet名称:"))
+        self.sheet_edit = QLineEdit()
+        self.sheet_edit.setPlaceholderText("留空 = 第一个 sheet")
+        row.addWidget(self.sheet_edit, 1)
+        self.read_header_btn = QPushButton("读取表头")
+        row.addWidget(self.read_header_btn)
+        filter_layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("筛选列:"))
+        self.filter_column_combo = QComboBox()
+        self.filter_column_combo.setEditable(True)
+        self.filter_column_combo.setPlaceholderText("留空 = 全表")
+        row.addWidget(self.filter_column_combo, 1)
+        filter_layout.addLayout(row)
+
+        filter_layout.addWidget(QLabel("筛选值(每行一个 / 逗号分隔):"))
+        self.filter_values_edit = QTextEdit()
+        self.filter_values_edit.setMaximumHeight(80)
+        self.filter_values_edit.setPlaceholderText("例如：\n北京\n上海\n或：北京,上海")
+        filter_layout.addWidget(self.filter_values_edit)
+
+        self.compare_check = QCheckBox("开启内容对比(增量，只推送新增)")
+        self.compare_check.setChecked(True)
+        self.no_compare_check = QCheckBox("关闭对比(有新文件即推送)")
+        self.compare_check.toggled.connect(self._on_compare_toggled)
+        self.no_compare_check.toggled.connect(self._on_compare_toggled)
+        filter_layout.addWidget(self.compare_check)
+        filter_layout.addWidget(self.no_compare_check)
+        right_layout.addWidget(filter_group)
+
+        # 3. 推送内容
+        send_group = right_bar.add_section("📤 推送内容")
+        send_layout = send_group.contentLayout()
+        self.send_text_check = QCheckBox("推送文字说明")
+        self.send_text_check.setChecked(True)
+        self.send_image_check = QCheckBox("推送图片")
+        self.send_file_check = QCheckBox("推送表格文件")
+        send_layout.addWidget(self.send_text_check)
+        send_layout.addWidget(self.send_image_check)
+        send_layout.addWidget(self.send_file_check)
+        right_layout.addWidget(send_group)
+
+        # 3.5. 数据清洗/校验（阶段B）
+        clean_group = right_bar.add_section("🧹 数据清洗")
+        clean_layout = clean_group.contentLayout()
+        self.clean_rules_container = QWidget()
+        self.clean_rules_layout = QVBoxLayout(self.clean_rules_container)
+        self.clean_rules_layout.setContentsMargins(0, 0, 0, 0)
+        self.clean_rules_layout.setSpacing(4)
+        clean_layout.addWidget(self.clean_rules_container)
+        self.add_clean_rule_btn = QPushButton("＋ 添加清洗规则")
+        clean_layout.addWidget(self.add_clean_rule_btn)
+        self.clean_rule_widgets: List[dict] = []
+        right_layout.addWidget(clean_group)
+
+        # 3.6. 本地台账（阶段B）
+        ledger_group = right_bar.add_section("📁 本地台账")
+        ledger_layout = ledger_group.contentLayout()
+        self.ledger_enabled_check = QCheckBox("启用台账追加（清洗后写入本地 Excel）")
+        ledger_layout.addWidget(self.ledger_enabled_check)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("台账文件:"))
+        self.ledger_path_edit = QLineEdit()
+        self.ledger_path_edit.setPlaceholderText("选择或输入 xlsx 台账路径")
+        row.addWidget(self.ledger_path_edit, 1)
+        self.ledger_browse_btn = QPushButton("浏览")
+        row.addWidget(self.ledger_browse_btn)
+        ledger_layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("目标Sheet:"))
+        self.ledger_sheet_edit = QLineEdit()
+        self.ledger_sheet_edit.setPlaceholderText("留空 = 第一个 sheet")
+        row.addWidget(self.ledger_sheet_edit, 1)
+        row.addWidget(QLabel("备注列:"))
+        self.ledger_remark_col_edit = QLineEdit()
+        self.ledger_remark_col_edit.setPlaceholderText("留空 = 不写备注")
+        row.addWidget(self.ledger_remark_col_edit, 1)
+        ledger_layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("备注内容:"))
+        self.ledger_remark_text_edit = QLineEdit()
+        self.ledger_remark_text_edit.setPlaceholderText("留空 = 自动『已追加 时间』")
+        row.addWidget(self.ledger_remark_text_edit, 1)
+        ledger_layout.addLayout(row)
+
+        self.ledger_exclude_check = QCheckBox("只写清洗规则涉及的列（未勾选则按同名表头写全部列）")
+        ledger_layout.addWidget(self.ledger_exclude_check)
+        right_layout.addWidget(ledger_group)
+
+        # 4. 微信接收人
+        recv_group = right_bar.add_section("👤 微信接收人")
+        recv_layout = recv_group.contentLayout()
+        self.recipients_edit = QTextEdit()
+        self.recipients_edit.setMaximumHeight(90)
+        self.recipients_edit.setPlaceholderText("每个微信昵称一行，或用逗号分隔")
+        recv_layout.addWidget(self.recipients_edit)
+        right_layout.addWidget(recv_group)
+
+        # 5. 时间窗
+        time_group = right_bar.add_section("🕐 时间窗")
+        time_layout = time_group.contentLayout()
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel("重复模式:"))
+        self.repeat_mode_combo = QComboBox()
+        self.repeat_mode_combo.addItem("每天", "daily")
+        self.repeat_mode_combo.addItem("每周指定日期", "weekly")
+        self.repeat_mode_combo.addItem("指定日期(一次)", "once")
+        row1.addWidget(self.repeat_mode_combo, 1)
+        time_layout.addLayout(row1)
+
+        self.weekday_group_box = QGroupBox("选择周几(每周模式生效):")
+        weekday_layout = QHBoxLayout(self.weekday_group_box)
+        self.weekday_checks: Dict[int, QCheckBox] = {}
+        for idx, name in enumerate(WEEKDAY_NAMES, start=1):
+            cb = QCheckBox(name)
+            self.weekday_checks[idx] = cb
+            weekday_layout.addWidget(cb)
+        time_layout.addWidget(self.weekday_group_box)
+
+        self.date_group_box = QGroupBox("执行日期(一次性模式生效，YYYY-MM-DD 逗号分隔):")
+        date_layout = QVBoxLayout(self.date_group_box)
+        self.run_dates_edit = QLineEdit()
+        self.run_dates_edit.setPlaceholderText("例如：2026-10-01,2026-10-02")
+        date_layout.addWidget(self.run_dates_edit)
+        time_layout.addWidget(self.date_group_box)
+        self._sync_time_window(self.repeat_mode_combo.currentIndex())
+        right_layout.addWidget(time_group)
+
+        # 6. 保存
+        save_group = right_bar.add_section("💾 保存")
+        save_layout = save_group.contentLayout()
+        save_row = QHBoxLayout()
+        self.save_btn = QPushButton("保存监控配置")
+        self.clear_btn = QPushButton("清空表单")
+        save_row.addWidget(self.save_btn)
+        save_row.addWidget(self.clear_btn)
+        save_layout.addLayout(save_row)
+        right_layout.addWidget(save_group)
+
+        # 运行日志 + 停止轮询
+        log_group = right_bar.add_section("📜 运行日志", collapsed=True)
+        log_layout = log_group.contentLayout()
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMinimumHeight(120)
+        self.log_text.setFont(QFont("Consolas", 9))
+        log_layout.addWidget(self.log_text)
+        log_btn_row = QHBoxLayout()
+        self.stop_poll_btn = QPushButton("停止轮询")
+        log_btn_row.addWidget(self.stop_poll_btn)
+        log_btn_row.addStretch()
+        log_layout.addLayout(log_btn_row)
+        right_layout.addWidget(log_group)
+
+        right_layout.addStretch()
+        main_layout.addWidget(right, 1)
+
+        # 注册可折叠分组，供主窗口「精简/详细模式」统一折叠
+        self._collapsible_groups = list(right_bar.sections)
+
+    def connect_signals(self):
+        self.task_list.currentItemChanged.connect(self._on_task_selected)
+        self.add_task_btn.clicked.connect(self._on_add_task)
+        self.delete_btn.clicked.connect(self._on_delete_task)
+        self.toggle_btn.clicked.connect(self._on_toggle_enabled)
+        self.run_once_btn.clicked.connect(self._on_run_once)
+        self.browse_btn.clicked.connect(self._on_browse)
+        self.read_header_btn.clicked.connect(self._on_read_headers)
+        self.repeat_mode_combo.currentIndexChanged.connect(self._sync_time_window)
+        self.save_btn.clicked.connect(self._on_save)
+        self.clear_btn.clicked.connect(self._reset_form)
+        self.stop_poll_btn.clicked.connect(self._on_toggle_polling)
+        # 阶段B：清洗规则 / 台账
+        self.add_clean_rule_btn.clicked.connect(lambda: self._add_clean_rule_row())
+        self.ledger_browse_btn.clicked.connect(self._on_browse_ledger)
+
+    # ----------------------------- 任务列表 -----------------------------
+    def reload_tasks(self):
+        self.task_list.blockSignals(True)
+        self.task_list.clear()
+        tasks = self.store.load_all()
+        self.tasks = {t.id: t for t in tasks}
+        for t in tasks:
+            item = QListWidgetItem(self._format_visual_label(t))
+            item.setData(Qt.ItemDataRole.UserRole, t.id)
+            self.task_list.addItem(item)
+        self.task_list.blockSignals(False)
+        if tasks:
+            self.task_list.setCurrentRow(0)
+
+    def _format_visual_label(self, task: MonitorTask) -> str:
+        mark = "✅" if task.enabled else "⬜"
+        rule = {
+            "weekly": "每周",
+            "once": "一次",
+        }.get(task.repeat_mode, "每天")
+        target = f"人数:{len(task.recipients)}"
+        return f"{mark} {task.name}  | {rule} | {target}"
+
+    def _current_task_id_from_list(self) -> Optional[str]:
+        item = self.task_list.currentItem()
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def _on_task_selected(self, current, previous):
+        if not self._loading_form:
+            self.current_task_id = (current.data(Qt.ItemDataRole.UserRole)
+                                    if current else None)
+        tid = self.current_task_id
+        if tid and tid in self.tasks:
+            self._load_task_to_form(self.tasks[tid])
+
+    # ----------------------------- 时间窗 -----------------------------
+    def _sync_time_window(self, index):
+        mode = self.repeat_mode_combo.itemData(index)
+        self.weekday_group_box.setVisible(mode == "weekly")
+        self.date_group_box.setVisible(mode == "once")
+
+    # ----------------------------- 对比互斥 -----------------------------
+    def _on_compare_toggled(self, _checked):
+        # 手动互斥：勾选一个时清掉另一个的勾选
+        if self.compare_check.isChecked() and self.no_compare_check.isChecked():
+            if self.sender() is self.compare_check:
+                self.no_compare_check.setChecked(False)
+            else:
+                self.compare_check.setChecked(False)
+
+    # ----------------------------- 浏览目录 / 读取表头 -----------------------------
+    def _on_browse(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "选择监控目录", self.watch_path_edit.text().strip())
+        if path:
+            self.watch_path_edit.setText(path)
+
+    def _on_read_headers(self):
+        watch_path = self.watch_path_edit.text().strip()
+        if not watch_path or not os.path.isdir(watch_path):
+            self.log("请先填写有效的监控目录")
+            return
+        patterns = [p.strip() for p in
+                    (self.pattern_edit.text() or "*.*").split(";") if p.strip()]
+        file_path = None
+        for pat in patterns or ["*.*"]:
+            hits = glob.glob(os.path.join(watch_path, pat))
+            for h in hits:
+                if os.path.isfile(h):
+                    file_path = h
+                    break
+            if file_path:
+                break
+        if not file_path:
+            self.log("目录下没有匹配的文件，无法读取表头")
+            return
+        try:
+            from modules import monitor_engine
+            headers, _rows = monitor_engine.read_sheet_rows(
+                file_path, sheet_name=self.sheet_edit.text().strip())
+            self.filter_column_combo.clear()
+            self.filter_column_combo.addItem("")  # 空=全表
+            for h in headers:
+                self.filter_column_combo.addItem(h)
+            # 同步刷新清洗规则行的列下拉（保留当前文本）
+            for w in self.clean_rule_widgets:
+                combo = w["combo"]
+                cur = combo.currentText()
+                combo.blockSignals(True)
+                combo.clear()
+                for h in headers:
+                    combo.addItem(h)
+                combo.setCurrentText(cur)
+                combo.blockSignals(False)
+            self.filter_column_loaded = True
+            if self.sheet_edit.text().strip():
+                self.log(f"已读取 {os.path.basename(file_path)} 的表头 {len(headers)} 列")
+            else:
+                self.log(f"已读取 {os.path.basename(file_path)} 首个 sheet 的表头 {len(headers)} 列")
+        except Exception as exc:
+            self.log(f"读取表头失败: {exc}")
+
+    # ----------------------------- 清洗规则 / 台账 -----------------------------
+    def _on_browse_ledger(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "选择台账文件", self.ledger_path_edit.text().strip(),
+            "Excel 文件 (*.xlsx)")
+        if path:
+            self.ledger_path_edit.setText(path)
+
+    def _add_clean_rule_row(self, rule=None):
+        from modules.monitor_config import CleanRule
+
+        rule = rule or CleanRule()
+        row_widget = QWidget()
+        lay = QHBoxLayout(row_widget)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setPlaceholderText("列名")
+        combo.setMinimumWidth(110)
+        # 已有列下拉数据时同步填充
+        for i in range(self.filter_column_combo.count()):
+            combo.addItem(self.filter_column_combo.itemText(i))
+        combo.setCurrentText(rule.column)
+        lay.addWidget(combo)
+
+        strip_check = QCheckBox("去空格")
+        strip_check.setChecked(rule.strip_space)
+        lay.addWidget(strip_check)
+        digits_check = QCheckBox("去非数字")
+        digits_check.setChecked(rule.keep_digits_only)
+        lay.addWidget(digits_check)
+
+        lay.addWidget(QLabel("前N位:"))
+        take_spin = QSpinBox()
+        take_spin.setRange(0, 50)
+        take_spin.setValue(rule.take_first_n)
+        take_spin.setToolTip("0 = 不截取")
+        lay.addWidget(take_spin)
+
+        prefix_edit = QLineEdit(rule.require_prefix)
+        prefix_edit.setPlaceholderText("前缀(须相符)")
+        prefix_edit.setMaximumWidth(110)
+        lay.addWidget(prefix_edit)
+
+        fail_combo = QComboBox()
+        fail_combo.addItem("剔除", "drop")
+        fail_combo.addItem("保留", "keep")
+        fail_combo.setCurrentIndex(0 if rule.on_fail == "drop" else 1)
+        lay.addWidget(fail_combo)
+
+        del_btn = QPushButton("✕")
+        del_btn.setFixedWidth(26)
+        lay.addWidget(del_btn)
+
+        self.clean_rules_layout.addWidget(row_widget)
+        entry = {
+            "row": row_widget,
+            "combo": combo,
+            "strip": strip_check,
+            "digits": digits_check,
+            "take": take_spin,
+            "prefix": prefix_edit,
+            "fail": fail_combo,
+        }
+        self.clean_rule_widgets.append(entry)
+        del_btn.clicked.connect(
+            lambda _=False, e=entry: self._remove_clean_rule_row(e))
+
+    def _remove_clean_rule_row(self, entry: dict):
+        try:
+            self.clean_rules_layout.removeWidget(entry["row"])
+            entry["row"].deleteLater()
+            self.clean_rule_widgets.remove(entry)
+        except ValueError:
+            pass
+
+    def _clear_clean_rules(self):
+        for entry in list(self.clean_rule_widgets):
+            self._remove_clean_rule_row(entry)
+
+    def _collect_clean_rules(self) -> List:
+        from modules.monitor_config import CleanRule
+
+        rules: List = []
+        for w in self.clean_rule_widgets:
+            column = w["combo"].currentText().strip()
+            if not column:
+                continue
+            rules.append(CleanRule(
+                column=column,
+                strip_space=w["strip"].isChecked(),
+                keep_digits_only=w["digits"].isChecked(),
+                take_first_n=w["take"].value(),
+                require_prefix=w["prefix"].text().strip(),
+                on_fail=w["fail"].currentData() or "drop",
+            ))
+        return rules
+
+    # ----------------------------- 表单 <-> 任务 -----------------------------
+    def _load_task_to_form(self, task: MonitorTask):
+        self._loading_form = True
+        try:
+            self.name_edit.setText(task.name)
+            self.watch_path_edit.setText(task.watch_path)
+            self.pattern_edit.setText(task.file_pattern)
+            self.interval_spin.setValue(task.poll_interval_min)
+            self.sheet_edit.setText(task.sheet_name)
+            self.filter_column_combo.setCurrentText(task.filter_column)
+            self.filter_values_edit.setPlainText("\n".join(task.filter_values))
+            self.compare_check.setChecked(task.compare_enabled)
+            self.no_compare_check.setChecked(not task.compare_enabled)
+            self.send_text_check.setChecked(task.send_text)
+            self.send_image_check.setChecked(task.send_image)
+            self.send_file_check.setChecked(task.send_file)
+            self._clear_clean_rules()
+            for rule in task.clean_rules:
+                self._add_clean_rule_row(rule)
+            self.ledger_enabled_check.setChecked(task.ledger_enabled)
+            self.ledger_path_edit.setText(task.ledger_path)
+            self.ledger_sheet_edit.setText(task.ledger_sheet)
+            self.ledger_remark_col_edit.setText(task.ledger_remark_col)
+            self.ledger_remark_text_edit.setText(task.ledger_remark_text)
+            self.ledger_exclude_check.setChecked(task.ledger_exclude_extra)
+            self.recipients_edit.setPlainText("\n".join(task.recipients))
+            mode_index = {"daily": 0, "weekly": 1, "once": 2}.get(
+                task.repeat_mode, 0)
+            self.repeat_mode_combo.setCurrentIndex(mode_index)
+            for d, cb in self.weekday_checks.items():
+                cb.setChecked(d in set(task.days))
+            self.run_dates_edit.setText(",".join(task.run_dates))
+            self._sync_time_window(self.repeat_mode_combo.currentIndex())
+        finally:
+            self._loading_form = False
+
+    def _form_to_task(self, new_id: bool) -> MonitorTask:
+        name = self.name_edit.text().strip()
+        if not name:
+            raise ValueError("请填写监控名称")
+        watch_path = self.watch_path_edit.text().strip()
+        if not watch_path:
+            raise ValueError("请选择监控目录")
+
+        existing_id = None if new_id else self.current_task_id
+        task = MonitorTask(id=existing_id or "", name=name)
+        task.enabled = True
+        task.watch_path = watch_path
+        task.file_pattern = self.pattern_edit.text().strip() or "*.xlsx;*.xls"
+        task.poll_interval_min = self.interval_spin.value()
+        task.sheet_name = self.sheet_edit.text().strip()
+        task.filter_column = self.filter_column_combo.currentText().strip()
+        task.filter_values = self._parse_filter_values(self.filter_values_edit.toPlainText())
+        task.compare_enabled = self.compare_check.isChecked()
+        task.send_text = self.send_text_check.isChecked()
+        task.send_image = self.send_image_check.isChecked()
+        task.send_file = self.send_file_check.isChecked()
+        task.clean_rules = self._collect_clean_rules()
+        task.ledger_enabled = self.ledger_enabled_check.isChecked()
+        task.ledger_path = self.ledger_path_edit.text().strip()
+        task.ledger_sheet = self.ledger_sheet_edit.text().strip()
+        task.ledger_remark_col = self.ledger_remark_col_edit.text().strip()
+        task.ledger_remark_text = self.ledger_remark_text_edit.text().strip()
+        task.ledger_exclude_extra = self.ledger_exclude_check.isChecked()
+        task.recipients = _parse_recipients(self.recipients_edit.toPlainText())
+        task.repeat_mode = self.repeat_mode_combo.currentData() or "daily"
+        task.days = sorted(d for d, cb in self.weekday_checks.items() if cb.isChecked())
+        task.run_dates = [d.strip() for d in
+                          self.run_dates_edit.text().replace("，", ",").split(",") if d.strip()]
+
+        # 编辑已有任务时，保留历史 baseline/seen_files，避免重复推送
+        if existing_id and existing_id in self.tasks:
+            old = self.tasks[existing_id]
+            task.baseline = dict(old.baseline)
+            task.seen_files = dict(old.seen_files)
+            task.created_at = old.created_at
+            task.enabled = old.enabled
+        return task
+
+    def _parse_filter_values(self, text: str) -> List[str]:
+        values: List[str] = []
+        raw = str(text).replace("，", ",").replace(";", ",").replace("；", ",")
+        for line in raw.splitlines():
+            for part in line.split(","):
+                v = part.strip()
+                if v and v not in values:
+                    values.append(v)
+        return values
+
+    # ----------------------------- 操作 -----------------------------
+    def _on_add_task(self):
+        self.current_task_id = None
+        self._set_list_selection(None)
+        self._reset_form()
+
+    def _set_list_selection(self, tid: Optional[str]):
+        self.task_list.blockSignals(True)
+        self.task_list.clearSelection()
+        if tid is not None:
+            for i in range(self.task_list.count()):
+                if self.task_list.item(i).data(Qt.ItemDataRole.UserRole) == tid:
+                    self.task_list.setCurrentRow(i)
+                    break
+        self.task_list.blockSignals(False)
+
+    def _on_delete_task(self):
+        tid = self._current_task_id_from_list()
+        if not tid:
+            QMessageBox.information(self, "提示", "请先选择一个监控任务")
+            return
+        task = self.tasks.get(tid)
+        reply = QMessageBox.question(
+            self, "确认删除", f"确定删除监控「{task.name}」吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            self.store.delete(tid)
+            self.log(f"[监控] 已删除任务: {task.name}")
+            self.current_task_id = None
+            self.reload_tasks()
+
+    def _on_toggle_enabled(self):
+        tid = self._current_task_id_from_list()
+        if not tid:
+            QMessageBox.information(self, "提示", "请先选择一个监控任务")
+            return
+        task = self.tasks.get(tid)
+        new_state = not task.enabled
+        self.store.set_enabled(tid, new_state)
+        task.enabled = new_state
+        self.log(f"[监控] 任务「{task.name}」已{'启用' if new_state else '禁用'}")
+        self.reload_tasks()
+
+    def _on_save(self):
+        try:
+            task = self._form_to_task(new_id=self.current_task_id is None)
+        except ValueError as exc:
+            QMessageBox.warning(self, "信息不完整", str(exc))
+            return
+        saved = self.store.save(task)
+        self.log(f"[监控] 已保存监控「{saved.name}」")
+        self.current_task_id = saved.id
+        self.reload_tasks()
+
+    def _reset_form(self):
+        self._loading_form = True
+        try:
+            self.name_edit.clear()
+            self.watch_path_edit.clear()
+            self.pattern_edit.setText("*.xlsx;*.xls")
+            self.interval_spin.setValue(5)
+            self.sheet_edit.clear()
+            self.filter_column_combo.clear()
+            self.filter_column_loaded = False
+            self.filter_column_combo.setCurrentText("")
+            self.filter_values_edit.clear()
+            self.compare_check.setChecked(True)
+            self.no_compare_check.setChecked(False)
+            self.send_text_check.setChecked(True)
+            self.send_image_check.setChecked(False)
+            self.send_file_check.setChecked(False)
+            self._clear_clean_rules()
+            self.ledger_enabled_check.setChecked(False)
+            self.ledger_path_edit.clear()
+            self.ledger_sheet_edit.clear()
+            self.ledger_remark_col_edit.clear()
+            self.ledger_remark_text_edit.clear()
+            self.ledger_exclude_check.setChecked(False)
+            self.recipients_edit.clear()
+            self.repeat_mode_combo.setCurrentIndex(0)
+            for cb in self.weekday_checks.values():
+                cb.setChecked(False)
+            self.run_dates_edit.clear()
+            self._sync_time_window(0)
+        finally:
+            self._loading_form = False
+
+    # ----------------------------- 轮询 / 立即执行 -----------------------------
+    def _start_polling(self):
+        if self._poll_worker is not None and self._poll_worker.isRunning():
+            return
+        worker = MonitorWorker(store=self.store, one_shot=False, poll_floor_sec=30.0)
+        self._bind_worker_signals(worker)
+        self._poll_worker = worker
+        self.poll_status_label.setText("轮询状态: 运行中")
+        self.stop_poll_btn.setText("停止轮询")
+        worker.start()
+        self.log("[监控] 轮询已启动 (后台常驻)")
+
+    def _on_toggle_polling(self):
+        if self._poll_worker is not None and self._poll_worker.isRunning():
+            self._poll_worker.stop()
+            self.poll_status_label.setText("轮询状态: 已停止")
+            self.stop_poll_btn.setText("开始轮询")
+            self.log("[监控] 轮询已停止")
+        else:
+            self._start_polling()
+
+    def _on_run_once(self):
+        # 防重叠：常驻轮询或手动执行进行中则跳过
+        if self._poll_worker is not None and self._poll_worker.isRunning():
+            self.log("正在执行，请稍候")
+            return
+        if self._one_shot_worker is not None and self._one_shot_worker.isRunning():
+            self.log("正在执行，请稍候")
+            return
+        # 保存当前表单到所选任务（保留用户临时修改）
+        tid = self._current_task_id_from_list()
+        if not tid:
+            QMessageBox.information(self, "提示", "请先选择要执行的监控任务")
+            return
+        try:
+            task = self._form_to_task(new_id=False)
+        except ValueError as exc:
+            QMessageBox.warning(self, "信息不完整", str(exc))
+            return
+        # 回写并保存，让 worker 读到最新配置
+        self.store.save(task)
+        self.tasks[tid] = self.store.get(tid)
+
+        worker = MonitorWorker(store=self.store, one_shot=True, poll_floor_sec=30.0)
+        self._bind_worker_signals(worker)
+        self._one_shot_worker = worker
+        self.log(f"[监控] 手动执行一次: {task.name}")
+        worker.start()
+
+    def _bind_worker_signals(self, worker: MonitorWorker):
+        worker.log.connect(self._worker_log_signal.emit)
+        worker.task_finished.connect(self._on_task_finished)
+        worker.run_finished.connect(self._on_run_finished)
+
+    def _on_task_finished(self, task_name: str, success: int, failed: int):
+        self.log(f"[监控] 任务「{task_name}」完成: 成功 {success} / 失败 {failed}")
+
+    def _on_run_finished(self):
+        self.log("[监控] 本轮执行完毕")
+
+    # ----------------------------- 日志 -----------------------------
+    def log(self, message: str) -> None:
+        if hasattr(self, "log_text") and self.log_text is not None:
+            from datetime import datetime
+            ts = datetime.now().strftime("%H:%M:%S")
+            self.log_text.append(f"[{ts}] {message}")
+            if not self._log_max_applied:
+                self.log_text.document().setMaximumBlockCount(1200)
+                self._log_max_applied = True
+        logger.info(message)
+        # 同时推送给 MainWindow，用于主界面统一日志面板
+        if self.log_callback:
+            try:
+                self.log_callback(message)
+            except Exception:
+                pass
+
+    def _on_worker_log(self, message: str) -> None:
+        self.log(message)
+
+    # 停止所有 worker（主窗口退出时调用）
+    def shutdown(self):
+        for attr in ("_poll_worker", "_one_shot_worker"):
+            worker = getattr(self, attr, None)
+            if worker is not None:
+                try:
+                    worker.stop()
+                except Exception:
+                    pass
+
+    def closeEvent(self, event):
+        self.shutdown()
+        super().closeEvent(event)
+
+
 class MainWindow(QMainWindow):
     # 跨线程日志投递：子线程 emit -> 主线程 slot 写 UI
     _schedule_log_signal = pyqtSignal(str)
@@ -5983,6 +6758,10 @@ class MainWindow(QMainWindow):
         self.schedule_tab = ScheduleTab(self.schedule_store, self.schedule_dispatcher)
         # 让 ScheduleTab 日志同时写入原表格发送主界面的日志面板，保持统一查看
         self.schedule_tab.log_callback = self._schedule_log_to_main
+        self.monitor_store = MonitorManager()
+        self.monitor_tab = MonitorTab(self.monitor_store)
+        # 让监控日志同时写入原表格发送主界面的日志面板，保持统一查看
+        self.monitor_tab.log_callback = self._schedule_log_to_main
 
         self.tab_widget = _ElasticTabWidget()
         # 用 ElasticPage 包装：非当前页不报告尺寸提示，窗口才能弹性收缩
@@ -5994,8 +6773,13 @@ class MainWindow(QMainWindow):
         pl2 = QVBoxLayout(page2)
         pl2.setContentsMargins(0, 0, 0, 0)
         pl2.addWidget(self.schedule_tab)
+        page3 = ElasticPage()
+        pl3 = QVBoxLayout(page3)
+        pl3.setContentsMargins(0, 0, 0, 0)
+        pl3.addWidget(self.monitor_tab)
         self.tab_widget.addTab(page1, "📊 数据发送")
         self.tab_widget.addTab(page2, "⏰ 定时发送")
+        self.tab_widget.addTab(page3, "📡 监控")
 
         # 全局精简/详细开关：放 QTabWidget 右上角 corner
         self._compact_mode = False
@@ -7137,6 +7921,14 @@ class MainWindow(QMainWindow):
         if dispatcher is not None:
             try:
                 dispatcher.stop()
+            except Exception:
+                pass
+
+        # 停止监控页轮询 / 手动执行线程
+        monitor_tab = getattr(self, "monitor_tab", None)
+        if monitor_tab is not None:
+            try:
+                monitor_tab.shutdown()
             except Exception:
                 pass
 
