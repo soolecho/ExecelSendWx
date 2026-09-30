@@ -8,6 +8,7 @@
 """
 import hashlib
 import os
+import re
 from typing import Dict, List, Optional, Tuple
 
 from . import wps_cloud
@@ -136,19 +137,28 @@ def is_new_file(seen: Dict[str, str], file_path: str) -> bool:
 def render_rows_text(
     headers: List[str],
     new_rows: List[List[str]],
+    title: str = "",
+    show_detail: bool = True,
 ) -> str:
-    """生成“新增了哪些”的文字说明（可读表格排版）。"""
+    """生成推送文字说明。
+
+    title 为空用默认标题；show_detail=True 时在下方附逐行明细（列:值），
+    False 时仅显示标题 + 新增条数。
+    """
     if not new_rows:
         return ""
-    lines = [f"共新增 {len(new_rows)} 条："]
-    # 用表头前 4 列 + 后续值截断，避免过长
-    cols = headers[:4]
-    for r in new_rows:
-        parts = [f"{cols[i]}:{r[i]}" for i in range(len(cols)) if i < len(r)]
-        extra = len(r) - len(cols)
-        if extra > 0:
-            parts.append(f"…+{extra}列")
-        lines.append("  " + "，".join(parts))
+    t = str(title).strip() or "监控新增提醒"
+    lines = [f"{t}", f"共新增 {len(new_rows)} 条"]
+    if show_detail:
+        lines.append("")
+        # 用表头前 4 列 + 后续值截断，避免过长
+        cols = headers[:4]
+        for r in new_rows:
+            parts = [f"{cols[i]}:{r[i]}" for i in range(len(cols)) if i < len(r)]
+            extra = len(r) - len(cols)
+            if extra > 0:
+                parts.append(f"…+{extra}列")
+            lines.append("  " + "，".join(parts))
     return "\n".join(lines)
 
 
@@ -317,6 +327,18 @@ def extract_columns_by(
     return sub_headers, sub_rows
 
 
+def _coerce_numeric(value: object) -> object:
+    """纯数字字符串 → 数值类型（int/float），避免 Excel「文本型数字」绿三角。"""
+    if isinstance(value, str):
+        v = value.strip()
+        if re.fullmatch(r"-?\d+(\.\d+)?", v):
+            try:
+                return int(v) if "." not in v else float(v)
+            except (ValueError, OverflowError):
+                return value
+    return value
+
+
 def build_out_file(
     headers: List[str],
     new_rows: List[List[str]],
@@ -330,7 +352,7 @@ def build_out_file(
     ws = wb.active
     ws.append(sub_headers)
     for r in sub_rows:
-        ws.append(r)
+        ws.append([_coerce_numeric(c) for c in r])
     try:
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
     except OSError:

@@ -146,6 +146,15 @@ class MonitorTask:
     clean_rules: List[CleanRule] = field(default_factory=list)
     # 发送提取列：只把这几列写入推送文字/图片/文件（空 = 全部列）
     extract_columns: List[str] = field(default_factory=list)
+    # 推送文字自定义标题（如"光缆故障新增提醒"），未配置用默认
+    text_title: str = ""
+    # 推送文字是否附带逐行明细（勾选才显示 列:值；否则只显示标题+条数）
+    text_detail: bool = True
+    # 是否递归扫描监控目录的子文件夹（默认仅当前层，避免大目录过慢）
+    include_subdir: bool = False
+    # 每天运行时间段（HH:MM，起:止）。空=全天；支持跨夜如 22:00-07:00。
+    active_start: str = ""
+    active_end: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -223,6 +232,11 @@ class MonitorTask:
             ],
             compare_columns=_split_list(data.get("compare_columns")),
             extract_columns=_split_list(data.get("extract_columns")),
+            text_title=_s("text_title"),
+            text_detail=_b("text_detail", True),
+            include_subdir=_b("include_subdir", False),
+            active_start=_s("active_start"),
+            active_end=_s("active_end"),
             created_at=_s("created_at"),
             updated_at=_s("updated_at"),
         )
@@ -235,7 +249,22 @@ def _now_in_window(task: MonitorTask, now: datetime) -> bool:
     daily=每天；weekly=指定的周几；once=指定的执行日期之一。
     监控采用轮询（poll_interval_min 节流），times 字段暂不参与日期判定，
     保留仅供将来按时间片收窄使用。
+
+    每天运行时间段（active_start~active_end，HH:MM）：空=全天；起止相同=
+    全天；支持跨夜（如 22:00-07:00 表示晚上10点到次日早上7点之间活动）。
     """
+    # 时段窗口判定（对所有 repeat_mode 生效）
+    s = str(task.active_start or "").strip()
+    e = str(task.active_end or "").strip()
+    if s and e and s != e:
+        cur = now.strftime("%H:%M")
+        if s < e:
+            if not (s <= cur <= e):
+                return False
+        else:  # 跨夜
+            if not (cur >= s or cur <= e):
+                return False
+
     if task.repeat_mode == "weekly":
         return now.isoweekday() in set(task.days)
     if task.repeat_mode == "once":

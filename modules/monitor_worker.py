@@ -93,21 +93,22 @@ class MonitorWorker(QThread):
         files = self._match_files(task)
         if not files:
             return
+        # 监控目录可能堆积大量历史文件：每个轮询周期只处理「时间最新」的那一个。
+        # 开启对比时，基于已记录的 baseline 做行增量（等同与上一个时间点的内容对比），
+        # 避免首次/每次轮询把目录里的历史表全部读一遍并重复推送。
+        latest = files[-1]  # _match_files 已按 mtime 升序，最后一个是最新
         success = 0
         failed = 0
-        for fp in files:
-            if self._stop:
-                break
-            try:
-                outcome = self._process_file(task, fp, log_prefix)
-                if outcome:
-                    success += 1
-                else:
-                    failed += 1
-            except Exception as exc:
+        try:
+            outcome = self._process_file(task, latest, log_prefix)
+            if outcome:
+                success += 1
+            else:
                 failed += 1
-                logger.exception("监控处理文件失败 %s", fp)
-                self.emit(f"{log_prefix} 处理失败「{os.path.basename(fp)}」: {exc}")
+        except Exception as exc:
+            failed += 1
+            logger.exception("监控处理文件失败 %s", latest)
+            self.emit(f"{log_prefix} 处理失败「{os.path.basename(latest)}」: {exc}")
         self.task_finished.emit(task.name, success, failed)
 
     def _match_files(self, task: MonitorTask):
@@ -116,8 +117,13 @@ class MonitorWorker(QThread):
             patterns = ["*.xlsx"]
         seen = set()
         out = []
+        recursive = bool(getattr(task, "include_subdir", False))
         for pat in patterns:
-            for p in glob.glob(os.path.join(task.watch_path, pat)):
+            search = pat
+            if recursive and not search.startswith("**/"):
+                search = "**/" + pat
+            for p in glob.glob(os.path.join(task.watch_path, search),
+                               recursive=recursive):
                 if os.path.isfile(p) and p not in seen:
                     seen.add(p)
                     out.append(p)
@@ -165,7 +171,11 @@ class MonitorWorker(QThread):
         png_path: Optional[str] = None
         out_file: Optional[str] = None
         if task.send_text:
-            texts.append(monitor_engine.render_rows_text(view_headers, view_rows))
+            texts.append(monitor_engine.render_rows_text(
+                view_headers, view_rows,
+                title=task.text_title,
+                show_detail=task.text_detail,
+            ))
         if task.send_image:
             tmp = os.path.join(tempfile.gettempdir(),
                                f"monitor_{datetime.now().strftime('%H%M%S%f')}.png")

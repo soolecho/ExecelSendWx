@@ -5917,6 +5917,7 @@ class MonitorTab(QWidget):
         self.log_callback = None
         self._worker_log_signal.connect(self._on_worker_log)
         self.filter_column_loaded = False
+        self._col_combos: Dict[int, QComboBox] = {}
         self.init_ui()
         self.connect_signals()
         self.reload_tasks()
@@ -5965,7 +5966,9 @@ class MonitorTab(QWidget):
         self.poll_status_label.setStyleSheet("color:#666; font-size:11px;")
         left_layout.addWidget(self.poll_status_label)
 
-        left_layout.addStretch()
+        # 关键：把「监控配置」ChipSection 加入左侧列布局，否则面板是孤儿不可见
+        left_column.addWidget(list_group)
+        left_column.addStretch()
         main_layout.addWidget(left_panel, 0)
 
         # --- 右侧：编辑表单（芯片排，可同开，简洁纵向布局） ---
@@ -5973,7 +5976,7 @@ class MonitorTab(QWidget):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(6)
-        right_bar = ChipBar(exclusive=False)
+        right_bar = ChipBar(exclusive=True)  # 手风琴：右栏设置一次只展开一个
         right_layout.addWidget(right_bar)
 
         # 1. 基本设置
@@ -6008,6 +6011,11 @@ class MonitorTab(QWidget):
         self.interval_spin.setValue(5)
         row.addWidget(self.interval_spin, 1)
         base_layout.addLayout(row)
+
+        self.include_subdir_check = QCheckBox("包含子文件夹中的匹配文件")
+        self.include_subdir_check.setChecked(False)
+        self.include_subdir_check.setToolTip("勾选后递归扫描监控目录的子文件夹（默认仅当前层）")
+        base_layout.addWidget(self.include_subdir_check)
         right_layout.addWidget(base_group)
 
         # 2. 筛选与对比
@@ -6049,11 +6057,20 @@ class MonitorTab(QWidget):
         # 3. 推送内容
         send_group = right_bar.add_section("📤 推送内容")
         send_layout = send_group.contentLayout()
+        title_row = QHBoxLayout()
+        title_row.addWidget(QLabel("文字标题:"))
+        self.text_title_edit = QLineEdit()
+        self.text_title_edit.setPlaceholderText("留空 = 默认「监控新增提醒」")
+        title_row.addWidget(self.text_title_edit, 1)
+        send_layout.addLayout(title_row)
         self.send_text_check = QCheckBox("推送文字说明")
         self.send_text_check.setChecked(True)
+        self.text_detail_check = QCheckBox("文字附带逐行明细")
+        self.text_detail_check.setChecked(True)
         self.send_image_check = QCheckBox("推送图片")
         self.send_file_check = QCheckBox("推送表格文件")
         send_layout.addWidget(self.send_text_check)
+        send_layout.addWidget(self.text_detail_check)
         send_layout.addWidget(self.send_image_check)
         send_layout.addWidget(self.send_file_check)
         right_layout.addWidget(send_group)
@@ -6062,11 +6079,12 @@ class MonitorTab(QWidget):
         col_group = right_bar.add_section("🧰 列设置")
         col_layout = col_group.contentLayout()
 
-        col_layout.addWidget(QLabel("清洗列（勾选要清洗的列，可多选）:"))
+        col_layout.addWidget(QLabel("清洗列（要清洗的列，可多选/手动添加）:"))
         self.clean_cols_list = QListWidget()
         self.clean_cols_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
         self.clean_cols_list.setMaximumHeight(90)
         col_layout.addWidget(self.clean_cols_list)
+        self._add_col_input_row(col_layout, self.clean_cols_list)
 
         row = QHBoxLayout()
         row.addWidget(QLabel("清洗方式:"))
@@ -6098,17 +6116,19 @@ class MonitorTab(QWidget):
         row.addWidget(self.clean_fail_combo, 1)
         col_layout.addLayout(row)
 
-        col_layout.addWidget(QLabel("发送保留列（只把这些列写入文字/图片/文件；留空 = 全部列）:"))
+        col_layout.addWidget(QLabel("发送保留列（提取/只写这些列；留空 = 全部列）:"))
         self.extract_cols_list = QListWidget()
         self.extract_cols_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
         self.extract_cols_list.setMaximumHeight(90)
         col_layout.addWidget(self.extract_cols_list)
+        self._add_col_input_row(col_layout, self.extract_cols_list)
 
         col_layout.addWidget(QLabel("对比列（决定「新增」依据；留空 = 比对全部列）:"))
         self.compare_cols_list = QListWidget()
         self.compare_cols_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
         self.compare_cols_list.setMaximumHeight(90)
         col_layout.addWidget(self.compare_cols_list)
+        self._add_col_input_row(col_layout, self.compare_cols_list)
 
         right_layout.addWidget(col_group)
 
@@ -6149,6 +6169,29 @@ class MonitorTab(QWidget):
         date_layout.addWidget(self.run_dates_edit)
         time_layout.addWidget(self.date_group_box)
         self._sync_time_window(self.repeat_mode_combo.currentIndex())
+
+        # 每天运行时间段（限定在起止时间内才监控/推送；起止相同或未勾选=全天）
+        time_row = QHBoxLayout()
+        self.active_window_check = QCheckBox("限定每天时段")
+        self.active_window_check.setToolTip("勾选后，只在起止时间段内扫描并推送；\n未勾选 = 全天监控")
+        time_row.addWidget(self.active_window_check)
+        time_row.addWidget(QLabel("起:"))
+        self.active_start_edit = QTimeEdit()
+        self.active_start_edit.setDisplayFormat("HH:mm")
+        self.active_start_edit.setTime(QTime(7, 0))
+        time_row.addWidget(self.active_start_edit)
+        time_row.addWidget(QLabel("止:"))
+        self.active_end_edit = QTimeEdit()
+        self.active_end_edit.setDisplayFormat("HH:mm")
+        self.active_end_edit.setTime(QTime(22, 0))
+        self.active_end_edit.setToolTip("起止相同 = 全天")
+        time_row.addWidget(self.active_end_edit)
+        self.active_start_edit.setEnabled(False)
+        self.active_end_edit.setEnabled(False)
+        self.active_window_check.toggled.connect(self.active_start_edit.setEnabled)
+        self.active_window_check.toggled.connect(self.active_end_edit.setEnabled)
+        time_layout.addLayout(time_row)
+
         right_layout.addWidget(time_group)
 
         # 6. 保存
@@ -6180,8 +6223,19 @@ class MonitorTab(QWidget):
         right_layout.addStretch()
         main_layout.addWidget(right, 1)
 
-        # 注册可折叠分组，供主窗口「精简/详细模式」统一折叠
-        self._collapsible_groups = list(right_bar.sections)
+        # 注册所有可折叠分组，供全局精简/详细模式遍历（含左侧配置列表，与定时发送一致）
+        self._collapsible_groups = [
+            list_group, base_group, filter_group, send_group,
+            col_group, recv_group, time_group, save_group, log_group,
+        ]
+        self.list_group = list_group
+        self.save_group = save_group
+        # 表单脏检测：登录后 _form_ready=True 才生效（防止程序化填充误判为改动）
+        self._form_dirty = False
+        self._form_ready = False
+        # 监控发送失败常驻通知去重：记录当前处于"失败未恢复"状态的任务名，
+        # 仅在该任务由成功转入失败时弹一次，避免轮询反复失败导致通知堆积
+        self._monitor_fail_notified: set = set()
 
     def connect_signals(self):
         self.task_list.currentItemChanged.connect(self._on_task_selected)
@@ -6196,6 +6250,56 @@ class MonitorTab(QWidget):
         self.clear_btn.clicked.connect(self._reset_form)
         self.stop_poll_btn.clicked.connect(self._on_toggle_polling)
         self.import_btn.clicked.connect(self._on_import_profile)
+        self._connect_form_dirty_signals()
+        self._form_ready = True
+
+    # ------------------------- 表单脏检测（改动自动弹开保存栏） -------------------------
+    def _connect_form_dirty_signals(self):
+        """所有表单控件改动 → 置脏并自动展开「💾 保存」栏（不挤掉正在编辑的栏）。"""
+        mark = self._mark_form_dirty
+        self.name_edit.textChanged.connect(mark)
+        self.watch_path_edit.textChanged.connect(mark)
+        self.pattern_edit.textChanged.connect(mark)
+        self.interval_spin.valueChanged.connect(mark)
+        self.sheet_edit.textChanged.connect(mark)
+        self.filter_column_combo.currentTextChanged.connect(mark)
+        self.filter_values_edit.textChanged.connect(mark)
+        self.compare_check.stateChanged.connect(mark)
+        self.no_compare_check.stateChanged.connect(mark)
+        self.send_text_check.stateChanged.connect(mark)
+        self.send_image_check.stateChanged.connect(mark)
+        self.send_file_check.stateChanged.connect(mark)
+        self.text_title_edit.textChanged.connect(mark)
+        self.text_detail_check.stateChanged.connect(mark)
+        self.include_subdir_check.stateChanged.connect(mark)
+        self.strip_space_check.stateChanged.connect(mark)
+        self.digits_check.stateChanged.connect(mark)
+        self.take_first_spin.valueChanged.connect(mark)
+        self.prefix_edit.textChanged.connect(mark)
+        self.clean_fail_combo.currentIndexChanged.connect(mark)
+        for lw in (self.clean_cols_list, self.extract_cols_list,
+                   self.compare_cols_list):
+            lw.itemChanged.connect(lambda *a: mark())
+        self.recipients_edit.textChanged.connect(mark)
+        self.repeat_mode_combo.currentIndexChanged.connect(mark)
+        for cb in self.weekday_checks.values():
+            cb.stateChanged.connect(mark)
+        self.run_dates_edit.textChanged.connect(mark)
+        self.active_window_check.stateChanged.connect(mark)
+        self.active_start_edit.timeChanged.connect(mark)
+        self.active_end_edit.timeChanged.connect(mark)
+
+    def _mark_form_dirty(self, *_args):
+        """表单项被用户改动：置脏并自动展开「保存」栏（程序填充阶段忽略）。"""
+        if not self._form_ready or self._loading_form:
+            return
+        self._form_dirty = True
+        if self.save_group.is_collapsed():
+            self.save_group.set_collapsed(False, animate=True, accordion_close=False)
+
+    def _clear_form_dirty(self):
+        """保存/重置成功后清脏并可选收起保存栏。"""
+        self._form_dirty = False
 
     # ----------------------------- 任务列表 -----------------------------
     def reload_tasks(self):
@@ -6292,6 +6396,17 @@ class MonitorTab(QWidget):
             self._fill_columns_list(self.clean_cols_list, headers, keep["clean"])
             self._fill_columns_list(self.extract_cols_list, headers, keep["extract"])
             self._fill_columns_list(self.compare_cols_list, headers, keep["compare"])
+            # 表头回填到各下拉候选（去重保留已有项表达式）
+            for lw in (self.clean_cols_list, self.extract_cols_list,
+                       self.compare_cols_list):
+                combo = self._col_combos.get(id(lw))
+                if combo is None:
+                    continue
+                seen = set(combo.itemText(i) for i in range(combo.count()))
+                for h in headers:
+                    if str(h).strip() and str(h) not in seen:
+                        combo.addItem(str(h))
+                        seen.add(str(h))
             self.filter_column_loaded = True
             if self.sheet_edit.text().strip():
                 self.log(f"已读取 {os.path.basename(file_path)} 的表头 {len(headers)} 列")
@@ -6301,21 +6416,76 @@ class MonitorTab(QWidget):
             self.log(f"读取表头失败: {exc}")
 
     # ----------------------------- 列设置(清洗/保留/对比) helper -----------------------------
+    def _add_col_input_row(self, column_layout, list_widget):
+        """为某个列列表添加『输入列名 + 添加/移除』一行，支持手动填写列名。
+
+        不依赖"读取表头"即可录入列名：在可编辑下拉里输入列名回车或点「＋」，
+        会加入对应列表并自动选中；选中列表项后点「−」可移除。
+        """
+        row = QHBoxLayout()
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.setPlaceholderText("输入或选择列名…")
+        add_btn = QPushButton("＋添加")
+        add_btn.setFixedWidth(58)
+        del_btn = QPushButton("−移除选中")
+        del_btn.setFixedWidth(70)
+
+        def _add_col():
+            text = combo.currentText().strip()
+            if not text:
+                return
+            # 已存在则不重复添加
+            for i in range(list_widget.count()):
+                if list_widget.item(i).text() == text:
+                    list_widget.item(i).setSelected(True)
+                    combo.clearEditText()
+                    return
+            item = QListWidgetItem(text)
+            list_widget.addItem(item)
+            item.setSelected(True)
+            combo.clearEditText()
+
+        def _del_col():
+            for i in list(range(list_widget.count() - 1, -1, -1)):
+                if list_widget.item(i).isSelected():
+                    list_widget.takeItem(i)
+
+        combo.lineEdit().returnPressed.connect(_add_col)
+        add_btn.clicked.connect(_add_col)
+        del_btn.clicked.connect(_del_col)
+        row.addWidget(combo, 1)
+        row.addWidget(add_btn)
+        row.addWidget(del_btn)
+        column_layout.addLayout(row)
+        # 记录每个列表对应的下拉，供读取表头后回填候选
+        self._col_combos.setdefault(id(list_widget), combo)
+
     def _selected_cols(self, list_widget) -> List[str]:
         return [list_widget.item(i).text() for i in range(list_widget.count())
                 if list_widget.item(i).isSelected()]
 
     def _fill_columns_list(self, list_widget, headers, selected):
-        selected = set(selected or [])
+        selected_ordered = list(selected or [])
+        selected_set = set(selected_ordered)
         list_widget.blockSignals(True)
         list_widget.clear()
+        header_set = set()
         for h in headers:
             hs = str(h)
             if not hs.strip():
                 continue
+            header_set.add(hs)
             it = QListWidgetItem(hs)
             list_widget.addItem(it)
-            it.setSelected(hs in selected)
+            it.setSelected(hs in selected_set)
+        # 表头为空时（尚未读取）也要保留已配置的列，保证加载配置不丢
+        for c in selected_ordered:
+            if c and c not in header_set:
+                it = QListWidgetItem(c)
+                list_widget.addItem(it)
+                it.setSelected(True)
         list_widget.blockSignals(False)
 
     def _current_headers(self) -> List[str]:
@@ -6387,6 +6557,9 @@ class MonitorTab(QWidget):
             self.send_text_check.setChecked(task.send_text)
             self.send_image_check.setChecked(task.send_image)
             self.send_file_check.setChecked(task.send_file)
+            self.text_title_edit.setText(task.text_title)
+            self.text_detail_check.setChecked(task.text_detail)
+            self.include_subdir_check.setChecked(task.include_subdir)
             # 列设置：勾选清洗/保留/对比列，并应用统一清洗方式
             self.strip_space_check.setChecked(True)
             self.digits_check.setChecked(False)
@@ -6415,6 +6588,16 @@ class MonitorTab(QWidget):
             for d, cb in self.weekday_checks.items():
                 cb.setChecked(d in set(task.days))
             self.run_dates_edit.setText(",".join(task.run_dates))
+            has_win = bool(task.active_start and task.active_end)
+            self.active_window_check.setChecked(has_win)
+            self.active_start_edit.setEnabled(has_win)
+            self.active_end_edit.setEnabled(has_win)
+            if task.active_start:
+                self.active_start_edit.setTime(
+                    QTime.fromString(task.active_start, "HH:mm"))
+            if task.active_end:
+                self.active_end_edit.setTime(
+                    QTime.fromString(task.active_end, "HH:mm"))
             self._sync_time_window(self.repeat_mode_combo.currentIndex())
         finally:
             self._loading_form = False
@@ -6440,6 +6623,9 @@ class MonitorTab(QWidget):
         task.send_text = self.send_text_check.isChecked()
         task.send_image = self.send_image_check.isChecked()
         task.send_file = self.send_file_check.isChecked()
+        task.text_title = self.text_title_edit.text().strip()
+        task.text_detail = self.text_detail_check.isChecked()
+        task.include_subdir = self.include_subdir_check.isChecked()
         task.compare_columns = self._selected_cols(self.compare_cols_list)
         task.extract_columns = self._selected_cols(self.extract_cols_list)
         task.clean_rules = self._build_clean_rules(
@@ -6449,6 +6635,12 @@ class MonitorTab(QWidget):
         task.days = sorted(d for d, cb in self.weekday_checks.items() if cb.isChecked())
         task.run_dates = [d.strip() for d in
                           self.run_dates_edit.text().replace("，", ",").split(",") if d.strip()]
+        if self.active_window_check.isChecked():
+            task.active_start = self.active_start_edit.time().toString("HH:mm")
+            task.active_end = self.active_end_edit.time().toString("HH:mm")
+        else:
+            task.active_start = ""
+            task.active_end = ""
 
         # 编辑已有任务时，保留历史 baseline/seen_files，避免重复推送
         if existing_id and existing_id in self.tasks:
@@ -6521,6 +6713,7 @@ class MonitorTab(QWidget):
             return
         saved = self.store.save(task)
         self.log(f"[监控] 已保存监控「{saved.name}」")
+        self._clear_form_dirty()
         self.current_task_id = saved.id
         self.reload_tasks()
 
@@ -6541,6 +6734,9 @@ class MonitorTab(QWidget):
             self.send_text_check.setChecked(True)
             self.send_image_check.setChecked(False)
             self.send_file_check.setChecked(False)
+            self.text_title_edit.clear()
+            self.text_detail_check.setChecked(True)
+            self.include_subdir_check.setChecked(False)
             self.strip_space_check.setChecked(True)
             self.digits_check.setChecked(False)
             self.take_first_spin.setValue(0)
@@ -6556,9 +6752,15 @@ class MonitorTab(QWidget):
             for cb in self.weekday_checks.values():
                 cb.setChecked(False)
             self.run_dates_edit.clear()
+            self.active_window_check.setChecked(False)
+            self.active_start_edit.setTime(QTime(7, 0))
+            self.active_end_edit.setTime(QTime(22, 0))
+            self.active_start_edit.setEnabled(False)
+            self.active_end_edit.setEnabled(False)
             self._sync_time_window(0)
         finally:
             self._loading_form = False
+        self._clear_form_dirty()
 
     # ----------------------------- 轮询 / 立即执行 -----------------------------
     def _start_polling(self):
@@ -6616,6 +6818,20 @@ class MonitorTab(QWidget):
 
     def _on_task_finished(self, task_name: str, success: int, failed: int):
         self.log(f"[监控] 任务「{task_name}」完成: 成功 {success} / 失败 {failed}")
+        # 发送失败 → 右下角常驻通知（同定时任务：红色图标、不自动隐藏、点击置前）。
+        # 仅在该任务由成功/无失败转入失败时弹一次；恢复成功后重新布防，避免反复失败堆积。
+        if failed > 0:
+            if task_name not in self._monitor_fail_notified:
+                self._monitor_fail_notified.add(task_name)
+                try:
+                    ToastNotification.show_toast(
+                        "监控发送失败",
+                        f"监控「{task_name}」发送失败 {failed} 条，成功 {success} 条（点击查看）",
+                        success=False, parent=self.window())
+                except Exception:
+                    logger.exception("[监控] 失败通知弹出失败")
+        else:
+            self._monitor_fail_notified.discard(task_name)
 
     def _on_run_finished(self):
         self.log("[监控] 本轮执行完毕")
