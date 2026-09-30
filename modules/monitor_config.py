@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
-MONITOR_VERSION = 2
+MONITOR_VERSION = 3
 
 
 @dataclass
@@ -140,15 +140,12 @@ class MonitorTask:
     minimize_after: bool = True
     keep_unlocked: bool = False
     relock_after: bool = False
-    # 数据清洗/校验规则（阶段B）
+    # 对比列：决定"新增"用哪些列（空 = 全部列）
+    compare_columns: List[str] = field(default_factory=list)
+    # 数据清洗/校验规则（每条规则针对一列，由"列设置"面板统一生成）
     clean_rules: List[CleanRule] = field(default_factory=list)
-    # 本地台账追加（阶段B）
-    ledger_enabled: bool = False
-    ledger_path: str = ""
-    ledger_sheet: str = ""
-    ledger_remark_col: str = ""
-    ledger_remark_text: str = ""
-    ledger_exclude_extra: bool = False
+    # 发送提取列：只把这几列写入推送文字/图片/文件（空 = 全部列）
+    extract_columns: List[str] = field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
 
@@ -224,12 +221,8 @@ class MonitorTask:
                 CleanRule.from_dict(c) for c in data.get("clean_rules", [])
                 if isinstance(c, dict)
             ],
-            ledger_enabled=_b("ledger_enabled", False),
-            ledger_path=_s("ledger_path"),
-            ledger_sheet=_s("ledger_sheet"),
-            ledger_remark_col=_s("ledger_remark_col"),
-            ledger_remark_text=_s("ledger_remark_text"),
-            ledger_exclude_extra=_b("ledger_exclude_extra", False),
+            compare_columns=_split_list(data.get("compare_columns")),
+            extract_columns=_split_list(data.get("extract_columns")),
             created_at=_s("created_at"),
             updated_at=_s("updated_at"),
         )
@@ -250,43 +243,99 @@ def _now_in_window(task: MonitorTask, now: datetime) -> bool:
     return True  # daily
 
 
+def _profiles_dir() -> Path:
+    """独立配置文件目录：monitors/profiles/<名称>.json，一个监控配置一个文件。"""
+    base = _monitors_dir() / "profiles"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _sanitize_name(name: str) -> str:
+    name = "".join(c for c in (name or "")
+                   if c not in '\\/:*?"<>|').strip()
+    return name or "监控"
+
+
+def _profile_path(name: str) -> Path:
+    return _profiles_dir() / (_sanitize_name(name) + ".json")
+
+
 class MonitorManager:
-    """监控任务持久化管理（镜像 ScheduleManager 风格）。"""
+    """监控配置文件管理：每个监控配置 = profiles 目录下一个独立的 .json 文件。
+
+    左侧列表 = 扫描 profiles 目录；保存/加载针对单个配置文件，便于导出、导入、
+    切换运行不同的监控配置（符合"能运行不同的监控配置文件"诉求）。
+    worker 的 load_all() 返回全部配置作为常驻运行池。
+    旧版单索引 monitors.json 若存在且无独立配置时，自动迁移为独立文件。
+    """
 
     def __init__(self, index_file: Optional[Path] = None):
-        self.index_file = Path(index_file) if index_file else MONITOR_INDEX_FILE
+        # index_file 仅作兼容参数保留；实际改用 profiles 目录
         self._lock = threading.Lock()
+        self._migrate_legacy()
 
+    # ---------------- 旧单索引自动迁移 ----------------
+    def _migrate_legacy(self) -> None:
+        try:
+            with self._lock:
+                legacy = MONITOR_INDEX_FILE
+                if not legacy.exists():
+                    return
+                if list(_profiles_dir().glob("*.json")):
+                    return
+                with legacy.open("r", encoding="utf-8") as fp:
+                    raw = json.load(fp)
+                items = raw.get("monitors") if isinstance(raw, dict) else None
+                if isinstance(items, list):
+                    for item in items:
+                        try:
+                            self._save_file(MonitorTask.from_dict(item))
+                        except Exception:
+                            continue
+                try:
+                    legacy.unlink()
+                except OSError:
+                    pass
+        except Exception:
+            pass
+
+    # ---------------- 列表 ----------------
     def load_all(self) -> List[MonitorTask]:
         with self._lock:
-            return self._load_all_unsafe()
+            tasks = []
+            for p in sorted(
+                _profiles_dir().glob("*.json"),
+                key=lambda x: x.stat().st_mtime if x.exists() else 0,
+            ):
+                try:
+                    with p.open("r", encoding="utf-8") as fp:
+                        raw = json.load(fp)
+                    tasks.append(MonitorTask.from_dict(raw))
+                except Exception:
+                    continue
+            tasks.sort(key=lambda t: (not t.enabled, t.name.lower()))
+            return tasks
 
-    def _load_all_unsafe(self) -> List[MonitorTask]:
-        try:
-            with self.index_file.open("r", encoding="utf-8") as fp:
-                raw = json.load(fp)
-        except (OSError, json.JSONDecodeError):
-            return []
-        if not isinstance(raw, dict):
-            return []
-        items = raw.get("monitors")
-        if not isinstance(items, list):
-            return []
-        tasks = [MonitorTask.from_dict(item) for item in items]
-        tasks.sort(key=lambda t: (not t.enabled, t.updated_at or t.created_at, t.id))
-        return tasks
+    def list_profiles(self) -> List[dict]:
+        with self._lock:
+            out = []
+            for p in sorted(_profiles_dir().glob("*.json")):
+                d = {"path": str(p), "name": p.stem, "enabled": False, "updated_at": ""}
+                try:
+                    with p.open("r", encoding="utf-8") as fp:
+                        raw = json.load(fp)
+                    d["enabled"] = bool(raw.get("enabled", True))
+                    d["updated_at"] = str(raw.get("updated_at", ""))
+                except Exception:
+                    pass
+                out.append(d)
+            return out
 
-    def _save_all(self, tasks: List[MonitorTask]) -> None:
-        data = {
-            "version": MONITOR_VERSION,
-            "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "monitors": [t.to_dict() for t in tasks],
-        }
-        try:
-            with self.index_file.open("w", encoding="utf-8") as fp:
-                json.dump(data, fp, ensure_ascii=False, indent=2)
-        except OSError:
-            pass
+    # ---------------- 存取 ----------------
+    def _save_file(self, task: MonitorTask) -> None:
+        p = _profile_path(task.name)
+        with p.open("w", encoding="utf-8") as fp:
+            json.dump(task.to_dict(), fp, ensure_ascii=False, indent=2)
 
     def save(self, task: MonitorTask) -> MonitorTask:
         with self._lock:
@@ -296,43 +345,84 @@ class MonitorManager:
             if not task.created_at:
                 task.created_at = now
             task.updated_at = now
-            tasks = self._load_all_unsafe()
-            replaced = False
-            for i, existing in enumerate(tasks):
-                if existing.id == task.id:
-                    tasks[i] = task
-                    replaced = True
-                    break
-            if not replaced:
-                tasks.append(task)
-            self._save_all(tasks)
+            # 改名或旧文件位置不同 → 删除旧 id 对应文件，避免残留
+            new_name = _sanitize_name(task.name) + ".json"
+            for p in _profiles_dir().glob("*.json"):
+                if p.name == new_name:
+                    continue
+                try:
+                    with p.open("r", encoding="utf-8") as fp:
+                        raw = json.load(fp)
+                except Exception:
+                    continue
+                if str(raw.get("id")) == task.id:
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+            self._save_file(task)
             return task
 
     def get(self, task_id: str) -> Optional[MonitorTask]:
-        for t in self._load_all_unsafe():
+        for t in self.load_all():
             if t.id == task_id:
                 return t
         return None
 
+    def load_profile(self, name: str) -> Optional[MonitorTask]:
+        p = _profile_path(name)
+        if not p.exists():
+            return None
+        with self._lock:
+            try:
+                with p.open("r", encoding="utf-8") as fp:
+                    raw = json.load(fp)
+                return MonitorTask.from_dict(raw)
+            except Exception:
+                return None
+
     def delete(self, task_id: str) -> bool:
         with self._lock:
-            tasks = self._load_all_unsafe()
-            new_tasks = [t for t in tasks if t.id != task_id]
-            if len(new_tasks) == len(tasks):
-                return False
-            self._save_all(new_tasks)
-            return True
+            for p in _profiles_dir().glob("*.json"):
+                try:
+                    with p.open("r", encoding="utf-8") as fp:
+                        raw = json.load(fp)
+                except Exception:
+                    continue
+                if str(raw.get("id")) == task_id:
+                    try:
+                        p.unlink()
+                        return True
+                    except OSError:
+                        return False
+            return False
 
     def set_enabled(self, task_id: str, enabled: bool) -> bool:
         with self._lock:
-            tasks = self._load_all_unsafe()
-            changed = False
-            for t in tasks:
-                if t.id == task_id:
-                    t.enabled = enabled
-                    t.updated_at = datetime.now().isoformat(timespec="seconds")
-                    changed = True
-                    break
-            if changed:
-                self._save_all(tasks)
-            return changed
+            for p in _profiles_dir().glob("*.json"):
+                try:
+                    with p.open("r", encoding="utf-8") as fp:
+                        raw = json.load(fp)
+                except Exception:
+                    continue
+                if str(raw.get("id")) == task_id:
+                    raw["enabled"] = bool(enabled)
+                    raw["updated_at"] = datetime.now().isoformat(timespec="seconds")
+                    try:
+                        with p.open("w", encoding="utf-8") as fp:
+                            json.dump(raw, fp, ensure_ascii=False, indent=2)
+                        return True
+                    except OSError:
+                        return False
+            return False
+
+    def save_profile_as(self, task: MonitorTask) -> str:
+        """另存为：以当前 name 落成独立配置文件，返回文件路径。"""
+        with self._lock:
+            if not task.id:
+                task.id = _new_task_id()
+            if not task.created_at:
+                task.created_at = datetime.now().isoformat(timespec="seconds")
+            task.updated_at = task.created_at
+            self._save_file(task)
+            return str(_profile_path(task.name))

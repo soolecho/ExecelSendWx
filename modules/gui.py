@@ -5937,7 +5937,7 @@ class MonitorTab(QWidget):
         left_bar = ChipBar(exclusive=False)
         left_column.addWidget(left_bar)
 
-        list_group = left_bar.add_section("📋 监控任务")
+        list_group = left_bar.add_section("📋 监控配置")
         left_layout = list_group.contentLayout()
 
         self.task_list = QListWidget()
@@ -5945,13 +5945,18 @@ class MonitorTab(QWidget):
         left_layout.addWidget(self.task_list)
 
         left_btn1 = QHBoxLayout()
-        self.add_task_btn = QPushButton("新增监控")
-        self.delete_btn = QPushButton("删除")
-        self.toggle_btn = QPushButton("启用/禁用")
+        self.add_task_btn = QPushButton("新建配置")
+        self.import_btn = QPushButton("导入配置")
         left_btn1.addWidget(self.add_task_btn)
-        left_btn1.addWidget(self.delete_btn)
-        left_btn1.addWidget(self.toggle_btn)
+        left_btn1.addWidget(self.import_btn)
         left_layout.addLayout(left_btn1)
+
+        left_btn2 = QHBoxLayout()
+        self.delete_btn = QPushButton("删除配置")
+        self.toggle_btn = QPushButton("启用/禁用")
+        left_btn2.addWidget(self.delete_btn)
+        left_btn2.addWidget(self.toggle_btn)
+        left_layout.addLayout(left_btn2)
 
         self.run_once_btn = QPushButton("立即执行一次")
         left_layout.addWidget(self.run_once_btn)
@@ -6053,55 +6058,59 @@ class MonitorTab(QWidget):
         send_layout.addWidget(self.send_file_check)
         right_layout.addWidget(send_group)
 
-        # 3.5. 数据清洗/校验（阶段B）
-        clean_group = right_bar.add_section("🧹 数据清洗")
-        clean_layout = clean_group.contentLayout()
-        self.clean_rules_container = QWidget()
-        self.clean_rules_layout = QVBoxLayout(self.clean_rules_container)
-        self.clean_rules_layout.setContentsMargins(0, 0, 0, 0)
-        self.clean_rules_layout.setSpacing(4)
-        clean_layout.addWidget(self.clean_rules_container)
-        self.add_clean_rule_btn = QPushButton("＋ 添加清洗规则")
-        clean_layout.addWidget(self.add_clean_rule_btn)
-        self.clean_rule_widgets: List[dict] = []
-        right_layout.addWidget(clean_group)
+        # 3.5. 列设置：清洗列 + 发送保留列 + 对比列（统一面板）
+        col_group = right_bar.add_section("🧰 列设置")
+        col_layout = col_group.contentLayout()
 
-        # 3.6. 本地台账（阶段B）
-        ledger_group = right_bar.add_section("📁 本地台账")
-        ledger_layout = ledger_group.contentLayout()
-        self.ledger_enabled_check = QCheckBox("启用台账追加（清洗后写入本地 Excel）")
-        ledger_layout.addWidget(self.ledger_enabled_check)
+        col_layout.addWidget(QLabel("清洗列（勾选要清洗的列，可多选）:"))
+        self.clean_cols_list = QListWidget()
+        self.clean_cols_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        self.clean_cols_list.setMaximumHeight(90)
+        col_layout.addWidget(self.clean_cols_list)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("台账文件:"))
-        self.ledger_path_edit = QLineEdit()
-        self.ledger_path_edit.setPlaceholderText("选择或输入 xlsx 台账路径")
-        row.addWidget(self.ledger_path_edit, 1)
-        self.ledger_browse_btn = QPushButton("浏览")
-        row.addWidget(self.ledger_browse_btn)
-        ledger_layout.addLayout(row)
+        row.addWidget(QLabel("清洗方式:"))
+        self.strip_space_check = QCheckBox("去空格")
+        self.strip_space_check.setChecked(True)
+        self.digits_check = QCheckBox("去非数字")
+        row.addWidget(self.strip_space_check)
+        row.addWidget(self.digits_check)
+        col_layout.addLayout(row)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("目标Sheet:"))
-        self.ledger_sheet_edit = QLineEdit()
-        self.ledger_sheet_edit.setPlaceholderText("留空 = 第一个 sheet")
-        row.addWidget(self.ledger_sheet_edit, 1)
-        row.addWidget(QLabel("备注列:"))
-        self.ledger_remark_col_edit = QLineEdit()
-        self.ledger_remark_col_edit.setPlaceholderText("留空 = 不写备注")
-        row.addWidget(self.ledger_remark_col_edit, 1)
-        ledger_layout.addLayout(row)
+        row.addWidget(QLabel("取前N位:"))
+        self.take_first_spin = QSpinBox()
+        self.take_first_spin.setRange(0, 50)
+        self.take_first_spin.setValue(0)
+        self.take_first_spin.setToolTip("0 = 不截取")
+        row.addWidget(self.take_first_spin)
+        row.addWidget(QLabel("前缀(须相符):"))
+        self.prefix_edit = QLineEdit()
+        self.prefix_edit.setPlaceholderText("空 = 不校验前缀")
+        row.addWidget(self.prefix_edit, 1)
+        col_layout.addLayout(row)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("备注内容:"))
-        self.ledger_remark_text_edit = QLineEdit()
-        self.ledger_remark_text_edit.setPlaceholderText("留空 = 自动『已追加 时间』")
-        row.addWidget(self.ledger_remark_text_edit, 1)
-        ledger_layout.addLayout(row)
+        row.addWidget(QLabel("前缀不符时:"))
+        self.clean_fail_combo = QComboBox()
+        self.clean_fail_combo.addItem("剔除该行", "drop")
+        self.clean_fail_combo.addItem("保留", "keep")
+        row.addWidget(self.clean_fail_combo, 1)
+        col_layout.addLayout(row)
 
-        self.ledger_exclude_check = QCheckBox("只写清洗规则涉及的列（未勾选则按同名表头写全部列）")
-        ledger_layout.addWidget(self.ledger_exclude_check)
-        right_layout.addWidget(ledger_group)
+        col_layout.addWidget(QLabel("发送保留列（只把这些列写入文字/图片/文件；留空 = 全部列）:"))
+        self.extract_cols_list = QListWidget()
+        self.extract_cols_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        self.extract_cols_list.setMaximumHeight(90)
+        col_layout.addWidget(self.extract_cols_list)
+
+        col_layout.addWidget(QLabel("对比列（决定「新增」依据；留空 = 比对全部列）:"))
+        self.compare_cols_list = QListWidget()
+        self.compare_cols_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        self.compare_cols_list.setMaximumHeight(90)
+        col_layout.addWidget(self.compare_cols_list)
+
+        right_layout.addWidget(col_group)
 
         # 4. 微信接收人
         recv_group = right_bar.add_section("👤 微信接收人")
@@ -6146,7 +6155,7 @@ class MonitorTab(QWidget):
         save_group = right_bar.add_section("💾 保存")
         save_layout = save_group.contentLayout()
         save_row = QHBoxLayout()
-        self.save_btn = QPushButton("保存监控配置")
+        self.save_btn = QPushButton("保存配置")
         self.clear_btn = QPushButton("清空表单")
         save_row.addWidget(self.save_btn)
         save_row.addWidget(self.clear_btn)
@@ -6186,9 +6195,7 @@ class MonitorTab(QWidget):
         self.save_btn.clicked.connect(self._on_save)
         self.clear_btn.clicked.connect(self._reset_form)
         self.stop_poll_btn.clicked.connect(self._on_toggle_polling)
-        # 阶段B：清洗规则 / 台账
-        self.add_clean_rule_btn.clicked.connect(lambda: self._add_clean_rule_row())
-        self.ledger_browse_btn.clicked.connect(self._on_browse_ledger)
+        self.import_btn.clicked.connect(self._on_import_profile)
 
     # ----------------------------- 任务列表 -----------------------------
     def reload_tasks(self):
@@ -6276,16 +6283,15 @@ class MonitorTab(QWidget):
             self.filter_column_combo.addItem("")  # 空=全表
             for h in headers:
                 self.filter_column_combo.addItem(h)
-            # 同步刷新清洗规则行的列下拉（保留当前文本）
-            for w in self.clean_rule_widgets:
-                combo = w["combo"]
-                cur = combo.currentText()
-                combo.blockSignals(True)
-                combo.clear()
-                for h in headers:
-                    combo.addItem(h)
-                combo.setCurrentText(cur)
-                combo.blockSignals(False)
+            # 同步填充三个列设置列表（保留当前选中）
+            keep = {
+                "clean": self._selected_cols(self.clean_cols_list),
+                "extract": self._selected_cols(self.extract_cols_list),
+                "compare": self._selected_cols(self.compare_cols_list),
+            }
+            self._fill_columns_list(self.clean_cols_list, headers, keep["clean"])
+            self._fill_columns_list(self.extract_cols_list, headers, keep["extract"])
+            self._fill_columns_list(self.compare_cols_list, headers, keep["compare"])
             self.filter_column_loaded = True
             if self.sheet_edit.text().strip():
                 self.log(f"已读取 {os.path.basename(file_path)} 的表头 {len(headers)} 列")
@@ -6294,105 +6300,76 @@ class MonitorTab(QWidget):
         except Exception as exc:
             self.log(f"读取表头失败: {exc}")
 
-    # ----------------------------- 清洗规则 / 台账 -----------------------------
-    def _on_browse_ledger(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "选择台账文件", self.ledger_path_edit.text().strip(),
-            "Excel 文件 (*.xlsx)")
-        if path:
-            self.ledger_path_edit.setText(path)
+    # ----------------------------- 列设置(清洗/保留/对比) helper -----------------------------
+    def _selected_cols(self, list_widget) -> List[str]:
+        return [list_widget.item(i).text() for i in range(list_widget.count())
+                if list_widget.item(i).isSelected()]
 
-    def _add_clean_rule_row(self, rule=None):
-        from modules.monitor_config import CleanRule
-
-        rule = rule or CleanRule()
-        row_widget = QWidget()
-        lay = QHBoxLayout(row_widget)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(4)
-
-        combo = QComboBox()
-        combo.setEditable(True)
-        combo.setPlaceholderText("列名")
-        combo.setMinimumWidth(110)
-        # 已有列下拉数据时同步填充
-        for i in range(self.filter_column_combo.count()):
-            combo.addItem(self.filter_column_combo.itemText(i))
-        combo.setCurrentText(rule.column)
-        lay.addWidget(combo)
-
-        strip_check = QCheckBox("去空格")
-        strip_check.setChecked(rule.strip_space)
-        lay.addWidget(strip_check)
-        digits_check = QCheckBox("去非数字")
-        digits_check.setChecked(rule.keep_digits_only)
-        lay.addWidget(digits_check)
-
-        lay.addWidget(QLabel("前N位:"))
-        take_spin = QSpinBox()
-        take_spin.setRange(0, 50)
-        take_spin.setValue(rule.take_first_n)
-        take_spin.setToolTip("0 = 不截取")
-        lay.addWidget(take_spin)
-
-        prefix_edit = QLineEdit(rule.require_prefix)
-        prefix_edit.setPlaceholderText("前缀(须相符)")
-        prefix_edit.setMaximumWidth(110)
-        lay.addWidget(prefix_edit)
-
-        fail_combo = QComboBox()
-        fail_combo.addItem("剔除", "drop")
-        fail_combo.addItem("保留", "keep")
-        fail_combo.setCurrentIndex(0 if rule.on_fail == "drop" else 1)
-        lay.addWidget(fail_combo)
-
-        del_btn = QPushButton("✕")
-        del_btn.setFixedWidth(26)
-        lay.addWidget(del_btn)
-
-        self.clean_rules_layout.addWidget(row_widget)
-        entry = {
-            "row": row_widget,
-            "combo": combo,
-            "strip": strip_check,
-            "digits": digits_check,
-            "take": take_spin,
-            "prefix": prefix_edit,
-            "fail": fail_combo,
-        }
-        self.clean_rule_widgets.append(entry)
-        del_btn.clicked.connect(
-            lambda _=False, e=entry: self._remove_clean_rule_row(e))
-
-    def _remove_clean_rule_row(self, entry: dict):
-        try:
-            self.clean_rules_layout.removeWidget(entry["row"])
-            entry["row"].deleteLater()
-            self.clean_rule_widgets.remove(entry)
-        except ValueError:
-            pass
-
-    def _clear_clean_rules(self):
-        for entry in list(self.clean_rule_widgets):
-            self._remove_clean_rule_row(entry)
-
-    def _collect_clean_rules(self) -> List:
-        from modules.monitor_config import CleanRule
-
-        rules: List = []
-        for w in self.clean_rule_widgets:
-            column = w["combo"].currentText().strip()
-            if not column:
+    def _fill_columns_list(self, list_widget, headers, selected):
+        selected = set(selected or [])
+        list_widget.blockSignals(True)
+        list_widget.clear()
+        for h in headers:
+            hs = str(h)
+            if not hs.strip():
                 continue
+            it = QListWidgetItem(hs)
+            list_widget.addItem(it)
+            it.setSelected(hs in selected)
+        list_widget.blockSignals(False)
+
+    def _current_headers(self) -> List[str]:
+        """当前表头候选：优先从筛选列下拉取已加载表头；否则回退到三个列列表里的列。"""
+        headers = []
+        for i in range(self.filter_column_combo.count()):
+            h = self.filter_column_combo.itemText(i)
+            if h:
+                headers.append(h)
+        if headers:
+            return headers
+        for lw in (self.clean_cols_list, self.extract_cols_list, self.compare_cols_list):
+            for i in range(lw.count()):
+                h = lw.item(i).text().strip()
+                if h and h not in headers:
+                    headers.append(h)
+        return headers
+
+    def _build_clean_rules(self, cols) -> List:
+        from modules.monitor_config import CleanRule
+
+        rules = []
+        for c in cols:
             rules.append(CleanRule(
-                column=column,
-                strip_space=w["strip"].isChecked(),
-                keep_digits_only=w["digits"].isChecked(),
-                take_first_n=w["take"].value(),
-                require_prefix=w["prefix"].text().strip(),
-                on_fail=w["fail"].currentData() or "drop",
+                column=c,
+                strip_space=self.strip_space_check.isChecked(),
+                keep_digits_only=self.digits_check.isChecked(),
+                take_first_n=self.take_first_spin.value(),
+                require_prefix=self.prefix_edit.text().strip(),
+                on_fail=self.clean_fail_combo.currentData() or "drop",
             ))
         return rules
+
+    def _on_import_profile(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "导入监控配置", "", "监控配置 (*.json)")
+        if not path:
+            return
+        try:
+            import json as _json
+            from modules.monitor_config import MonitorTask as _MT
+
+            with open(path, "r", encoding="utf-8") as fp:
+                raw = _json.load(fp)
+            task = _MT.from_dict(raw)
+            task.id = task.id or ""
+            self.store.save(task)          # 落成 profiles 独立配置
+            self.current_task_id = task.id
+            self.reload_tasks()
+            self._set_list_selection(task.id)
+            self._load_task_to_form(task)
+            self.log(f"[监控] 已导入配置「{task.name}」")
+        except Exception as exc:
+            QMessageBox.warning(self, "导入失败", str(exc))
 
     # ----------------------------- 表单 <-> 任务 -----------------------------
     def _load_task_to_form(self, task: MonitorTask):
@@ -6410,15 +6387,27 @@ class MonitorTab(QWidget):
             self.send_text_check.setChecked(task.send_text)
             self.send_image_check.setChecked(task.send_image)
             self.send_file_check.setChecked(task.send_file)
-            self._clear_clean_rules()
-            for rule in task.clean_rules:
-                self._add_clean_rule_row(rule)
-            self.ledger_enabled_check.setChecked(task.ledger_enabled)
-            self.ledger_path_edit.setText(task.ledger_path)
-            self.ledger_sheet_edit.setText(task.ledger_sheet)
-            self.ledger_remark_col_edit.setText(task.ledger_remark_col)
-            self.ledger_remark_text_edit.setText(task.ledger_remark_text)
-            self.ledger_exclude_check.setChecked(task.ledger_exclude_extra)
+            # 列设置：勾选清洗/保留/对比列，并应用统一清洗方式
+            self.strip_space_check.setChecked(True)
+            self.digits_check.setChecked(False)
+            self.take_first_spin.setValue(0)
+            self.prefix_edit.clear()
+            self.clean_fail_combo.setCurrentIndex(0)
+            if task.clean_rules:
+                r0 = task.clean_rules[0]
+                self.strip_space_check.setChecked(r0.strip_space)
+                self.digits_check.setChecked(r0.keep_digits_only)
+                self.take_first_spin.setValue(r0.take_first_n)
+                self.prefix_edit.setText(r0.require_prefix)
+                self.clean_fail_combo.setCurrentIndex(
+                    0 if getattr(r0, "on_fail", "drop") != "keep" else 1)
+            clean_cols = [r.column for r in task.clean_rules if getattr(r, "column", "")]
+            self._fill_columns_list(self.clean_cols_list, self._current_headers(),
+                                    clean_cols)
+            self._fill_columns_list(self.extract_cols_list, self._current_headers(),
+                                    task.extract_columns)
+            self._fill_columns_list(self.compare_cols_list, self._current_headers(),
+                                    task.compare_columns)
             self.recipients_edit.setPlainText("\n".join(task.recipients))
             mode_index = {"daily": 0, "weekly": 1, "once": 2}.get(
                 task.repeat_mode, 0)
@@ -6451,13 +6440,10 @@ class MonitorTab(QWidget):
         task.send_text = self.send_text_check.isChecked()
         task.send_image = self.send_image_check.isChecked()
         task.send_file = self.send_file_check.isChecked()
-        task.clean_rules = self._collect_clean_rules()
-        task.ledger_enabled = self.ledger_enabled_check.isChecked()
-        task.ledger_path = self.ledger_path_edit.text().strip()
-        task.ledger_sheet = self.ledger_sheet_edit.text().strip()
-        task.ledger_remark_col = self.ledger_remark_col_edit.text().strip()
-        task.ledger_remark_text = self.ledger_remark_text_edit.text().strip()
-        task.ledger_exclude_extra = self.ledger_exclude_check.isChecked()
+        task.compare_columns = self._selected_cols(self.compare_cols_list)
+        task.extract_columns = self._selected_cols(self.extract_cols_list)
+        task.clean_rules = self._build_clean_rules(
+            self._selected_cols(self.clean_cols_list))
         task.recipients = _parse_recipients(self.recipients_edit.toPlainText())
         task.repeat_mode = self.repeat_mode_combo.currentData() or "daily"
         task.days = sorted(d for d, cb in self.weekday_checks.items() if cb.isChecked())
@@ -6555,13 +6541,16 @@ class MonitorTab(QWidget):
             self.send_text_check.setChecked(True)
             self.send_image_check.setChecked(False)
             self.send_file_check.setChecked(False)
-            self._clear_clean_rules()
-            self.ledger_enabled_check.setChecked(False)
-            self.ledger_path_edit.clear()
-            self.ledger_sheet_edit.clear()
-            self.ledger_remark_col_edit.clear()
-            self.ledger_remark_text_edit.clear()
-            self.ledger_exclude_check.setChecked(False)
+            self.strip_space_check.setChecked(True)
+            self.digits_check.setChecked(False)
+            self.take_first_spin.setValue(0)
+            self.prefix_edit.clear()
+            self.clean_fail_combo.setCurrentIndex(0)
+            for lw in (self.clean_cols_list, self.extract_cols_list,
+                       self.compare_cols_list,):
+                lw.blockSignals(True)
+                lw.clear()
+                lw.blockSignals(False)
             self.recipients_edit.clear()
             self.repeat_mode_combo.setCurrentIndex(0)
             for cb in self.weekday_checks.values():

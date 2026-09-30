@@ -292,161 +292,44 @@ def apply_clean_rules(
     return kept, dropped
 
 
-def append_to_ledger(
+def extract_columns_by(
     headers: List[str],
     rows: List[List[str]],
-    ledger_path: str,
-    sheet_name: str = "",
-    remark_col: str = "",
-    remark_text: str = "",
-    exclude_extra: bool = True,
-    clean_rules=None,
-    log_fn=None,
-) -> int:
-    """把清洗后的行追加到本地台账 xlsx，返回写入行数。
-
-    目标 sheet：sheet_name 为空取第一个；文件不存在/无该 sheet 则新建。
-    写入方式：跳过已有数据行，从目标列首个空行起逐行下移（整行追加到最底部）。
-    exclude_extra=True 时只用 clean_rules 涉及的列；否则按 header 同名匹配写入
-    （台账缺列时自动补列）。remark_col 非空时在同样新增行的该列写备注
-    （remark_text 为空则用"已追加 <时间>"）。原子写（tmp + os.replace）。
-    """
-    import os
-    import tempfile
-    import openpyxl
-
-    log = log_fn or (lambda msg: None)
-    if not rows:
-        return 0
-    try:
-        os.makedirs(os.path.dirname(os.path.abspath(ledger_path)), exist_ok=True)
-    except OSError:
-        pass
-
-    wb = None
-    ws = None
-    if os.path.exists(ledger_path):
+    extract_columns: List[str] | None = None,
+):
+    """按指定的提取列裁剪，返回 (sub_headers, sub_rows)。
+    extract_columns 为空 -> 返回原始。列名精确优先，兜底子串匹配
+    （与 filter_rows / apply_clean_rules 一致）。"""
+    if not extract_columns:
+        return list(headers), [list(r) for r in rows]
+    indexes: List[int] = []
+    for c in extract_columns:
+        if not c:
+            continue
         try:
-            wb = openpyxl.load_workbook(ledger_path)
-        except Exception as exc:
-            log(f"台账文件加载失败({exc})，将新建覆盖")
-            wb = None
-    if wb is None:
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        if sheet_name:
-            ws.title = sheet_name
-    else:
-        if sheet_name and sheet_name in wb.sheetnames:
-            ws = wb[sheet_name]
-        elif not sheet_name:
-            ws = wb.active
-        else:
-            ws = wb.create_sheet(sheet_name)
-    if ws is None:
-        ws = wb.active
-
-    # 用 clean_rules 涉及的列名集合；exclude_extra=False 时按 header 同名写
-    from .monitor_config import CleanRule
-
-    rule_cols = set()
-    for rule in clean_rules or []:
-        if isinstance(rule, CleanRule) and rule.column:
-            rule_cols.add(rule.column)
-    wanted_set = rule_cols if (exclude_extra and rule_cols) else set(
-        c for c in headers if c
-    )
-    # 按源表表头顺序排序目标列，保证新建台账列顺序与源一致
-    wanted_cols = [c for c in headers if c in wanted_set]
-
-    # 解析台账表头（行1）与列位置
-    ledger_headers = [
-        str(ws.cell(row=1, column=col).value or "").strip() for col in range(1, ws.max_column + 1)
-    ]
-    has_header = any(ledger_headers)
-    write_col: Dict[str, int] = {}
-    if not has_header:
-        # 空台账：目标列从第 1 列起按源顺序写表头
-        for i, col_name in enumerate(wanted_cols, start=1):
-            ws.cell(row=1, column=i, value=col_name)
-            write_col[col_name] = i
-        next_col = len(wanted_cols) + 1
-    else:
-        next_col = ws.max_column + 1
-        for col_name in wanted_cols:
-            try:
-                write_col[col_name] = ledger_headers.index(col_name) + 1
-            except ValueError:
-                # 台账缺列 → 追加为最后一列
-                write_col[col_name] = next_col
-                ws.cell(row=1, column=write_col[col_name], value=col_name)
-                next_col += 1
-    if remark_col:
-        if not has_header or remark_col not in ledger_headers:
-            remark_col_idx = next_col
-            ws.cell(row=1, column=remark_col_idx, value=remark_col)
-        else:
-            remark_col_idx = ledger_headers.index(remark_col) + 1
-    else:
-        remark_col_idx = None
-
-    # 定位最底部（第一个全空行）→ 从该行起逐行写入
-    start_row = 1
-    while True:
-        empty = all(
-            (ws.cell(row=start_row, column=col).value in (None, ""))
-            for col in range(1, ws.max_column + 1)
-        )
-        if empty:
-            break
-        start_row += 1
-        if start_row > 100000:
-            break
-
-    remark_value = (remark_text or "").strip() or f"已追加 {_now_str()}"
-    for i, row in enumerate(rows):
-        target = start_row + i
-        for col_name, col_idx in write_col.items():
-            src_idx = headers.index(col_name) if col_name in headers else -1
-            if src_idx >= 0 and src_idx < len(row):
-                ws.cell(row=target, column=col_idx, value=row[src_idx])
-        if remark_col_idx:
-            ws.cell(row=target, column=remark_col_idx, value=remark_value)
-
-    # 原子写
-    fd, tmp = tempfile.mkstemp(
-        prefix=".ledger.", suffix=".xlsx", dir=os.path.dirname(os.path.abspath(ledger_path))
-    )
-    os.close(fd)
-    try:
-        wb.save(tmp)
-        os.replace(tmp, ledger_path)
-    except Exception:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
-    return len(rows)
-
-
-def _now_str() -> str:
-    from datetime import datetime
-
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
+            idx = headers.index(c)
+        except ValueError:
+            idx = next((i for i, h in enumerate(headers) if c in str(h)), -1)
+        if idx >= 0 and idx not in indexes:
+            indexes.append(idx)
+    sub_headers = [headers[i] for i in indexes]
+    sub_rows = [[row[i] for i in indexes if i < len(row)] for row in rows]
+    return sub_headers, sub_rows
 
 
 def build_out_file(
     headers: List[str],
     new_rows: List[List[str]],
     out_path: str,
+    extract_columns: List[str] | None = None,
 ) -> str:
-    """把新增行写入一个临时 xlsx，返回文件路径。"""
+    """把新增行（可选按提取列裁剪后）写入一个临时 xlsx，返回文件路径。"""
     import openpyxl
+    sub_headers, sub_rows = extract_columns_by(headers, new_rows, extract_columns)
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.append(headers)
-    for r in new_rows:
+    ws.append(sub_headers)
+    for r in sub_rows:
         ws.append(r)
     try:
         os.makedirs(os.path.dirname(out_path), exist_ok=True)

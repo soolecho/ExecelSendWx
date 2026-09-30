@@ -134,7 +134,7 @@ class MonitorWorker(QThread):
         rows = monitor_engine.filter_rows(
             headers, all_rows, task.filter_column, task.filter_values
         )
-        key_columns = [task.filter_column] if task.filter_column else None
+        key_columns = list(task.compare_columns) or ([task.filter_column] if task.filter_column else None)
 
         new_rows: list = rows
         if task.compare_enabled:
@@ -150,44 +150,31 @@ class MonitorWorker(QThread):
                 return False
             new_keys = monitor_engine.build_baseline(headers, rows, key_columns)
 
-        # 有新内容 → 清洗/校验 → 台账追加 → 生成并推送
+        # 有新内容 → 清洗/校验 → 按提取列裁剪 → 生成并推送
         clean_rows, dropped = monitor_engine.apply_clean_rules(
             headers, new_rows, task.clean_rules
         )
         for d in dropped:
             self.emit(f"{log_prefix} 任务「{task.name}」行{d['row_idx'] + 1} 清洗剔除（{d['column']}）: {d['reason']}")
 
-        if task.ledger_enabled and task.ledger_path and clean_rows:
-            try:
-                written = monitor_engine.append_to_ledger(
-                    headers, clean_rows, task.ledger_path,
-                    sheet_name=task.ledger_sheet,
-                    remark_col=task.ledger_remark_col,
-                    remark_text=task.ledger_remark_text,
-                    exclude_extra=task.ledger_exclude_extra,
-                    clean_rules=task.clean_rules,
-                    log_fn=lambda m: logger.info("monitor ledger: %s", m),
-                )
-                self.emit(f"{log_prefix} 任务「{task.name}」已追加 {written} 行到台账 {os.path.basename(task.ledger_path)}")
-            except Exception as exc:
-                logger.exception("台账追加失败")
-                self.emit(f"{log_prefix} 任务「{task.name}」台账追加失败: {exc}")
-
-        # 推送/生成基于清洗后的行；文字说明基于清洗结果
+        # 推送/生成基于清洗后的行 + 指定的提取列；文字说明基于裁剪后的结果
+        view_headers, view_rows = monitor_engine.extract_columns_by(
+            headers, clean_rows, task.extract_columns
+        )
         texts = []
         png_path: Optional[str] = None
         out_file: Optional[str] = None
         if task.send_text:
-            texts.append(monitor_engine.render_rows_text(headers, clean_rows))
+            texts.append(monitor_engine.render_rows_text(view_headers, view_rows))
         if task.send_image:
             tmp = os.path.join(tempfile.gettempdir(),
                                f"monitor_{datetime.now().strftime('%H%M%S%f')}.png")
-            png_path = monitor_engine.render_rows_image(headers, clean_rows, tmp,
+            png_path = monitor_engine.render_rows_image(view_headers, view_rows, tmp,
                                                         log_fn=lambda m: logger.info("monitor img: %s", m))
         if task.send_file:
             tmpx = os.path.join(tempfile.gettempdir(),
                                 f"monitor_{datetime.now().strftime('%H%M%S%f')}.xlsx")
-            out_file = monitor_engine.build_out_file(headers, clean_rows, tmpx)
+            out_file = monitor_engine.build_out_file(view_headers, view_rows, tmpx)
 
         self.emit(f"{log_prefix} 任务「{task.name}」文件「{name}」检出新增 {len(new_rows)} 条，清洗后保留 {len(clean_rows)} 条，开始推送…")
 
