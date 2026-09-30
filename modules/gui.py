@@ -6467,41 +6467,53 @@ class MonitorTab(QWidget):
                 if list_widget.item(i).isSelected()]
 
     def _fill_columns_list(self, list_widget, headers, selected):
-        selected_ordered = list(selected or [])
-        selected_set = set(selected_ordered)
+        """填充某个列设置列表。
+
+        关键：已配置/选中的列按用户录入顺序排在顶部，其余未选中表头随后，
+        保证保存后重载不改变用户设定的列顺序（_selected_cols 按列表顺序返回）。
+        headers 传入为空时仅显示已配置列（避免与其它列表串台成同一组列）。
+        """
+        selected_set = set()
+        selected_ordered = []
+        for c in (selected or []):
+            cs = str(c).strip()
+            if cs and cs not in selected_set:
+                selected_set.add(cs)
+                selected_ordered.append(cs)
+        # 表头候选去重保序
+        head = []
+        seen_h = set()
+        for h in headers:
+            hs = str(h).strip()
+            if hs and hs not in seen_h:
+                seen_h.add(hs)
+                head.append(hs)
+        # 显示顺序 = 已配置列(保序)在前，其余未选中表头随后
+        order = []
+        seen = set()
+        for c in selected_ordered:
+            if c not in seen:
+                seen.add(c)
+                order.append(c)
+        for h in head:
+            if h not in seen:
+                seen.add(h)
+                order.append(h)
         list_widget.blockSignals(True)
         list_widget.clear()
-        header_set = set()
-        for h in headers:
-            hs = str(h)
-            if not hs.strip():
-                continue
-            header_set.add(hs)
-            it = QListWidgetItem(hs)
+        for name in order:
+            it = QListWidgetItem(name)
             list_widget.addItem(it)
-            it.setSelected(hs in selected_set)
-        # 表头为空时（尚未读取）也要保留已配置的列，保证加载配置不丢
-        for c in selected_ordered:
-            if c and c not in header_set:
-                it = QListWidgetItem(c)
-                list_widget.addItem(it)
-                it.setSelected(True)
+            it.setSelected(name in selected_set)
         list_widget.blockSignals(False)
 
     def _current_headers(self) -> List[str]:
-        """当前表头候选：优先从筛选列下拉取已加载表头；否则回退到三个列列表里的列。"""
+        """当前表头候选：已加载到筛选列下拉的表头（不含跨列表合并）。"""
         headers = []
         for i in range(self.filter_column_combo.count()):
-            h = self.filter_column_combo.itemText(i)
-            if h:
+            h = self.filter_column_combo.itemText(i).strip()
+            if h and h not in headers:
                 headers.append(h)
-        if headers:
-            return headers
-        for lw in (self.clean_cols_list, self.extract_cols_list, self.compare_cols_list):
-            for i in range(lw.count()):
-                h = lw.item(i).text().strip()
-                if h and h not in headers:
-                    headers.append(h)
         return headers
 
     def _build_clean_rules(self, cols) -> List:
