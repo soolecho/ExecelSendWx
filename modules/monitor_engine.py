@@ -162,32 +162,9 @@ def render_rows_text(
     return "\n".join(lines)
 
 
-def render_html(headers: List[str], rows: List[List[str]]) -> str:
-    """生成带样式的 HTML 表格（供图片渲染/文件导出复用）。"""
-    cells = ["<tr><th>序号</th>"] + [f"<th>{_esc(h)}</th>" for h in headers] + ["</tr>"]
-    body = []
-    for i, r in enumerate(rows, start=1):
-        body.append("<tr><td>{}</td>".format(i) + "".join(
-            f"<td>{_esc(str(c))}</td>" for c in r
-        ) + "</tr>")
-    html = (
-        "<html><head><meta charset='utf-8'><style>"
-        "table{border-collapse:collapse;font-family:'Microsoft YaHei',sans-serif;font-size:13px}"
-        "th,td{border:1px solid #ccc;padding:5px 9px;text-align:left}"
-        "th{background:#f0f0f0}</style></head><body><table>"
-        + "".join(cells) + "".join(body) + "</table></body></html>"
-    )
-    return html
-
-
-def _esc(text: str) -> str:
-    return (
-        str(text)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-    )
+def _disp_width(text) -> int:
+    """显示宽度：中文/全角按 2，半角按 1（用于列宽估算）。"""
+    return sum(2 if ord(ch) > 0x2E80 else 1 for ch in str(text))
 
 
 def render_rows_image(
@@ -196,49 +173,115 @@ def render_rows_image(
     out_png: str,
     log_fn=None,
 ) -> Optional[str]:
-    """尽力把表格渲染成 PNG。返回成功时的路径；环境不支持则返回 None（调用方自动跳过图片推送）。"""
-    log = log_fn or (lambda msg: None)
-    html = render_html(headers, rows)
+    """用 QPainter 直接绘制表格为 PNG（不依赖 QtWebEngine，worker 线程可用）。
+
+    特性：
+    - 列宽按表头/内容自适应（自动展开，无需手动拉宽）
+    - 超长单元格自动折行、行高自适应，保证内容发全
+    返回生成路径；异常返回 None。
+    """
     try:
-        from PyQt6.QtCore import QEventLoop, QTimer, QUrl
-        from PyQt6.QtWebEngineWidgets import QWebEngineView  # type: ignore
-        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtCore import QRect, Qt
+        from PyQt6.QtGui import (QColor, QFont, QFontMetrics, QImage, QPainter,
+                                 QPen)
 
-        QApplication.instance() or QApplication([])
-        view = QWebEngineView()
-        view.resize(1000, 200 + len(rows) * 30)
-        view.load(QUrl.fromLocalFile(_write_tmp_html(html, out_png)))
+        data = [list(r) for r in (rows or [])]
+        hds = [str(h) for h in (headers or [])]
+        ncol = max(len(hds), max((len(r) for r in data), default=0))
+        if ncol == 0:
+            return None
+        hds = (hds + [""] * ncol)[:ncol]
+        data = [(r + [""] * ncol)[:ncol] for r in data]
 
-        loop = QEventLoop()
-        image_holder = {}
+        font = QFont("Microsoft YaHei", 10)
+        fm = QFontMetrics(font)
+        pad = 8
+        max_col_px = 520          # 超长列折行宽度上限
+        min_col_px = 60
 
-        def on_ready():
-            QTimer.singleShot(150, _grab)
+        # 列宽：表头与内容实际像素宽度（含 padding），超长封顶后自动折行
+        col_w = []
+        for c in range(ncol):
+            w = max(fm.horizontalAdvance(hds[c]) + pad * 2, min_col_px)
+            for r in data:
+                w = max(w, fm.horizontalAdvance(str(r[c])) + pad * 2)
+            col_w.append(min(w, max_col_px))
 
-        def _grab():
-            image_holder["img"] = view.grab()
-            loop.quit()
+        def _wrap(text: str, width: int) -> list:
+            t = str(text)
+            if not t:
+                return [""]
+            lines, cur = [], ""
+            for ch in t:
+                if cur and fm.horizontalAdvance(cur + ch) > width - pad * 2:
+                    lines.append(cur)
+                    cur = ch
+                else:
+                    cur += ch
+            lines.append(cur)
+            return lines
 
-        view.page().loadFinished.connect(on_ready)
-        timer = QTimer()
-        timer.setSingleShot(True)
-        timer.timeout.connect(loop.quit)
-        timer.start(10000)
-        loop.exec()
-        img = image_holder.get("img")
-        if img is not None:
-            img.save(out_png)
-        return out_png if os.path.exists(out_png) else None
+        cells = [[_wrap(str(r[c]), col_w[c]) for c in range(ncol)] for r in data]
+        header_h = max(fm.height() + pad * 2, 34)
+        row_h = [
+            max(fm.lineSpacing() * len(cells[i][c]) + pad * 2 for c in range(ncol))
+            for i in range(len(data))
+        ]
+        total_w = sum(col_w) + 1
+        total_h = header_h + sum(row_h) + 1
+
+        img = QImage(total_w, total_h, QImage.Format.Format_ARGB32)
+        img.fill(QColor("white"))
+        p = QPainter(img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setFont(font)
+        grid_pen = QPen(QColor("#d0d0d0"))
+        header_bg = QColor("#2F6FEB")
+        alt_bg = QColor("#F7FAFF")
+
+        # 表头
+        p.fillRect(0, 0, total_w, header_h, header_bg)
+        p.setPen(QPen(QColor("white")))
+        x = 0
+        for c, w in enumerate(col_w):
+            p.drawText(QRect(x + pad, 0, w - pad * 2, header_h),
+                       Qt.AlignmentFlag.AlignVCenter, hds[c])
+            x += w
+
+        # 数据行（自动折行绘制）
+        y = header_h
+        for i, r in enumerate(cells):
+            if i % 2 == 1:
+                p.fillRect(0, y, total_w, row_h[i], alt_bg)
+            p.setPen(QPen(QColor("#333333")))
+            x = 0
+            for c, w in enumerate(col_w):
+                ty = y
+                for ln in r[c]:
+                    p.drawText(QRect(x + pad, ty, w - pad * 2, fm.lineSpacing()),
+                               Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                               ln)
+                    ty += fm.lineSpacing()
+                x += w
+            y += row_h[i]
+
+        # 网格线
+        p.setPen(grid_pen)
+        x = 0
+        for c, w in enumerate(col_w):
+            x += w
+            p.drawLine(x, 0, x, total_h)
+        y = header_h
+        for h in row_h:
+            y += h
+            p.drawLine(0, y, total_w, y)
+        p.end()
+
+        ok = img.save(out_png)
+        return out_png if ok and os.path.exists(out_png) else None
     except Exception as exc:
-        log(f"图片渲染不可用，跳过图片推送：{exc}")
+        (log_fn or (lambda m: None))(f"图片渲染失败，跳过图片推送：{exc}")
         return None
-
-
-def _write_tmp_html(html: str, out_png: str) -> str:
-    tmp = out_png + ".html"
-    with open(tmp, "w", encoding="utf-8") as fp:
-        fp.write(html)
-    return str(tmp).replace("\\", "/")
 
 
 # ---------------------------------------------------------------- 数据清洗/校验（阶段B）
@@ -353,6 +396,13 @@ def build_out_file(
     ws.append(sub_headers)
     for r in sub_rows:
         ws.append([_coerce_numeric(c) for c in r])
+    # 自动调整列宽：按表头与内容最大显示宽度（中文按2宽），上限 50、下限 8
+    for c in range(len(sub_headers)):
+        w = _disp_width(sub_headers[c])
+        for r in sub_rows:
+            w = max(w, _disp_width(r[c]))
+        ws.column_dimensions[openpyxl.utils.get_column_letter(c + 1)].width = \
+            min(max(w + 2, 8), 50)
     try:
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
     except OSError:
