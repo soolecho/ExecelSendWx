@@ -124,9 +124,14 @@ class MonitorWorker(QThread):
                 search = "**/" + pat
             for p in glob.glob(os.path.join(task.watch_path, search),
                                recursive=recursive):
-                if os.path.isfile(p) and p not in seen:
-                    seen.add(p)
-                    out.append(p)
+                if not os.path.isfile(p) or p in seen:
+                    continue
+                base = os.path.basename(p)
+                # 跳过 Excel 打开编辑时的临时锁文件（~$xxx.xlsx）与临时备份（~xxx.tmp）
+                if base.startswith("~$") or (base.startswith("~") and base.lower().endswith(".tmp")):
+                    continue
+                seen.add(p)
+                out.append(p)
         out.sort(key=lambda p: os.path.getmtime(p))
         return out
 
@@ -144,12 +149,14 @@ class MonitorWorker(QThread):
 
         new_rows: list = rows
         if task.compare_enabled:
-            baseline_keys = task.baseline.get(name, [])
+            # 语义：只跟「上一个时间点的文件」对比（滚动快照），找出相对上一份新增的行。
+            # 因此基线只用最近一份文件的行键，而非累积所有历史文件。
+            prev_keys = (task.baseline or {}).get("__prev__", [])
             new_rows, new_keys = monitor_engine.diff_incremental(
-                headers, rows, baseline_keys, key_columns
+                headers, rows, prev_keys, key_columns
             )
             if not new_rows:
-                return False  # 无新增，跳过
+                return False  # 相对上一份无新增，跳过
         else:
             # 关闭对比：文件未见过/指纹变 → 视为新文件
             if not monitor_engine.is_new_file(task.seen_files, fp):
@@ -204,11 +211,11 @@ class MonitorWorker(QThread):
                 logger.exception("推送失败 %s", person)
                 self.emit(f"{log_prefix} → 「{person}」推送失败: {exc}")
 
-        # 更新基线 / 已见文件（无论推送成败，标记已处理避免无限重推）
+        # 更新基线 / 已见文件（无论推送成败，标志已处理避免无限重推）
         if task.compare_enabled:
-            merged = set(task.baseline.get(name, []))
-            merged.update(new_keys)
-            task.baseline[name] = sorted(merged)
+            # 只保留「当前这份文件的全部行键」作为下一轮对比基线（滚动快照，只对比上一个时间点）。
+            # 注意必须存当前文件所有行的键，而非仅 new_keys（新增行），否则下轮会重复推上轮已存在的行。
+            task.baseline = {"__prev__": monitor_engine.build_baseline(headers, rows, key_columns)}
         else:
             task.seen_files[name] = monitor_engine.file_fingerprint(fp)
         self.store.save(task)
