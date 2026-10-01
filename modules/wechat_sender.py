@@ -647,11 +647,11 @@ class WeChatSender:
         """
         if any(k in title for k in cls._DIALOG_TITLE_KEYWORDS):
             return True
-        # 兜底1：标准对话框类(#32770) 或 Qt 弹窗，标题为空且尺寸较小
-        # （排除通话/朋友圈等大窗口），基本就是模态提示弹窗
+        # 兜底1：标题为空 + 尺寸较小（排除通话/朋友圈等大窗口），
+        # 基本就是模态提示弹窗（微信 4.0 的"发送失败"框无标题栏，
+        # 正文直接显示失败文案；类名不限于 Qt，放宽类名避免漏检）
         if not title.strip() and w <= 800 and h <= 600:
-            if class_name == "#32770" or (class_name.startswith("Qt") and "QWindow" in class_name):
-                return True
+            return True
         # 兜底2（发送期间）：任何 Qt 类名的小尺寸顶层窗口，标题为短标题
         # 或含提示类字样，都视为疑似发送失败弹窗（标题栏常显示'微信'，
         # 正文才是失败文案，仅靠关键词会漏检）
@@ -661,6 +661,70 @@ class WeChatSender:
                                                    "发送", "注意", "警告", "异常", "重试")):
                 return True
         return False
+
+    def _click_dialog_button_uia(self, hwnd) -> bool:
+        """通过 UIAutomation 查找弹窗内'知道了/确定'按钮并 Invoke 点击。
+
+        微信 4.0 的"发送失败"框是 Qt 自绘弹窗（无标题栏、无标准 Win32
+        Button 子控件），Win32 消息（Enter/Close 等）经常无响应，但 Qt
+        控件对 UIA 有暴露。此路径按按钮文本精确定位并触发其 Invoke 模式，
+        等价于真实鼠标点击，是关闭该类弹窗最可靠的手段。
+        """
+        try:
+            import comtypes.client
+            import comtypes.gen.UIAutomationClient as UIA
+        except Exception:
+            return False
+        try:
+            # UIAutomationCore 的 CUIAutomation 类没有注册 ProgID，使用固定 CLSID
+            ui_unknown = comtypes.client.CreateObject(
+                "{FF48DBA4-60EF-4201-AA87-54103EEF594E}"
+            )
+            ui = ui_unknown.QueryInterface(UIA.IUIAutomation)
+        except Exception:
+            return False
+        try:
+            el = ui.ElementFromHandle(hwnd)
+            for text in self._DIALOG_CONFIRM_TEXTS:
+                # UIA_NamePropertyId=30005；TreeScope_Descendants=4
+                cond = ui.CreatePropertyCondition(30005, text)
+                found = el.FindFirst(4, cond)
+                if not found:
+                    continue
+                # UIA_InvokePatternId=10000：找到按钮后触发 Invoke（真实点击）
+                pattern = found.GetCurrentPattern(10000)
+                if pattern is not None:
+                    invoke = pattern.QueryInterface(UIA.IUIAutomationInvokePattern)
+                    invoke.Invoke()
+                    time.sleep(0.2)
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _click_dialog_bottom_right(self, hwnd) -> bool:
+        """终极兜底：模拟鼠标点击弹窗右下角区域。
+
+        Windows 惯例把默认/确认按钮放在右下角，'知道了'按钮通常位于
+        弹窗底部偏右。UIA 不可用或未命中按钮文本时，盲点该区域。
+        """
+        try:
+            import win32gui
+            import ctypes
+            import time as _t
+
+            rect = win32gui.GetWindowRect(hwnd)
+            x = rect[0] + int((rect[2] - rect[0]) * 0.85)
+            y = rect[1] + int((rect[3] - rect[1]) * 0.82)
+            user32 = ctypes.windll.user32
+            user32.SetCursorPos(x, y)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
+            _t.sleep(0.05)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
+            _t.sleep(0.2)
+            return True
+        except Exception:
+            return False
 
     def _close_dialog_hwnd(self, hwnd, title, class_name) -> bool:
         """关闭指定弹窗。优先 PostMessage 直接点击'确定'按钮（不依赖前台，
@@ -707,6 +771,15 @@ class WeChatSender:
         except Exception:
             pass
 
+        # 2.1) UIAutomation 精确定位'知道了/确定'按钮并 Invoke（微信 4.0
+        #      Qt 自绘弹窗最可靠关闭方式，等价真实鼠标点击按钮）
+        try:
+            if self._click_dialog_button_uia(hwnd):
+                if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                    return True
+        except Exception:
+            pass
+
         # 2.5) 直接请求关闭窗口 / 发送 IDOK 命令 / Esc 键
         # （Qt 自绘弹窗对标准 Button 与 Enter 可能无响应，这三条消息覆盖面更广）
         try:
@@ -740,6 +813,18 @@ class WeChatSender:
         time.sleep(0.1)
         self._send_enter_key()
         time.sleep(0.15)
+        try:
+            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                return True
+        except Exception:
+            pass
+
+        # 4) 终极兜底：模拟鼠标点击弹窗右下角（'知道了'按钮惯例位置）
+        try:
+            if self._click_dialog_bottom_right(hwnd):
+                time.sleep(0.2)
+        except Exception:
+            pass
         try:
             return not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd)
         except Exception:
