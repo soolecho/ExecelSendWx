@@ -6070,6 +6070,13 @@ class MonitorTab(QWidget):
         base_layout.addLayout(row)
 
         row = QHBoxLayout()
+        row.addWidget(QLabel("文件前缀:"))
+        self.prefix_edit = QLineEdit()
+        self.prefix_edit.setPlaceholderText("留空匹配全部文件；填如 主干及分支 只处理同名开头的文件")
+        row.addWidget(self.prefix_edit, 1)
+        base_layout.addLayout(row)
+
+        row = QHBoxLayout()
         row.addWidget(QLabel("扫描周期(分钟):"))
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(1, 1440)
@@ -6325,6 +6332,7 @@ class MonitorTab(QWidget):
         self.name_edit.textChanged.connect(mark)
         self.watch_path_edit.textChanged.connect(mark)
         self.pattern_edit.textChanged.connect(mark)
+        self.prefix_edit.textChanged.connect(mark)
         self.interval_spin.valueChanged.connect(mark)
         self.sheet_edit.textChanged.connect(mark)
         self.filter_column_combo.currentTextChanged.connect(mark)
@@ -6619,6 +6627,7 @@ class MonitorTab(QWidget):
             self.name_edit.setText(task.name)
             self.watch_path_edit.setText(task.watch_path)
             self.pattern_edit.setText(task.file_pattern)
+            self.prefix_edit.setText(task.file_prefix)
             self.interval_spin.setValue(task.poll_interval_min)
             self.sheet_edit.setText(task.sheet_name)
             self.filter_column_combo.setCurrentText(task.filter_column)
@@ -6686,6 +6695,7 @@ class MonitorTab(QWidget):
         task.enabled = True
         task.watch_path = watch_path
         task.file_pattern = self.pattern_edit.text().strip() or "*.xlsx;*.xls"
+        task.file_prefix = self.prefix_edit.text().strip()
         task.poll_interval_min = self.interval_spin.value()
         task.sheet_name = self.sheet_edit.text().strip()
         task.filter_column = self.filter_column_combo.currentText().strip()
@@ -6794,6 +6804,7 @@ class MonitorTab(QWidget):
             self.name_edit.clear()
             self.watch_path_edit.clear()
             self.pattern_edit.setText("*.xlsx;*.xls")
+            self.prefix_edit.clear()
             self.interval_spin.setValue(5)
             self.sheet_edit.clear()
             self.filter_column_combo.clear()

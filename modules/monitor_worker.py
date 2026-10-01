@@ -134,6 +134,10 @@ class MonitorWorker(QThread):
                 # 跳过 Excel 打开编辑时的临时锁文件（~$xxx.xlsx）与临时备份（~xxx.tmp）
                 if base.startswith("~$") or (base.startswith("~") and base.lower().endswith(".tmp")):
                     continue
+                # 文件名前缀过滤：非空时只处理以该前缀开头的文件（如"主干及分支"）
+                if getattr(task, "file_prefix", "") and not base.startswith(
+                        str(task.file_prefix).strip()):
+                    continue
                 seen.add(p)
                 out.append(p)
         out.sort(key=lambda p: os.path.getmtime(p))

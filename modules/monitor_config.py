@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
-MONITOR_VERSION = 3
+MONITOR_VERSION = 4
 
 
 @dataclass
@@ -112,6 +112,8 @@ class MonitorTask:
     # 文件来源
     watch_path: str = ""
     file_pattern: str = "*.xlsx;*.xls"
+    # 文件名前缀过滤：非空时只处理文件名以该前缀开头的文件；留空=全量
+    file_prefix: str = ""
     # 筛选规则：sheet_name 空=第一个 sheet；filter_column 空=不筛选(全表)
     sheet_name: str = ""
     filter_column: str = ""
@@ -202,6 +204,7 @@ class MonitorTask:
             enabled=_b("enabled", True),
             watch_path=_s("watch_path"),
             file_pattern=_s("file_pattern", "*.xlsx;*.xls"),
+            file_prefix=_s("file_prefix"),
             sheet_name=_s("sheet_name"),
             filter_column=_s("filter_column"),
             filter_values=_split_list(data.get("filter_values")),
