@@ -6446,11 +6446,18 @@ class MonitorTab(QWidget):
             list_widget.addItem(item)
             item.setSelected(True)
             combo.clearEditText()
+            # addItem 不会触发 itemChanged，需显式置脏以弹开保存栏
+            self._mark_form_dirty()
 
         def _del_col():
+            removed = False
             for i in list(range(list_widget.count() - 1, -1, -1)):
                 if list_widget.item(i).isSelected():
                     list_widget.takeItem(i)
+                    removed = True
+            # takeItem 不会触发 itemChanged，需显式置脏以弹开保存栏
+            if removed:
+                self._mark_form_dirty()
 
         combo.lineEdit().returnPressed.connect(_add_col)
         add_btn.clicked.connect(_add_col)
