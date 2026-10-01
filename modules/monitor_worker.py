@@ -258,6 +258,9 @@ class MonitorWorker(QThread):
 
         # 清理临时图/表：延迟 15s 再删。wxauto 的 SendFiles 返回时微信只是开始异步上传，
         # 立即删除会导致上传读到一半文件消失而发送失败。
+        # 注意：threading.Timer 不接受 daemon 直接关键字（daemon 只支持经 kwargs 传入，
+        # 且仅 Python 3.10+），直接传 daemon=True 会抛 TypeError 导致任务被误判失败，
+        # 因此这里不传 daemon（Python 3.10+ Timer 默认即 daemon）。
         def _delayed_remove(path: str) -> None:
             def _rm() -> None:
                 try:
@@ -265,11 +268,15 @@ class MonitorWorker(QThread):
                         os.remove(path)
                 except OSError:
                     pass
-            threading.Timer(15.0, _rm, daemon=True).start()
+            threading.Timer(15.0, _rm).start()
 
-        for tmp in (png_path, out_file):
-            if tmp and os.path.exists(tmp):
-                _delayed_remove(tmp)
+        # 清理环节异常（如定时器创建失败）只记录日志，不得中断/误判本轮发送结果
+        try:
+            for tmp in (png_path, out_file):
+                if tmp and os.path.exists(tmp):
+                    _delayed_remove(tmp)
+        except Exception as exc:
+            logger.warning("清理监控临时文件失败（不影响发送结果）: %s", exc)
         if msg_delivered:
             self.emit(f"{log_prefix} 任务「{task.name}」推送完成，接收人 {msg_delivered} 个")
         elif msg_failed:
