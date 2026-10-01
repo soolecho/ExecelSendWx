@@ -292,7 +292,7 @@ def apply_clean_rules(
 ) -> Tuple[List[List[str]], List[dict]]:
     """按每任务的清洗/校验规则加工行。
 
-    每列加工顺序：去空 -> 去非数字 -> 取前N位 -> 前缀校验。
+    每列加工顺序：去空格 -> 去空 -> 去非数字 -> 取前N位 -> 前缀校验。
     on_fail="drop" 该行剔除；on_fail="keep" 保留清洗后的值但不拦该行。
     返回 (清洗后保留的行, 剔除信息列表 [{row_idx, column, reason}]).
     """
@@ -324,6 +324,15 @@ def apply_clean_rules(
             val = raw
             if rule.strip_space:
                 val = val.replace(" ", "").replace("\u3000", "")
+            if rule.drop_empty and not val.strip():
+                dropped.append(
+                    {"row_idx": r_idx, "column": rule.column,
+                     "reason": f"内容为空(清洗后): {raw}"}
+                )
+                if rule.on_fail == "drop":
+                    keep_row = False
+                    break
+                continue
             if rule.keep_digits_only:
                 val = "".join(ch for ch in val if ch.isdigit())
             if rule.take_first_n > 0:

@@ -27,12 +27,13 @@ MONITOR_VERSION = 4
 class CleanRule:
     """单条数据清洗/校验规则。
 
-    加工顺序：去空(str.replace(' ')) -> 去非数字(keep_digits_only) ->
-    取前 N 位(take_first_n>0) -> 前缀校验(require_prefix 非空时 startswith)。
+    加工顺序：去空格(strip_space) -> 去空(drop_empty，空值剔除) ->
+    去非数字(keep_digits_only) -> 取前 N 位(take_first_n>0) -> 前缀校验(require_prefix 非空时 startswith)。
     on_fail="drop" 整行剔除；on_fail="keep" 保留清洗后的值但不本行剔除外。
     """
     column: str = ""
     strip_space: bool = True
+    drop_empty: bool = False     # 清洗后为空则按 on_fail 处理（drop=剔除该行）
     keep_digits_only: bool = False
     take_first_n: int = 0        # 0=不截取
     require_prefix: str = ""
@@ -63,6 +64,7 @@ class CleanRule:
         return cls(
             column=_s("column"),
             strip_space=_b("strip_space", True),
+            drop_empty=_b("drop_empty", False),
             keep_digits_only=_b("keep_digits_only", False),
             take_first_n=max(0, _i("take_first_n", 0)),
             require_prefix=_s("require_prefix"),

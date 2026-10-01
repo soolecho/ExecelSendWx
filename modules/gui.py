@@ -6071,9 +6071,9 @@ class MonitorTab(QWidget):
 
         row = QHBoxLayout()
         row.addWidget(QLabel("文件前缀:"))
-        self.prefix_edit = QLineEdit()
-        self.prefix_edit.setPlaceholderText("留空匹配全部文件；填如 主干及分支 只处理同名开头的文件")
-        row.addWidget(self.prefix_edit, 1)
+        self.file_prefix_edit = QLineEdit()
+        self.file_prefix_edit.setPlaceholderText("留空匹配全部文件；填如 主干及分支 只处理同名开头的文件")
+        row.addWidget(self.file_prefix_edit, 1)
         base_layout.addLayout(row)
 
         row = QHBoxLayout()
@@ -6162,8 +6162,11 @@ class MonitorTab(QWidget):
         row.addWidget(QLabel("清洗方式:"))
         self.strip_space_check = QCheckBox("去空格")
         self.strip_space_check.setChecked(True)
+        self.drop_empty_check = QCheckBox("去空(空剔除)")
+        self.drop_empty_check.setToolTip("勾选后，该列清洗后为空的单元格所在行按下方规则剔除/保留")
         self.digits_check = QCheckBox("去非数字")
         row.addWidget(self.strip_space_check)
+        row.addWidget(self.drop_empty_check)
         row.addWidget(self.digits_check)
         col_layout.addLayout(row)
 
@@ -6332,7 +6335,7 @@ class MonitorTab(QWidget):
         self.name_edit.textChanged.connect(mark)
         self.watch_path_edit.textChanged.connect(mark)
         self.pattern_edit.textChanged.connect(mark)
-        self.prefix_edit.textChanged.connect(mark)
+        self.file_prefix_edit.textChanged.connect(mark)
         self.interval_spin.valueChanged.connect(mark)
         self.sheet_edit.textChanged.connect(mark)
         self.filter_column_combo.currentTextChanged.connect(mark)
@@ -6346,6 +6349,7 @@ class MonitorTab(QWidget):
         self.text_detail_check.stateChanged.connect(mark)
         self.include_subdir_check.stateChanged.connect(mark)
         self.strip_space_check.stateChanged.connect(mark)
+        self.drop_empty_check.stateChanged.connect(mark)
         self.digits_check.stateChanged.connect(mark)
         self.take_first_spin.valueChanged.connect(mark)
         self.prefix_edit.textChanged.connect(mark)
@@ -6591,6 +6595,7 @@ class MonitorTab(QWidget):
             rules.append(CleanRule(
                 column=c,
                 strip_space=self.strip_space_check.isChecked(),
+                drop_empty=self.drop_empty_check.isChecked(),
                 keep_digits_only=self.digits_check.isChecked(),
                 take_first_n=self.take_first_spin.value(),
                 require_prefix=self.prefix_edit.text().strip(),
@@ -6627,7 +6632,7 @@ class MonitorTab(QWidget):
             self.name_edit.setText(task.name)
             self.watch_path_edit.setText(task.watch_path)
             self.pattern_edit.setText(task.file_pattern)
-            self.prefix_edit.setText(task.file_prefix)
+            self.file_prefix_edit.setText(task.file_prefix)
             self.interval_spin.setValue(task.poll_interval_min)
             self.sheet_edit.setText(task.sheet_name)
             self.filter_column_combo.setCurrentText(task.filter_column)
@@ -6642,6 +6647,7 @@ class MonitorTab(QWidget):
             self.include_subdir_check.setChecked(task.include_subdir)
             # 列设置：勾选清洗/保留/对比列，并应用统一清洗方式
             self.strip_space_check.setChecked(True)
+            self.drop_empty_check.setChecked(False)
             self.digits_check.setChecked(False)
             self.take_first_spin.setValue(0)
             self.prefix_edit.clear()
@@ -6649,6 +6655,7 @@ class MonitorTab(QWidget):
             if task.clean_rules:
                 r0 = task.clean_rules[0]
                 self.strip_space_check.setChecked(r0.strip_space)
+                self.drop_empty_check.setChecked(getattr(r0, "drop_empty", False))
                 self.digits_check.setChecked(r0.keep_digits_only)
                 self.take_first_spin.setValue(r0.take_first_n)
                 self.prefix_edit.setText(r0.require_prefix)
@@ -6695,7 +6702,7 @@ class MonitorTab(QWidget):
         task.enabled = True
         task.watch_path = watch_path
         task.file_pattern = self.pattern_edit.text().strip() or "*.xlsx;*.xls"
-        task.file_prefix = self.prefix_edit.text().strip()
+        task.file_prefix = self.file_prefix_edit.text().strip()
         task.poll_interval_min = self.interval_spin.value()
         task.sheet_name = self.sheet_edit.text().strip()
         task.filter_column = self.filter_column_combo.currentText().strip()
