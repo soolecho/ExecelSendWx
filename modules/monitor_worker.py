@@ -13,6 +13,7 @@ import glob
 import logging
 import os
 import tempfile
+import threading
 import time
 from datetime import datetime
 from typing import Dict, Optional
@@ -238,13 +239,20 @@ class MonitorWorker(QThread):
                 self.emit(f"{log_prefix} 任务「{task.name}」有接收人发送失败，不标记已见文件，下次轮询将重试推送")
         self.store.save(task)
 
-        # 清理临时图/表
-        for tmp in (png_path, out_file):
-            if tmp and os.path.exists(tmp):
+        # 清理临时图/表：延迟 15s 再删。wxauto 的 SendFiles 返回时微信只是开始异步上传，
+        # 立即删除会导致上传读到一半文件消失而发送失败。
+        def _delayed_remove(path: str) -> None:
+            def _rm() -> None:
                 try:
-                    os.remove(tmp)
+                    if os.path.exists(path):
+                        os.remove(path)
                 except OSError:
                     pass
+            threading.Timer(15.0, _rm, daemon=True).start()
+
+        for tmp in (png_path, out_file):
+            if tmp and os.path.exists(tmp):
+                _delayed_remove(tmp)
         if msg_delivered:
             self.emit(f"{log_prefix} 任务「{task.name}」推送完成，接收人 {msg_delivered} 个")
         elif msg_failed:
