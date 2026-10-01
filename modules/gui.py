@@ -7865,7 +7865,8 @@ class MainWindow(QMainWindow):
                 f"成功{result['success']}，失败{result['failed']}"
             )
             # 强制兜底恢复标题/任务栏：无论 worker 结束信号是否正确到达，
-            # finished.wait() 一定返回，这里无条件恢复，杜绝标题永久停“发送中”
+            # 分段等待循环一定退出（正常结束/超时/排队被停止），这里无条件恢复，
+            # 杜绝标题永久停“发送中”
             try:
                 self._schedule_done_signal.emit(
                     int(result.get("failed", 0)),
