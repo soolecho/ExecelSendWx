@@ -221,13 +221,21 @@ class MonitorWorker(QThread):
                 logger.exception("推送失败 %s", person)
                 self.emit(f"{log_prefix} → 「{person}」推送失败: {exc}")
 
-        # 更新基线 / 已见文件（无论推送成败，标志已处理避免无限重推）
+        # 更新基线 / 已见文件：只有发送全部成功才推进，否则保留上一基线，
+        # 让下次轮询重新检出同一批新增并重试（避免"有新增但发送失败"被当作已处理而永久丢失）
         if task.compare_enabled:
-            # 只保留「当前这份文件的全部行键」作为下一轮对比基线（滚动快照，只对比上一个时间点）。
-            # 注意必须存当前文件所有行的键，而非仅 new_keys（新增行），否则下轮会重复推上轮已存在的行。
-            task.baseline = {"__prev__": monitor_engine.build_baseline(headers, rows, key_columns)}
+            if msg_failed:
+                # 存在发送失败：不更新 __prev__ 基线 → 下次轮询重新检出新增行重试
+                self.emit(f"{log_prefix} 任务「{task.name}」有接收人发送失败，保留对比基线，下次轮询将重试推送")
+            else:
+                # 只保留「当前这份文件的全部行键」作为下一轮对比基线（滚动快照，只对比上一个时间点）。
+                # 注意必须存当前文件所有行的键，而非仅 new_keys（新增行），否则下轮会重复推上轮已存在的行。
+                task.baseline = {"__prev__": monitor_engine.build_baseline(headers, rows, key_columns)}
         else:
-            task.seen_files[name] = monitor_engine.file_fingerprint(fp)
+            if not msg_failed:
+                task.seen_files[name] = monitor_engine.file_fingerprint(fp)
+            else:
+                self.emit(f"{log_prefix} 任务「{task.name}」有接收人发送失败，不标记已见文件，下次轮询将重试推送")
         self.store.save(task)
 
         # 清理临时图/表
