@@ -1,5 +1,5 @@
 #define MyAppName "表格自动发送By春风予Lu"
-#define MyAppVersion "1.4.11"
+#define MyAppVersion "1.4.12"
 #define MyAppPublisher "春风予Lu"
 #define MyAppURL "https://github.com/soolecho/ExecelSendWx"
 #define MyAppExeName "表格自动发送By春风予Lu.exe"
