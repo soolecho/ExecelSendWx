@@ -3,6 +3,7 @@ import os
 import glob
 import logging
 import threading
+import time
 from typing import List, Optional, Set, Dict, Tuple, Any
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -848,6 +849,7 @@ class SendWorker(QThread):
         total_count = len(self.tasks)
         sender = None
         result_emitted = False
+        acquired = False  # 是否已获得全局发送批次锁
         # 预初始化：若在赋值前抛异常，finally 还原时不能引用未定义变量
         _orig_sender_log = None
 
@@ -859,6 +861,16 @@ class SendWorker(QThread):
             self.attachment = ""
 
         try:
+            # 全局发送批次锁：与其他发送任务（定时/监控）排队串行
+            acquired = WeChatSender.acquire_batch(
+                log_fn=self.signals.log.emit,
+                should_stop=self.stopped_event.is_set,
+            )
+            if not acquired:
+                self.signals.log.emit("❌ 发送已停止，取消排队")
+                self.signals.result.emit((0, total_count, total_count, list(self.tasks)))
+                result_emitted = True
+                return
             self.tasks = [self._normalize_task(t) for t in self.tasks]
             self.signals.log.emit("初始化微信客户端...")
             sender = WeChatSender.shared_instance()
@@ -947,6 +959,12 @@ class SendWorker(QThread):
                         pass
                 try:
                     sender.cleanup_temp_images()
+                except Exception:
+                    pass
+            # 释放全局发送批次锁（排在最后，保证窗口/清理完成后才轮到下一批次）
+            if acquired:
+                try:
+                    WeChatSender.release_batch()
                 except Exception:
                     pass
 
@@ -1041,6 +1059,8 @@ class ScheduleSendWorker(QThread):
         self._log_cb = log_callback
         self.stopped_event = threading.Event()
         self._sender = None
+        # 是否已获得全局发送批次锁（供调度线程区分"排队中"与"已开始发送"）
+        self._batch_acquired = False
 
     def stop(self):
         self.stopped_event.set()
@@ -1100,6 +1120,15 @@ class ScheduleSendWorker(QThread):
         self.log("[定时] 初始化微信客户端...")
         _orig_sender_log = None
         try:
+            # 全局发送批次锁：与其他发送任务（手动/监控）排队串行
+            self._batch_acquired = WeChatSender.acquire_batch(
+                log_fn=self.log,
+                should_stop=self.stopped_event.is_set,
+            )
+            if not self._batch_acquired:
+                self.log("[定时] ❌ 已停止，取消排队")
+                self.finished_with_result.emit(0, len(self.recipients), list(self.recipients))
+                return
             self._sender = WeChatSender.shared_instance()
             # 保存原始 log 方法，在结束时还原，避免共享单例的 log 指向已销毁的 QThread
             _orig_sender_log = self._sender.log
@@ -1108,12 +1137,24 @@ class ScheduleSendWorker(QThread):
             if not self._sender.initialize():
                 WeChatSender.reset_shared_instance()
                 self.log("[定时] 微信初始化失败，本次任务失败")
+                if self._batch_acquired:
+                    try:
+                        WeChatSender.release_batch()
+                    except Exception:
+                        pass
+                    self._batch_acquired = False
                 self.finished_with_result.emit(0, len(self.recipients), list(self.recipients))
                 return
             self.log("[定时] 微信客户端初始化成功")
         except Exception as exc:
             self.log(f"[定时] 初始化异常: {exc}")
             WeChatSender.reset_shared_instance()
+            if self._batch_acquired:
+                try:
+                    WeChatSender.release_batch()
+                except Exception:
+                    pass
+                self._batch_acquired = False
             self.finished_with_result.emit(0, len(self.recipients), list(self.recipients))
             return
 
@@ -1214,6 +1255,13 @@ class ScheduleSendWorker(QThread):
                         self._sender.log = _orig_sender_log
                     except Exception:
                         pass
+            # 释放全局发送批次锁（排在最后，保证窗口/清理完成后才轮到下一批次）
+            if self._batch_acquired:
+                try:
+                    WeChatSender.release_batch()
+                except Exception:
+                    pass
+                self._batch_acquired = False
             # 关键：无论正常结束、手动停止还是异常中断，都必须发出结束信号，
             # 主线程据此恢复标题/清除任务栏进度
             self.finished_with_result.emit(
@@ -1241,6 +1289,8 @@ class ProfileChainWorker(QThread):
         self.signals = WorkerSignals()
         self.stopped_event = threading.Event()
         self._sender = None
+        # 是否已获得全局发送批次锁（供调度线程区分"排队中"与"已开始发送"）
+        self._batch_acquired = False
 
     def stop(self):
         self.stopped_event.set()
@@ -1296,6 +1346,15 @@ class ProfileChainWorker(QThread):
             pass
 
         try:
+            # 全局发送批次锁：与其他发送任务（手动/定时/监控）排队串行
+            self._batch_acquired = WeChatSender.acquire_batch(
+                log_fn=self.log,
+                should_stop=self.stopped_event.is_set,
+            )
+            if not self._batch_acquired:
+                self.log("[配置链] ❌ 已停止，取消排队")
+                _emit_finished()
+                return
             self.log("[配置链] 初始化微信客户端...")
             sender = WeChatSender.shared_instance()
             _orig_sender_log = sender.log
@@ -1378,6 +1437,12 @@ class ProfileChainWorker(QThread):
                         sender.log = _orig_sender_log
                     except Exception:
                         pass
+            # 释放全局发送批次锁
+            if self._batch_acquired:
+                try:
+                    WeChatSender.release_batch()
+                except Exception:
+                    pass
             self.log(
                 f"[配置链] 全部结束：{total} 个配置，"
                 f"累计成功 {success_total}，失败 {len(failed_names)}"
@@ -6884,8 +6949,6 @@ class MainWindow(QMainWindow):
     _schedule_trigger_signal = pyqtSignal(object, str)
     # 发送进度开始：attach 可能发生在调度线程，用信号排队到主线程再碰 GUI/COM
     _progress_begin_signal = pyqtSignal()
-    # 定时触发因互斥跳过后，守护线程用它通知主线程恢复按钮状态
-    _schedule_skipped_signal = pyqtSignal()
     # 定时任务执行完毕（成功/超时/异常）后强制恢复标题/任务栏，
     # 不依赖 worker 的 finished_with_result 信号是否正确到达，
     # 避免无人值守时窗口标题永久停在“发送中…”
@@ -6925,9 +6988,6 @@ class MainWindow(QMainWindow):
         # 因为子线程没有 Qt event loop，singleShot 永远不会触发
         self._schedule_log_signal.connect(self._on_schedule_log_signal)
         self._schedule_trigger_signal.connect(self._on_schedule_trigger_in_main)
-        self._schedule_skipped_signal.connect(
-            self._on_main_schedule_worker_finished_ui
-        )
         # 进度开始信号始终在主线程执行（receiver=MainWindow），保证 setWindowTitle/
         # winId()/COM/托盘 全部在主线程，避免调度线程跨线程操作 GUI
         self._progress_begin_signal.connect(self._begin_send_progress)
@@ -7602,18 +7662,11 @@ class MainWindow(QMainWindow):
         self._schedule_trigger_signal.emit(task, slot)
 
     def _on_schedule_trigger_in_main(self, task: ScheduleTask, slot: str):
-        """主线程 slot：创建 worker（affinity = 主线程），再交给 ScheduleRun 线程执行。"""
-        # 主线程先做一次互斥预检（锁内还有一道竞态兜底）：
-        # 手动发送/立即执行进行中则不创建 worker，按钮状态也无需变动
-        try:
-            if self._is_other_send_running():
-                self._post_schedule_log_from_worker(
-                    f"[定时] ⚠ 任务「{task.name}」时间点 {slot} 与正在进行的"
-                    f"其他发送任务冲突，本次跳过"
-                )
-                return
-        except Exception:
-            pass
+        """主线程 slot：创建 worker（affinity = 主线程），再交给 ScheduleRun 线程执行。
+
+        不再做"与其他发送任务冲突则跳过"的预检：全局发送批次锁会让本任务
+        排队等待其他发送完成后再继续（排队无时间上限，用户确认）。
+        """
         # 主线程内容校验（调度器已校验一次，这里双保险，防止数据在窗口内被改坏）
         problem = ScheduleDispatcher._validate_task_content(task)
         if problem:
@@ -7681,30 +7734,10 @@ class MainWindow(QMainWindow):
 
     def _run_schedule_task_serialized(self, task: ScheduleTask, slot: str, worker: "ScheduleSendWorker"):
         with self._schedule_running_lock:
-            # 互斥：用户可能正在手动发送/刚点了“立即执行”。定时触发只在本锁内
-            # 与其他定时任务互斥，这里再补一道跨通道检查，避免两个 worker 同时
-            # 驱动同一个微信单例。跳过本次触发（当日 fired_log 已记，不补跑）。
-            try:
-                if self._is_other_send_running(exclude=worker):
-                    self._post_schedule_log_from_worker(
-                        f"[定时] ⚠ 任务「{task.name}」时间点 {slot} 与正在进行的"
-                        f"其他发送任务冲突，本次跳过"
-                    )
-                    # worker 从未 start，finished 不会触发，用信号通知主线程恢复按钮
-                    try:
-                        self._schedule_skipped_signal.emit()
-                    except Exception:
-                        pass
-                    try:
-                        worker.deleteLater()
-                    except Exception:
-                        pass
-                    if worker is self._schedule_worker:
-                        self._schedule_worker = None
-                    return
-            except Exception:
-                pass
-
+            # 与其他定时任务用本锁互斥；跨通道（手动/监控/立即执行）不再做
+            # "冲突则跳过"，统一交给全局发送批次锁排队：本任务会在其他发送
+            # 完成后自动继续（排队无时间上限）。worker 排队期间被手动停止
+            # 时 acquire_batch 会返回 False，worker 自行结束并发出结束信号。
             # 按任务配置启动防锁定守护
             if getattr(task, "keep_unlocked", False):
                 if not self.workstation_guard.is_running():
@@ -7765,8 +7798,28 @@ class MainWindow(QMainWindow):
             else:
                 total_timeout = max(60.0, 60.0 * (len(task.recipients) or 1) * 10.0)
             total_timeout = min(total_timeout, 12 * 3600.0)
-            finished.wait(timeout=total_timeout)
-            if not finished.is_set():
+
+            # 等待策略：先等 worker 拿到全局发送批次锁（排队阶段无超时上限，
+            # 用户确认"排队无时间上限"）；拿到锁后才开始计算任务总超时。
+            # 排队期间被手动停止时，worker 未拿锁即结束（finished 置位）。
+            run_started_ts = None  # worker 拿到批次锁、真正开始发送的时间
+            timed_out = False
+            while not finished.is_set():
+                if run_started_ts is None and getattr(worker, "_batch_acquired", False):
+                    run_started_ts = time.time()
+                if run_started_ts is not None:
+                    if time.time() - run_started_ts >= total_timeout:
+                        timed_out = True
+                        break
+                # 兜底：worker 线程异常退出且从未拿到锁，避免无限轮询
+                try:
+                    if not worker.isRunning() and run_started_ts is None:
+                        break
+                except Exception:
+                    pass
+                if finished.wait(1.0):
+                    break
+            if timed_out:
                 self._post_schedule_log_from_worker(
                     f"[定时] ⚠ 任务「{task.name}」执行超时（{int(total_timeout)}秒），强制停止"
                 )

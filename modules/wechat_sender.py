@@ -58,6 +58,62 @@ class WeChatSender:
     _shared_lock = threading.Lock()
     _shared_instance: "WeChatSender | None" = None
 
+    # 全局发送批次锁：手动/定时/监控所有发送批次在此排队串行，
+    # 避免多个 worker 同时驱动同一份微信句柄导致窗口争抢发错对象。
+    # _BATCH_ACTIVE>0 表示当前有批次持锁（供弹窗 watchdog 门控判断）。
+    _BATCH_LOCK = threading.Lock()
+    _BATCH_ACTIVE = 0
+    _BATCH_STATE_LOCK = threading.Lock()
+
+    @classmethod
+    def is_batch_active(cls) -> bool:
+        """是否有发送批次正在持锁运行（弹窗 watchdog 据此决定是否扫描）。"""
+        with cls._BATCH_STATE_LOCK:
+            return cls._BATCH_ACTIVE > 0
+
+    @classmethod
+    def acquire_batch(cls, log_fn=None, should_stop=None) -> bool:
+        """获取全局发送批次锁（阻塞排队，可被 should_stop 中断）。
+
+        返回 True=已获得锁；False=被 should_stop 中断放弃排队。
+        等待期间每 ~5s 提示一次，首次等待即提示"排队等待"。
+        """
+        waited = False
+        last_hint = 0.0
+        while True:
+            if cls._BATCH_LOCK.acquire(timeout=0.5):
+                with cls._BATCH_STATE_LOCK:
+                    cls._BATCH_ACTIVE += 1
+                return True
+            if should_stop and should_stop():
+                return False
+            now = time.time()
+            if not waited:
+                waited = True
+                last_hint = now
+                if log_fn:
+                    try:
+                        log_fn("⏳ 有其他发送任务正在进行，本任务排队等待其完成后继续…")
+                    except Exception:
+                        pass
+            elif now - last_hint >= 5.0:
+                last_hint = now
+                if log_fn:
+                    try:
+                        log_fn("⏳ 仍在排队等待其他发送任务完成…")
+                    except Exception:
+                        pass
+
+    @classmethod
+    def release_batch(cls) -> None:
+        """释放全局发送批次锁。未持锁时调用不抛异常。"""
+        try:
+            with cls._BATCH_STATE_LOCK:
+                cls._BATCH_ACTIVE = max(0, cls._BATCH_ACTIVE - 1)
+            cls._BATCH_LOCK.release()
+        except Exception:
+            pass
+
     def __init__(self):
         self.wx = None
         # 最近一次确认句柄可用的时间戳；超时会先做一次轻量探活
@@ -525,6 +581,8 @@ class WeChatSender:
     _DIALOG_TITLE_KEYWORDS = (
         "发送失败", "发送出错", "消息发送失败", "发送中断",
         "操作频繁", "过于频繁", "无法发送", "重新发送", "网络错误",
+        "网络异常", "请求超时", "无法连接", "操作太频繁",
+        "发送过于频繁", "内容违规",
     )
     _DIALOG_CONFIRM_TEXTS = ("确定", "OK", "好的", "知道了", "重试")
 
@@ -535,7 +593,7 @@ class WeChatSender:
             return True
         # 兜底：标准对话框类(#32770) 或 Qt 弹窗，标题为空且尺寸较小
         # （排除通话/朋友圈等大窗口），基本就是模态提示弹窗
-        if not title.strip() and w <= 620 and h <= 440:
+        if not title.strip() and w <= 800 and h <= 600:
             if class_name == "#32770" or (class_name.startswith("Qt") and "QWindow" in class_name):
                 return True
         return False
@@ -579,6 +637,31 @@ class WeChatSender:
         try:
             win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
             win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
+            time.sleep(0.15)
+            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                return True
+        except Exception:
+            pass
+
+        # 2.5) 直接请求关闭窗口 / 发送 IDOK 命令 / Esc 键
+        # （Qt 自绘弹窗对标准 Button 与 Enter 可能无响应，这三条消息覆盖面更广）
+        try:
+            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+            time.sleep(0.15)
+            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                return True
+        except Exception:
+            pass
+        try:
+            win32gui.PostMessage(hwnd, win32con.WM_COMMAND, 1, 0)  # IDOK=1
+            time.sleep(0.15)
+            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                return True
+        except Exception:
+            pass
+        try:
+            win32gui.PostMessage(hwnd, win32con.WM_KEYDOWN, win32con.VK_ESCAPE, 0)
+            win32gui.PostMessage(hwnd, win32con.WM_KEYUP, win32con.VK_ESCAPE, 0)
             time.sleep(0.15)
             if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
                 return True
@@ -634,15 +717,13 @@ class WeChatSender:
             return found
 
     def _ensure_dialog_watchdog(self):
-        """确保弹窗守护线程在运行。发送期间每 0.5 秒扫描一次弹窗，
-        空闲超过 15 秒（无发送调用）自动退出。
+        """确保弹窗守护线程在运行（常驻 daemon，幂等启动）。
 
-        关键作用：微信'发送失败'弹窗是模态对话框，会阻塞 SendMsg 的
-        UIA 调用导致其不返回，发送线程内的'发送后检测'永远执行不到；
-        独立线程扫描可在 0.5 秒内关掉弹窗解除阻塞，防止批量任务卡死。
+        每 0.5 秒扫描一次微信弹窗；仅当有发送批次持锁
+        （is_batch_active()）时才实际执行关闭，避免误关用户手动
+        在微信里操作产生的弹窗。线程随进程退出，无需 stop。
         """
         with self._watchdog_lock:
-            self._watchdog_deadline = time.time() + 15.0
             t = self._watchdog_thread
             if t is not None and t.is_alive():
                 return
@@ -656,14 +737,12 @@ class WeChatSender:
     def _dialog_watchdog_loop(self):
         while True:
             try:
-                self._dismiss_send_failure_dialog()
+                # 发送批次持锁时才扫描关闭（门控），空闲/用户手动操作不干预
+                if self.is_batch_active():
+                    self._dismiss_send_failure_dialog()
             except Exception:
                 pass
-            with self._watchdog_lock:
-                remaining = self._watchdog_deadline - time.time()
-            if remaining <= 0:
-                return
-            time.sleep(min(0.5, max(0.1, remaining)))
+            time.sleep(0.5)
 
     def _send_msg_with_dialog_retry(self, content, recipient, stop_event=None) -> bool:
         """发送消息，检测发送失败弹窗并重试。最多 3 次。

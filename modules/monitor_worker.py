@@ -204,23 +204,40 @@ class MonitorWorker(QThread):
 
         self.emit(f"{log_prefix} 任务「{task.name}」文件「{name}」检出新增 {len(new_rows)} 条，清洗后保留 {len(clean_rows)} 条，开始推送…")
 
+        # 全局发送批次锁：与其他发送任务（手动/定时/链路）排队串行，
+        # 避免多个 worker 同时驱动同一份微信句柄导致窗口争抢发错对象。
+        # 排队无时间上限；队列期间被停止则返回 None（跳过本轮）。
+        acquired = WeChatSender.acquire_batch(
+            log_fn=lambda m: self.emit(m),
+            should_stop=lambda: self._stop,
+        )
+        if not acquired:
+            self.emit(f"{log_prefix} 任务「{task.name}」已停止，取消排队")
+            return None
         msg_delivered = 0
         msg_failed = 0
-        for person in task.recipients:
-            if self._stop or not person or not clean_rows:
-                continue
+        try:
+            for person in task.recipients:
+                if self._stop or not person or not clean_rows:
+                    continue
+                try:
+                    if texts:
+                        self._send_text(person, "\n".join(texts), task, log_prefix)
+                    if png_path and os.path.exists(png_path):
+                        self._send_file(person, png_path, task, log_prefix)
+                    if out_file and os.path.exists(out_file):
+                        self._send_file(person, out_file, task, log_prefix)
+                    msg_delivered += 1
+                except Exception as exc:
+                    msg_failed += 1
+                    logger.exception("推送失败 %s", person)
+                    self.emit(f"{log_prefix} → 「{person}」推送失败: {exc}")
+        finally:
+            # 释放全局发送批次锁（推送结束/异常都必须放锁，避免后续任务死等）
             try:
-                if texts:
-                    self._send_text(person, "\n".join(texts), task, log_prefix)
-                if png_path and os.path.exists(png_path):
-                    self._send_file(person, png_path, task, log_prefix)
-                if out_file and os.path.exists(out_file):
-                    self._send_file(person, out_file, task, log_prefix)
-                msg_delivered += 1
-            except Exception as exc:
-                msg_failed += 1
-                logger.exception("推送失败 %s", person)
-                self.emit(f"{log_prefix} → 「{person}」推送失败: {exc}")
+                WeChatSender.release_batch()
+            except Exception:
+                pass
 
         # 更新基线 / 已见文件：只有发送全部成功才推进，否则保留上一基线，
         # 让下次轮询重新检出同一批新增并重试（避免"有新增但发送失败"被当作已处理而永久丢失）
