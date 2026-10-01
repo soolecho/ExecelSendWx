@@ -129,6 +129,9 @@ class WeChatSender:
         self._watchdog_lock = threading.Lock()
         self._watchdog_thread = None
         self._watchdog_deadline = 0.0
+        # 收件人存在性预检查缓存：recipient -> (result, expiry_ts)，
+        # 批量发送时同一名字只搜一次，避免重复输入+等待拖慢速度
+        self._precheck_cache: dict = {}
 
     @classmethod
     def shared_instance(cls) -> "WeChatSender":
@@ -967,6 +970,140 @@ class WeChatSender:
             return True
         return False
 
+    def _precheck_contact_exists(self, recipient: str) -> bool:
+        """发送前预验证收件人在微信里能搜到联系人项。
+
+        原因：wxauto4 的 ChatWith 搜不到联系人时，会误点搜索下拉里的
+        「搜索网络结果」入口，把微信主界面切到网页搜索页（Esc 无效），
+        导致后续重试连环失败。本方法改用 UIA 直接往微信搜索框输入名字、
+        读取搜索结果下拉：
+        - 存在匹配的联系人/群/公众号项（mmui::SearchContentCellView）→ 放行
+        - 不存在 → 按 Esc 关闭搜索浮层并返回 False，调用方跳过该收件人，
+          绝不调用 ChatWith，从根上避免弹出搜索网页。
+        任何异常/找不到搜索框时返回 True 放行，由原逻辑兜底。
+        """
+        key = str(recipient or "").strip()
+        if not key:
+            return True
+        now = time.time()
+        cached = self._precheck_cache.get(key)
+        if cached and cached[1] > now:
+            return cached[0]
+
+        result = True
+        try:
+            import comtypes.client
+            import comtypes.gen.UIAutomationClient as UIA
+            import win32gui
+
+            hwnd = 0
+            for cls_name in ("Qt51514QWindowIcon", "WeChatMainWndForPC"):
+                try:
+                    hwnd = win32gui.FindWindow(cls_name, "微信")
+                except Exception:
+                    hwnd = 0
+                if hwnd:
+                    break
+            if not hwnd:
+                self.log("⚠ 找不到微信窗口，跳过收件人预检查")
+                return True
+
+            # 微信可能最小化到托盘/隐藏：隐藏窗口 UIA 读不到内容，先恢复并置前
+            try:
+                self._activate_wechat_window(self.log)
+            except Exception:
+                pass
+
+            # 定位微信顶部搜索框（name='搜索' 或 class 含 XValidatorTextEdit）。
+            # 窗口刚从托盘恢复时 UIA 树可能仍在懒加载，搜索框未立即暴露，
+            # 需置前+短等重试；仍找不到则按 Ctrl+F 强制聚焦搜索框兜底。
+            import ctypes
+            edit = None
+            ui = None
+            root = None
+            for _try in range(3):
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+                time.sleep(0.3)
+                ui_unknown = comtypes.client.CreateObject(
+                    "{FF48DBA4-60EF-4201-AA87-54103EEF594E}"
+                )
+                ui = ui_unknown.QueryInterface(UIA.IUIAutomation)
+                root = ui.ElementFromHandle(hwnd)
+                cond = ui.CreatePropertyCondition(30005, "搜索")
+                edit = root.FindFirst(4, cond)
+                if edit:
+                    break
+                # 按名字找不到：遍历 class 含 XValidatorTextEdit 的元素
+                all_cond = ui.CreateTrueCondition()
+                found_all = root.FindAll(4, all_cond)
+                for i in range(found_all.Length):
+                    el = found_all.GetElement(i)
+                    try:
+                        if "XValidatorTextEdit" in str(el.CurrentClassName or ""):
+                            edit = el
+                            break
+                    except Exception:
+                        continue
+                if edit:
+                    break
+                # 兜底：Ctrl+F 聚焦搜索框后下一轮重试
+                try:
+                    ctypes.windll.user32.keybd_event(0x11, 0, 0, 0)
+                    ctypes.windll.user32.keybd_event(0x46, 0, 0, 0)
+                    ctypes.windll.user32.keybd_event(0x46, 0, 2, 0)
+                    ctypes.windll.user32.keybd_event(0x11, 0, 2, 0)
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            if not edit:
+                self.log("⚠ 找不到微信搜索框，跳过收件人预检查")
+                return True
+
+            try:
+                vp = edit.GetCurrentPattern(10002)  # ValuePatternId
+                vp.QueryInterface(UIA.IUIAutomationValuePattern).SetValue(key)
+            except Exception:
+                self.log("⚠ 收件人预检查输入失败，放行")
+                return True
+
+            # 轮询读取搜索下拉：微信渲染慢/卡顿时多等几次再判定，
+            # 避免只读一次因渲染延迟误判"找不到"而跳过真实联系人
+            kl = key.lower()
+            result = False
+            deadline = time.time() + 1.2
+            while time.time() < deadline:
+                all_cond = ui.CreateTrueCondition()
+                items = root.FindAll(4, all_cond)
+                for i in range(items.Length):
+                    el = items.GetElement(i)
+                    try:
+                        cls = str(el.CurrentClassName or "")
+                        name = str(el.CurrentName or "").strip()
+                    except Exception:
+                        continue
+                    # 联系人/群/公众号项均为 mmui::SearchContentCellView
+                    if cls == "mmui::SearchContentCellView" and kl and kl in name.lower():
+                        result = True
+                        break
+                if result:
+                    break
+                time.sleep(0.2)
+        except Exception as e:
+            self.log(f"⚠ 收件人预检查异常，放行: {e}")
+            result = True
+        finally:
+            # 关闭搜索浮层（Esc），避免残留影响后续 ChatWith
+            try:
+                self._press_esc_on_wechat()
+            except Exception:
+                pass
+            # 统一写缓存（含放行/失败路径，5 分钟内同收件人不再重复搜索）
+            self._precheck_cache[key] = (result, time.time() + 300)
+        return result
+
     def _safe_chatwith(self, recipient: str, exact: bool = False) -> bool:
         if not self.wx:
             return False
@@ -991,6 +1128,9 @@ class WeChatSender:
         if not self.wx:
             if not self.initialize():
                 return False
+        if not self._precheck_contact_exists(recipient):
+            self.log(f"❌ 微信中找不到联系人「{recipient}」，跳过发送（避免误点搜索网页）")
+            return False
         max_retries = 3
         for attempt in range(max_retries):
             if self._stop_requested(stop_event):
@@ -1062,6 +1202,10 @@ class WeChatSender:
         self._ensure_dialog_watchdog()
         # 进入发送前，先清理可能残留的发送失败弹窗（上一次发送可能遗留）
         self._dismiss_send_failure_dialog()
+        # 预验证收件人存在：微信搜不到时跳过，避免 ChatWith 误点搜索网页
+        if not self._precheck_contact_exists(recipient):
+            self.log(f"❌ 微信中找不到联系人「{recipient}」，跳过发送（避免误点搜索网页）")
+            return False
         # 发送前把微信窗口从最大化归位普通大小，避免 wxauto4 激活后"全屏化"
         self._normalize_wechat_window()
 
@@ -1181,6 +1325,10 @@ class WeChatSender:
         self._ensure_dialog_watchdog()
         # 进入发送前，先清理可能残留的发送失败弹窗（上一次发送可能遗留）
         self._dismiss_send_failure_dialog()
+        # 预验证收件人存在：微信搜不到时跳过，避免 ChatWith 误点搜索网页
+        if not self._precheck_contact_exists(recipient):
+            self.log(f"❌ 微信中找不到联系人「{recipient}」，跳过发送（避免误点搜索网页）")
+            return False
         # 发送前把微信窗口从最大化归位普通大小，避免 wxauto4 激活后"全屏化"
         self._normalize_wechat_window()
 
