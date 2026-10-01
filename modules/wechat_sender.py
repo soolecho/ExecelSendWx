@@ -200,6 +200,13 @@ class WeChatSender:
             if not was_visible:
                 # 从系统托盘恢复：SW_RESTORE=9
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                # 微信此前若是最大化，SW_RESTORE 会原样恢复成最大化（看起来像全屏）；
+                # 本程序仅因发送需要恢复窗口，归位为普通大小更自然
+                try:
+                    if win32gui.IsZoomed(hwnd):
+                        win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
+                except Exception:
+                    pass
                 was_minimized = True
             # 解除 Windows 前台锁定（SystemParametersInfo, SPI_SETFOREGROUNDLOCKTIMEOUT=0x2001）
             try:
@@ -266,6 +273,13 @@ class WeChatSender:
             fixed = False
             if win32gui.IsIconic(hwnd):
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                # 最小化前若是最大化，SW_RESTORE 会恢复成最大化；此处仅因发送需要
+                # 恢复窗口，归位为普通大小，避免微信"全屏"跳动
+                try:
+                    if win32gui.IsZoomed(hwnd):
+                        win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
+                except Exception:
+                    pass
                 fixed = True
                 if log_fn:
                     try:
@@ -347,6 +361,13 @@ class WeChatSender:
                 except Exception:
                     hwnd = 0
                 if hwnd:
+                    # 若窗口当前是最大化，先归位为普通大小再最小化；否则下次任何恢复
+                    # （含 wxauto4 内部 SetActive 的 SW_RESTORE）会回到最大化，看起来像全屏
+                    try:
+                        if win32gui.IsZoomed(hwnd):
+                            win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
+                    except Exception:
+                        pass
                     win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
                     return
         except Exception:

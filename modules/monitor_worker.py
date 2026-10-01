@@ -266,8 +266,14 @@ class MonitorWorker(QThread):
                 try:
                     if os.path.exists(path):
                         os.remove(path)
-                except OSError:
-                    pass
+                        logger.info("监控临时文件已删除: %s", path)
+                        # 已删除提示（GUI 面板日志；Timer 线程 emit 线程安全）
+                        try:
+                            self.emit(f"[监控] 临时文件已删除: {os.path.basename(path)}")
+                        except Exception:
+                            pass
+                except OSError as exc:
+                    logger.warning("删除监控临时文件失败 %s: %s", path, exc)
             threading.Timer(15.0, _rm).start()
 
         # 清理环节异常（如定时器创建失败）只记录日志，不得中断/误判本轮发送结果
