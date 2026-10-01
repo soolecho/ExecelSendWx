@@ -32,6 +32,11 @@ class MonitorWorker(QThread):
     task_finished = pyqtSignal(str, int, int)  # task_name, success, failed
     run_finished = pyqtSignal()  # 一轮（manual/一次循环）完成
 
+    # 任务级互斥：同一任务可能同时被「常驻轮询」与「手动执行」两个 worker 处理，
+    # 用 busy 标志保证同一时刻只有一个 worker 在处理同一任务，避免重复推送
+    _TASK_BUSY: Dict[str, bool] = {}
+    _TASK_BUSY_LOCK = threading.Lock()
+
     def __init__(self, store: Optional[MonitorManager] = None, one_shot: bool = False,
                  poll_floor_sec: float = 30.0):
         super().__init__()
@@ -88,6 +93,19 @@ class MonitorWorker(QThread):
 
     # ------------------------------------------------------------ 单个任务处理
     def _process_task(self, task: MonitorTask, log_prefix: str) -> None:
+        # 任务级互斥：该任务正在被其他 worker（常驻轮询/手动执行）处理则本轮跳过
+        with self._TASK_BUSY_LOCK:
+            if self._TASK_BUSY.get(task.id, False):
+                self.emit(f"{log_prefix} 任务「{task.name}」正在执行中（手动/轮询），本轮跳过")
+                return
+            self._TASK_BUSY[task.id] = True
+        try:
+            self._process_task_inner(task, log_prefix)
+        finally:
+            with self._TASK_BUSY_LOCK:
+                self._TASK_BUSY.pop(task.id, None)
+
+    def _process_task_inner(self, task: MonitorTask, log_prefix: str) -> None:
         if not task.watch_path or not os.path.isdir(task.watch_path):
             self.emit(f"{log_prefix} 任务「{task.name}」目录不存在: {task.watch_path}")
             return
@@ -242,6 +260,12 @@ class MonitorWorker(QThread):
                 WeChatSender.release_batch()
             except Exception:
                 pass
+            # 发送完成后按配置最小化微信（隐私保护），避免窗口长时间停留前台/全屏
+            if task.minimize_after and (msg_delivered or msg_failed):
+                try:
+                    WeChatSender.shared_instance().minimize_window()
+                except Exception:
+                    pass
 
         # 更新基线 / 已见文件：只有发送全部成功才推进，否则保留上一基线，
         # 让下次轮询重新检出同一批新增并重试（避免"有新增但发送失败"被当作已处理而永久丢失）

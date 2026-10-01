@@ -6866,10 +6866,8 @@ class MonitorTab(QWidget):
             self._start_polling()
 
     def _on_run_once(self):
-        # 防重叠：常驻轮询或手动执行进行中则跳过
-        if self._poll_worker is not None and self._poll_worker.isRunning():
-            self.log("正在执行，请稍候")
-            return
+        # 防重叠：仅防止「手动执行」自身重复执行。与常驻轮询并行是允许的，
+        # 由 MonitorWorker 的任务级互斥保证同一任务不会同时被两个 worker 处理
         if self._one_shot_worker is not None and self._one_shot_worker.isRunning():
             self.log("正在执行，请稍候")
             return

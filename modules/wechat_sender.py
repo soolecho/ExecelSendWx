@@ -373,6 +373,36 @@ class WeChatSender:
         except Exception:
             pass
 
+    @staticmethod
+    def _normalize_wechat_window() -> bool:
+        """发送前把微信主窗口从「最大化」归位为普通大小。
+
+        wxauto4 每次激活窗口（SetActive/ChatWith 内部）会把最小化的窗口
+        SW_RESTORE 恢复；若窗口之前处于最大化状态，恢复后即以最大化（全屏）
+        显示，干扰用户。发送是自动化操作，统一在每次发送前把窗口归位为
+        普通大小，避免"全屏化"。窗口本就不是最大化时不改动。
+        """
+        try:
+            import win32gui
+            import win32con
+        except ImportError:
+            return False
+        for cls_name in ("Qt51514QWindowIcon", "WeChatMainWndForPC"):
+            try:
+                hwnd = win32gui.FindWindow(cls_name, "微信")
+            except Exception:
+                hwnd = 0
+            if not hwnd:
+                continue
+            try:
+                if win32gui.IsZoomed(hwnd):
+                    win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
+                    return True
+            except Exception:
+                pass
+            return False
+        return False
+
     def reconnect(self, log_fn=None) -> bool:
         """当检测到微信句柄失效时重新初始化。失败会写日志但不抛异常。"""
         try:
@@ -921,6 +951,8 @@ class WeChatSender:
         self._ensure_dialog_watchdog()
         # 进入发送前，先清理可能残留的发送失败弹窗（上一次发送可能遗留）
         self._dismiss_send_failure_dialog()
+        # 发送前把微信窗口从最大化归位普通大小，避免 wxauto4 激活后"全屏化"
+        self._normalize_wechat_window()
 
         def attempt_once(allow_reconnect: bool) -> bool:
             try:
@@ -1038,6 +1070,8 @@ class WeChatSender:
         self._ensure_dialog_watchdog()
         # 进入发送前，先清理可能残留的发送失败弹窗（上一次发送可能遗留）
         self._dismiss_send_failure_dialog()
+        # 发送前把微信窗口从最大化归位普通大小，避免 wxauto4 激活后"全屏化"
+        self._normalize_wechat_window()
 
         def attempt_once(allow_reconnect: bool) -> bool:
             try:
