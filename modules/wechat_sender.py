@@ -638,14 +638,27 @@ class WeChatSender:
     _DIALOG_CONFIRM_TEXTS = ("确定", "OK", "好的", "知道了", "重试")
 
     @classmethod
-    def _is_suspect_failure_dialog(cls, title, class_name, w, h):
-        """判断一个微信顶层窗口是否疑似'发送失败'类弹窗。"""
+    def _is_suspect_failure_dialog(cls, title, class_name, w, h, sending=False):
+        """判断一个微信顶层窗口是否疑似'发送失败'类弹窗。
+
+        sending=True 表示当前有发送批次持锁（watchdog 门控），此时采用
+        更宽松的兜底：微信 4.0 自绘提示框的标题栏常为'微信'等短标题，
+        正文才是'发送失败'，仅按关键词/空标题会漏检导致任务卡死。
+        """
         if any(k in title for k in cls._DIALOG_TITLE_KEYWORDS):
             return True
-        # 兜底：标准对话框类(#32770) 或 Qt 弹窗，标题为空且尺寸较小
+        # 兜底1：标准对话框类(#32770) 或 Qt 弹窗，标题为空且尺寸较小
         # （排除通话/朋友圈等大窗口），基本就是模态提示弹窗
         if not title.strip() and w <= 800 and h <= 600:
             if class_name == "#32770" or (class_name.startswith("Qt") and "QWindow" in class_name):
+                return True
+        # 兜底2（发送期间）：任何 Qt 类名的小尺寸顶层窗口，标题为短标题
+        # 或含提示类字样，都视为疑似发送失败弹窗（标题栏常显示'微信'，
+        # 正文才是失败文案，仅靠关键词会漏检）
+        if sending and w <= 800 and h <= 600 and class_name.startswith("Qt"):
+            t = title.strip()
+            if len(t) <= 8 or any(k in t for k in ("微信", "消息", "提示", "错误", "失败",
+                                                   "发送", "注意", "警告", "异常", "重试")):
                 return True
         return False
 
@@ -752,9 +765,12 @@ class WeChatSender:
             if not candidates:
                 return False
 
+            sending = self.is_batch_active()
             found = False
+            missed = []
             for hwnd, title, cls, w, h in candidates:
-                if not self._is_suspect_failure_dialog(title, cls, w, h):
+                if not self._is_suspect_failure_dialog(title, cls, w, h, sending=sending):
+                    missed.append((title, cls, w, h))
                     continue
                 found = True
                 try:
@@ -765,6 +781,16 @@ class WeChatSender:
                     )
                 except Exception as exc:
                     self.log(f"⚠️ 关闭微信弹窗异常: {exc}")
+            # 诊断：发送期间存在未命中的候选窗口时记录其特征（节流 10s），
+            # 便于发现新弹窗标题变体导致的漏检，避免任务静默卡死无从定位
+            if sending and missed:
+                now = time.time()
+                if now - getattr(self, "_last_missed_diag_ts", 0.0) >= 10.0:
+                    self._last_missed_diag_ts = now
+                    self.log(
+                        f"🔎 发送期间未命中的微信窗口(非弹窗或未知弹窗): "
+                        f"{missed}"
+                    )
             return found
 
     def _ensure_dialog_watchdog(self):
