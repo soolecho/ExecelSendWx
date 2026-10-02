@@ -260,8 +260,16 @@ def prepare_profile(profile, log_fn=None):
             if mapping_file and os.path.isfile(mapping_file):
                 fresh = _load_mappings_from_file(mapping_file, log)
                 if fresh:
-                    mappings = fresh
-                    log(f"已从关联文件自动加载 {len(mappings)} 条映射: {mapping_file}")
+                    # 覆盖式合并：文件覆盖同名 key，配置内嵌映射中文件没有的保留
+                    file_keys = {
+                        str(m.get("source_value", "") or "").strip()
+                        for m in fresh
+                    }
+                    mappings = fresh + [
+                        m for m in mappings
+                        if str(m.get("source_value", "") or "").strip() not in file_keys
+                    ]
+                    log(f"已从关联文件自动加载 {len(fresh)} 条映射: {mapping_file}")
             for m in mappings:
                 src = str(m.get("source_value", "") or "").strip()
                 recips_raw = m.get("recipients") or []

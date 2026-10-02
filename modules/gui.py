@@ -4083,12 +4083,14 @@ class TableFilterTab(QWidget):
                     from modules.profile_runner import _load_mappings_from_file
                     fresh = _load_mappings_from_file(mapping_file, self.log)
                     if fresh:
-                        value_to_recipients = {
+                        fresh_map = {
                             m["source_value"]: list(m["recipients"])
                             for m in fresh
                         }
+                        # 覆盖式合并：文件覆盖同名 key，UI 中有而文件没有的保留
+                        value_to_recipients.update(fresh_map)
                         self.log(
-                            f"已从关联文件自动加载 {len(value_to_recipients)} 条映射: {mapping_file}"
+                            f"已从关联文件自动加载 {len(fresh_map)} 条映射: {mapping_file}"
                         )
                 except Exception as exc:
                     self.log(f"⚠ 自动读取映射表失败，使用 UI 当前数据: {exc}")
