@@ -133,6 +133,50 @@ def is_new_file(seen: Dict[str, str], file_path: str) -> bool:
     return seen.get(name) != fp
 
 
+# ---------------------------------------------------------------- 指定区域截图（关闭对比模式）
+def parse_region(spec: str) -> Optional[Tuple[int, int, int, int]]:
+    """解析 Excel 区域 "A1:F20"（大小写不敏感）→ (r0, r1, c0, c1)。
+
+    返回 0-based 半开区间 [r0, r1) x [c0, c1)，可直接切片二维网格；
+    终点单元格为包含式（"A1:F20" = 第 1~20 行、A~F 列）。
+    只写单格 "F20" 视为 1x1；spec 为空/非法返回 None（调用方按整表已用区域处理）。
+    """
+    s = str(spec or "").strip().upper()
+    if not s:
+        return None
+    m = re.fullmatch(r"([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?", s)
+    if not m:
+        return None
+
+    def col_idx(letters: str) -> int:
+        n = 0
+        for ch in letters:
+            n = n * 26 + (ord(ch) - 64)
+        return n - 1
+
+    c0, r0 = col_idx(m.group(1)), int(m.group(2)) - 1
+    if m.group(3):
+        # Excel 范围终点是包含式的："A1:F20" 含第 1~20 行、A~F 列
+        c1, r1 = col_idx(m.group(3)) + 1, int(m.group(4))
+    else:
+        c0, c1 = col_idx(m.group(1)), col_idx(m.group(1)) + 1
+        r1 = r0 + 1
+    if r0 < 0 or c0 < 0 or r1 <= r0 or c1 <= c0:
+        return None
+    return r0, r1, c0, c1
+
+
+def slice_region(grid: List[List[str]], r0: int, r1: int, c0: int, c1: int) -> List[List[str]]:
+    """按 0-based 半开区间从整表网格切出矩形区域，缺列补空串保证等宽。"""
+    width = c1 - c0
+    out: List[List[str]] = []
+    for row in grid[r0:r1]:
+        seg = [str(v) if v is not None else "" for v in row[c0:c1]]
+        seg += [""] * (width - len(seg))
+        out.append(seg)
+    return out
+
+
 # ---------------------------------------------------------------- 内容生成
 def render_rows_text(
     headers: List[str],

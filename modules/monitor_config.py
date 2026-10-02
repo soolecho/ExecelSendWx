@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
-MONITOR_VERSION = 4
+MONITOR_VERSION = 5
 
 
 @dataclass
@@ -150,6 +150,9 @@ class MonitorTask:
     clean_rules: List[CleanRule] = field(default_factory=list)
     # 发送提取列：只把这几列写入推送文字/图片/文件（空 = 全部列）
     extract_columns: List[str] = field(default_factory=list)
+    # 指定区域截图（仅「关闭对比」模式生效）：勾选后图片内容改为截取 sheet 指定区域
+    snapshot_enabled: bool = False
+    snapshot_range: str = ""  # 如 "A1:F20"；留空 = 整表已用区域
     # 推送文字自定义标题（如"光缆故障新增提醒"），未配置用默认
     text_title: str = ""
     # 推送文字是否附带逐行明细（勾选才显示 列:值；否则只显示标题+条数）
@@ -237,6 +240,8 @@ class MonitorTask:
             ],
             compare_columns=_split_list(data.get("compare_columns")),
             extract_columns=_split_list(data.get("extract_columns")),
+            snapshot_enabled=_b("snapshot_enabled", False),
+            snapshot_range=_s("snapshot_range"),
             text_title=_s("text_title"),
             text_detail=_b("text_detail", True),
             include_subdir=_b("include_subdir", False),

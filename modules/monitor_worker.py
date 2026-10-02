@@ -205,6 +205,27 @@ class MonitorWorker(QThread):
         view_headers, view_rows = monitor_engine.extract_columns_by(
             headers, clean_rows, task.extract_columns
         )
+
+        # 指定区域截图（仅「关闭对比」模式生效，与筛选/清洗/提取列并存、独立勾选）：
+        # 勾选后图片内容改为截取 sheet 原始区域（不参与筛选/清洗），留空范围 = 整表已用区域。
+        # 开启对比时忽略本功能并给出提示，图片仍按筛选数据渲染。
+        snapshot_headers: Optional[List[str]] = None
+        snapshot_rows: Optional[List[List[str]]] = None
+        if getattr(task, "snapshot_enabled", False):
+            if not task.compare_enabled:
+                grid = [list(headers)] + [list(r) for r in all_rows]  # 整表已用区域（含表头行）
+                region = monitor_engine.parse_region(getattr(task, "snapshot_range", ""))
+                if region:
+                    region_rows = monitor_engine.slice_region(grid, *region)
+                    self.emit(f"{log_prefix} 任务「{task.name}」指定区域截图: {task.snapshot_range}")
+                else:
+                    region_rows = grid
+                    self.emit(f"{log_prefix} 任务「{task.name}」指定区域截图: 整表已用区域")
+                if region_rows:
+                    snapshot_headers, snapshot_rows = region_rows[0], region_rows[1:]
+            else:
+                self.emit(f"{log_prefix} 任务「{task.name}」已勾选指定区域截图，但当前为开启对比模式，本轮忽略，使用筛选图片")
+
         texts = []
         png_path: Optional[str] = None
         out_file: Optional[str] = None
@@ -217,8 +238,14 @@ class MonitorWorker(QThread):
         if task.send_image:
             tmp = os.path.join(tempfile.gettempdir(),
                                f"monitor_{datetime.now().strftime('%H%M%S%f')}.png")
-            png_path = monitor_engine.render_rows_image(view_headers, view_rows, tmp,
-                                                        log_fn=lambda m: logger.info("monitor img: %s", m))
+            if snapshot_headers is not None:
+                # 指定区域截图优先：图片 = 用户勾选的区域原样截取
+                png_path = monitor_engine.render_rows_image(
+                    snapshot_headers, snapshot_rows, tmp,
+                    log_fn=lambda m: logger.info("monitor img: %s", m))
+            else:
+                png_path = monitor_engine.render_rows_image(view_headers, view_rows, tmp,
+                                                            log_fn=lambda m: logger.info("monitor img: %s", m))
         if task.send_file:
             tmpx = os.path.join(tempfile.gettempdir(),
                                 f"monitor_{datetime.now().strftime('%H%M%S%f')}.xlsx")

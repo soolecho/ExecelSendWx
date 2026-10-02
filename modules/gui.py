@@ -6232,6 +6232,22 @@ class MonitorTab(QWidget):
         send_layout.addWidget(self.text_detail_check)
         send_layout.addWidget(self.send_image_check)
         send_layout.addWidget(self.send_file_check)
+
+        # 指定区域截图（与筛选/清洗/提取列并存、独立勾选；仅「关闭对比」模式生效）
+        self.snapshot_check = QCheckBox("指定区域截图（仅关闭对比时生效）")
+        self.snapshot_check.setToolTip("勾选后，图片内容改为截取 Sheet 指定区域（留空范围 = 整表已用区域）")
+        self.snapshot_check.setChecked(False)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("截图区域:"))
+        self.snapshot_range_edit = QLineEdit()
+        self.snapshot_range_edit.setPlaceholderText("如 A1:F20；留空 = 整表已用区域")
+        row.addWidget(self.snapshot_range_edit, 1)
+        self.snapshot_hint = QLabel("⚠ 指定区域截图仅在「关闭对比」模式下生效")
+        self.snapshot_hint.setStyleSheet("color:#e08a00; font-size:11px;")
+        self.snapshot_hint.setVisible(False)
+        send_layout.addWidget(self.snapshot_check)
+        send_layout.addLayout(row)
+        send_layout.addWidget(self.snapshot_hint)
         right_layout.addWidget(send_group)
 
         # 3.5. 列设置：清洗列 + 发送保留列 + 对比列（统一面板）
@@ -6412,6 +6428,7 @@ class MonitorTab(QWidget):
         self.clear_btn.clicked.connect(self._reset_form)
         self.stop_poll_btn.clicked.connect(self._on_toggle_polling)
         self.import_btn.clicked.connect(self._on_import_profile)
+        self.snapshot_check.toggled.connect(self._on_snapshot_toggled)
         self._connect_form_dirty_signals()
         self._form_ready = True
 
@@ -6432,6 +6449,8 @@ class MonitorTab(QWidget):
         self.send_text_check.stateChanged.connect(mark)
         self.send_image_check.stateChanged.connect(mark)
         self.send_file_check.stateChanged.connect(mark)
+        self.snapshot_check.stateChanged.connect(mark)
+        self.snapshot_range_edit.textChanged.connect(mark)
         self.text_title_edit.textChanged.connect(mark)
         self.text_detail_check.stateChanged.connect(mark)
         self.include_subdir_check.stateChanged.connect(mark)
@@ -6516,6 +6535,22 @@ class MonitorTab(QWidget):
                 self.no_compare_check.setChecked(False)
             else:
                 self.compare_check.setChecked(False)
+        self._refresh_snapshot_hint()
+
+    # ----------------------------- 指定区域截图 -----------------------------
+    def _on_snapshot_toggled(self, checked: bool):
+        if self._loading_form:
+            return
+        # 勾选指定区域截图时自动开启「推送图片」，保证截图能被发出去（取消勾选不影响图片开关）
+        if checked and not self.send_image_check.isChecked():
+            self.send_image_check.setChecked(True)
+        self._refresh_snapshot_hint()
+
+    def _refresh_snapshot_hint(self):
+        # 开启对比时提示该功能不生效（与关闭对比模式并存，用户自由选择）
+        self.snapshot_hint.setVisible(
+            self.compare_check.isChecked() and self.snapshot_check.isChecked()
+        )
 
     # ----------------------------- 浏览目录 / 读取表头 -----------------------------
     def _on_browse(self):
@@ -6729,6 +6764,8 @@ class MonitorTab(QWidget):
             self.send_text_check.setChecked(task.send_text)
             self.send_image_check.setChecked(task.send_image)
             self.send_file_check.setChecked(task.send_file)
+            self.snapshot_check.setChecked(task.snapshot_enabled)
+            self.snapshot_range_edit.setText(task.snapshot_range)
             self.text_title_edit.setText(task.text_title)
             self.text_detail_check.setChecked(task.text_detail)
             self.include_subdir_check.setChecked(task.include_subdir)
@@ -6773,6 +6810,7 @@ class MonitorTab(QWidget):
                 self.active_end_edit.setTime(
                     QTime.fromString(task.active_end, "HH:mm"))
             self._sync_time_window(self.repeat_mode_combo.currentIndex())
+            self._refresh_snapshot_hint()
         finally:
             self._loading_form = False
 
@@ -6798,6 +6836,8 @@ class MonitorTab(QWidget):
         task.send_text = self.send_text_check.isChecked()
         task.send_image = self.send_image_check.isChecked()
         task.send_file = self.send_file_check.isChecked()
+        task.snapshot_enabled = self.snapshot_check.isChecked()
+        task.snapshot_range = self.snapshot_range_edit.text().strip()
         task.text_title = self.text_title_edit.text().strip()
         task.text_detail = self.text_detail_check.isChecked()
         task.include_subdir = self.include_subdir_check.isChecked()
@@ -6910,6 +6950,8 @@ class MonitorTab(QWidget):
             self.send_text_check.setChecked(True)
             self.send_image_check.setChecked(False)
             self.send_file_check.setChecked(False)
+            self.snapshot_check.setChecked(False)
+            self.snapshot_range_edit.clear()
             self.text_title_edit.clear()
             self.text_detail_check.setChecked(True)
             self.include_subdir_check.setChecked(False)
@@ -6934,6 +6976,7 @@ class MonitorTab(QWidget):
             self.active_start_edit.setEnabled(False)
             self.active_end_edit.setEnabled(False)
             self._sync_time_window(0)
+            self._refresh_snapshot_hint()
         finally:
             self._loading_form = False
         self._clear_form_dirty()
