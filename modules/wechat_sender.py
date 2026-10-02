@@ -1034,25 +1034,40 @@ class WeChatSender:
                 self.log("⚠ 找不到微信窗口，跳过收件人预检查")
                 return True
 
-            # 微信可能最小化到托盘/隐藏：隐藏窗口 UIA 读不到内容，先恢复并置前
+            # 仅当微信窗口不可见/最小化到托盘时才恢复并置前：同一批连续预检
+            # 通常窗口已在前台，若每次都激活会反复抢焦点又拖慢速度
+            need_activate = True
             try:
-                self._activate_wechat_window(self.log)
+                # 最小化窗口 IsWindowVisible 仍为 True，需同时排除 IsIconic
+                need_activate = not (
+                    win32gui.IsWindowVisible(hwnd) and not win32gui.IsIconic(hwnd)
+                )
             except Exception:
                 pass
+            if need_activate:
+                # 隐藏窗口 UIA 读不到内容，先恢复并置前
+                try:
+                    self._activate_wechat_window(self.log)
+                except Exception:
+                    pass
 
             # 定位微信顶部搜索框（name='搜索' 或 class 含 XValidatorTextEdit）。
             # 窗口刚从托盘恢复时 UIA 树可能仍在懒加载，搜索框未立即暴露，
-            # 需置前+短等重试；仍找不到则按 Ctrl+F 强制聚焦搜索框兜底。
+            # 需置前+短等重试；窗口已在前台时无需置前，改用更短的等待。
+            # 仍找不到则按 Ctrl+F 强制聚焦搜索框兜底。
             import ctypes
             edit = None
             ui = None
             root = None
+            # 已在前台时缩短等待：UIA 树已就绪，搜索框立即可读
+            wait_sleep = 0.3 if need_activate else 0.05
             for _try in range(3):
-                try:
-                    win32gui.SetForegroundWindow(hwnd)
-                except Exception:
-                    pass
-                time.sleep(0.3)
+                if need_activate:
+                    try:
+                        win32gui.SetForegroundWindow(hwnd)
+                    except Exception:
+                        pass
+                time.sleep(wait_sleep)
                 ui_unknown = comtypes.client.CreateObject(
                     "{FF48DBA4-60EF-4201-AA87-54103EEF594E}"
                 )
@@ -1097,46 +1112,30 @@ class WeChatSender:
 
             # 轮询读取搜索下拉：微信渲染慢/卡顿时多等几次再判定，
             # 避免只读一次因渲染延迟误判"找不到"而跳过真实联系人。
-            # 搜索结果可能渲染在主窗口树里，也可能在独立的搜索浮层工具窗
+            # 结果通常渲染在主窗口树；个别情况下搜索浮层是独立 Qt 工具窗
             # （class 常为 Qt51514QWindowToolSaveBits，标题 'Weixin'），
-            # 每轮同时扫描主窗口与全部微信顶层工具窗，避免漏掉结果项。
+            # 主窗口树未命中时才枚举顶层工具窗补扫，避免每轮 FindWindow 开销。
             kl = key.lower()
             result = False
             deadline = time.time() + 1.2
             while time.time() < deadline:
                 all_cond = ui.CreateTrueCondition()
-                trees = []
-                try:
-                    trees.append(root)
-                except Exception:
-                    pass
-                # 每轮重新枚举顶层工具窗：搜索浮层可能是输入后才出现的窗口
+                # 1) 先扫主窗口树（最常见情况）
+                if self._scan_tree_for_contact(root, all_cond, kl):
+                    result = True
+                    break
+                # 2) 主窗口树未命中：补扫顶层 Qt 工具窗（搜索浮层独立成窗时）
                 try:
                     _, tool_windows = self._find_wechat_dialogs()
                 except Exception:
                     tool_windows = []
                 for _thw, _tt, _tc, _tw, _th in tool_windows:
                     try:
-                        trees.append(ui.ElementFromHandle(_thw))
-                    except Exception:
-                        pass
-                for tree in trees:
-                    try:
-                        items = tree.FindAll(4, all_cond)
+                        tree = ui.ElementFromHandle(_thw)
                     except Exception:
                         continue
-                    for i in range(items.Length):
-                        el = items.GetElement(i)
-                        try:
-                            cls = str(el.CurrentClassName or "")
-                            name = str(el.CurrentName or "").strip()
-                        except Exception:
-                            continue
-                        # 联系人/群/公众号项均为 mmui::SearchContentCellView
-                        if cls == "mmui::SearchContentCellView" and kl and kl in name.lower():
-                            result = True
-                            break
-                    if result:
+                    if self._scan_tree_for_contact(tree, all_cond, kl):
+                        result = True
                         break
                 if result:
                     break
@@ -1239,6 +1238,30 @@ class WeChatSender:
         """返回 (缓存条数, ttl_seconds)，供 GUI 展示。"""
         self._load_precheck_cache()
         return len(self._precheck_cache), self._precheck_ttl
+
+    @staticmethod
+    def _scan_tree_for_contact(tree, all_cond, kl: str) -> bool:
+        """扫描一个 UIA 树，返回是否命中收件人搜索结果项。
+
+        WeChat 的联系人/群/公众号搜索结果项均为 mmui::SearchContentCellView，
+        且元素名包含收件人关键字。任何异常视为未命中。
+        """
+        if tree is None:
+            return False
+        try:
+            items = tree.FindAll(4, all_cond)
+        except Exception:
+            return False
+        for i in range(items.Length):
+            el = items.GetElement(i)
+            try:
+                cls = str(el.CurrentClassName or "")
+                name = str(el.CurrentName or "").strip()
+            except Exception:
+                continue
+            if cls == "mmui::SearchContentCellView" and kl and kl in name.lower():
+                return True
+        return False
 
     def _safe_chatwith(self, recipient: str, exact: bool = False) -> bool:
         if not self.wx:
