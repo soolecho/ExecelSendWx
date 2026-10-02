@@ -2100,6 +2100,38 @@ class TableFilterTab(QWidget):
 
         right_layout.addWidget(recipient_group)
 
+        # 发送预检缓存：控制"发送前验证微信联系人"结果缓存的有效期与手动清理。
+        # 有效期选「永久」即不自动清理，需手动点「清除缓存」。
+        precheck_group = right_bar.add_section("⚙️ 发送预检缓存", collapsed=True)
+        precheck_layout = precheck_group.contentLayout()
+
+        ttl_row = QHBoxLayout()
+        ttl_row.addWidget(QLabel("缓存有效期:"))
+        self.precheck_ttl_combo = QComboBox()
+        self.precheck_ttl_combo.addItem("5 分钟", 300)
+        self.precheck_ttl_combo.addItem("30 分钟", 1800)
+        self.precheck_ttl_combo.addItem("1 小时", 3600)
+        self.precheck_ttl_combo.addItem("24 小时", 86400)
+        self.precheck_ttl_combo.addItem("永久（不自动清理）", 0)
+        self.precheck_ttl_combo.setFixedWidth(170)
+        ttl_row.addWidget(self.precheck_ttl_combo)
+        precheck_layout.addLayout(ttl_row)
+
+        self.precheck_cache_info = QLabel("预检缓存: -")
+        precheck_layout.addWidget(self.precheck_cache_info)
+
+        self.precheck_cache_clear_btn = QPushButton("🧹 清除缓存")
+        precheck_layout.addWidget(self.precheck_cache_clear_btn)
+
+        self.precheck_ttl_combo.currentIndexChanged.connect(
+            self._on_precheck_ttl_changed
+        )
+        self.precheck_cache_clear_btn.clicked.connect(
+            self._on_clear_precheck_cache
+        )
+
+        right_layout.addWidget(precheck_group)
+
         progress_group = right_bar.add_section("📊 发送进度", collapsed=True)
         progress_layout = progress_group.contentLayout()
         
@@ -2185,7 +2217,7 @@ class TableFilterTab(QWidget):
             config_group, url_group, filter_group,
             persons_group, preview_group,
             send_group, progress_group, log_group, control_group,
-            recipient_group,
+            recipient_group, precheck_group,
         ]
         # 保存各面板引用（自动折叠/发送时自动切换视图用）
         self.config_group = config_group
@@ -2201,6 +2233,8 @@ class TableFilterTab(QWidget):
         self._load_expand_groups = [
             persons_group, preview_group, progress_group, control_group,
         ]
+        # 启动时同步一次预检缓存状态（TTL 下拉与磁盘持久化保持一致）
+        self._refresh_precheck_cache_info()
 
     def _collapse_groups(self, *groups):
         """批量折叠指定面板（忽略 None）。"""
@@ -3236,6 +3270,48 @@ class TableFilterTab(QWidget):
             return [default_recipient]
         return [fallback_recipient] if fallback_recipient else []
 
+    # ------------------------- 发送预检缓存 -------------------------
+    def _on_precheck_ttl_changed(self, _idx=None):
+        """缓存有效期下拉变化：写入 WeChatSender 并持久化。"""
+        try:
+            from modules.wechat_sender import WeChatSender
+            sender = WeChatSender.shared_instance()
+            ttl = int(self.precheck_ttl_combo.currentData() or 0)
+            sender.set_precheck_ttl(ttl)
+            self.log(
+                f"发送预检缓存有效期已设置为: {self.precheck_ttl_combo.currentText()}"
+            )
+            self._refresh_precheck_cache_info()
+        except Exception as exc:
+            self.log(f"⚠ 设置预检缓存有效期失败: {exc}")
+
+    def _on_clear_precheck_cache(self):
+        """手动清空发送预检缓存。"""
+        try:
+            from modules.wechat_sender import WeChatSender
+            sender = WeChatSender.shared_instance()
+            n = sender.clear_precheck_cache()
+            self.log(f"🧹 已清除发送预检缓存 {n} 条")
+            self._refresh_precheck_cache_info()
+        except Exception as exc:
+            self.log(f"⚠ 清除预检缓存失败: {exc}")
+
+    def _refresh_precheck_cache_info(self):
+        """刷新缓存状态标签 + 下拉框与持久化 TTL 同步（不触发变更信号）。"""
+        try:
+            from modules.wechat_sender import WeChatSender
+            sender = WeChatSender.shared_instance()
+            count, ttl = sender.get_precheck_cache_stats()
+            ttl_text = "永久" if ttl <= 0 else f"{ttl} 秒"
+            self.precheck_cache_info.setText(f"当前缓存: {count} 条 · 有效期: {ttl_text}")
+            idx = self.precheck_ttl_combo.findData(ttl)
+            if idx >= 0 and idx != self.precheck_ttl_combo.currentIndex():
+                self.precheck_ttl_combo.blockSignals(True)
+                self.precheck_ttl_combo.setCurrentIndex(idx)
+                self.precheck_ttl_combo.blockSignals(False)
+        except Exception:
+            self.precheck_cache_info.setText("预检缓存: -")
+
     # ------------------------- 发送顺序 -------------------------
     def _get_send_order(self):
         """按列表行顺序返回已勾选的内容类型 key 列表。"""
@@ -3989,6 +4065,15 @@ class TableFilterTab(QWidget):
         value_to_recipients = rm_cfg.get("value_to_recipients", {})
         default_recipient = rm_cfg.get("default_recipient", "")
         mapping_enabled = rm_cfg.get("enabled", False)
+        # 未启用但已有映射条目/关联文件时醒目标志提醒，
+        # 避免用户以为映射已生效（需勾选「启用联系人映射」）
+        if not mapping_enabled and (
+            rm_cfg.get("mappings") or rm_cfg.get("mapping_file")
+        ):
+            self.log(
+                "⚠️ 检测到联系人映射条目/关联文件，但「启用联系人映射」未勾选，"
+                "本次发送未应用映射，将按默认接收人逻辑发送（如需映射请勾选该开关）"
+            )
         # 关联了映射表文件 → 发送前自动读取最新内容，
         # 用户改了文件不用手动"导入表格"
         if mapping_enabled:

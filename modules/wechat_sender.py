@@ -130,8 +130,18 @@ class WeChatSender:
         self._watchdog_thread = None
         self._watchdog_deadline = 0.0
         # 收件人存在性预检查缓存：recipient -> (result, expiry_ts)，
-        # 批量发送时同一名字只搜一次，避免重复输入+等待拖慢速度
+        # 批量发送时同一名字只搜一次，避免重复输入+等待拖慢速度。
+        # expiry_ts == 0 表示永久不过期（用户选"永久"档）；否则为到期时间戳。
+        # 缓存与 TTL 持久化到 %LOCALAPPDATA%\ExcelSendWx\precheck_cache.json，
+        # 重启程序后仍可复用，节省重复搜索耗时。
         self._precheck_cache: dict = {}
+        self._precheck_ttl = 300  # 默认有效期 5 分钟（0 = 永久）
+        self._precheck_cache_loaded = False
+        # 弹窗守护线程挂起计数器：仅收件人预检搜索期间挂起 watchdog
+        # （预检要持续读取搜索下拉结果，且该阶段不会出现"发送失败"弹窗）。
+        # ChatWith 阶段不挂起——watchdog 通过 _is_suspect_failure_dialog 的
+        # ToolSaveBits+Weixin 排除规则识别搜索浮层并跳过，继续防真实失败弹窗
+        self._watchdog_suspend = 0
 
     @classmethod
     def shared_instance(cls) -> "WeChatSender":
@@ -650,6 +660,13 @@ class WeChatSender:
         """
         if any(k in title for k in cls._DIALOG_TITLE_KEYWORDS):
             return True
+        # 排除微信搜索下拉浮层：class 含 ToolSaveBits 且标题为英文 'Weixin'
+        # （在搜索框输入收件人名时弹出的搜索结果工具窗）。它不是"发送失败"
+        # 弹窗——若被 watchdog 误关会导致真实联系人也被误判为找不到。
+        # 真实失败弹窗标题为中文（'微信'/空/'发送失败'）或含失败关键词，
+        # 与该特征（英文 Weixin + ToolSaveBits 工具窗）不重叠。
+        if "ToolSaveBits" in class_name and title.strip() == "Weixin":
+            return False
         # 兜底1：标题为空 + 尺寸较小（排除通话/朋友圈等大窗口），
         # 基本就是模态提示弹窗（微信 4.0 的"发送失败"框无标题栏，
         # 正文直接显示失败文案；类名不限于 Qt，放宽类名避免漏检）
@@ -902,8 +919,10 @@ class WeChatSender:
     def _dialog_watchdog_loop(self):
         while True:
             try:
-                # 发送批次持锁时才扫描关闭（门控），空闲/用户手动操作不干预
-                if self.is_batch_active():
+                # 发送批次持锁时才扫描关闭（门控），空闲/用户手动操作不干预；
+                # 收件人预检期间挂起（计数器>0）；ChatWith 的搜索浮层则靠
+                # ToolSaveBits+Weixin 排除规则识别跳过，不在此挂起
+                if self.is_batch_active() and self._watchdog_suspend == 0:
                     self._dismiss_send_failure_dialog()
             except Exception:
                 pass
@@ -981,15 +1000,22 @@ class WeChatSender:
         - 不存在 → 按 Esc 关闭搜索浮层并返回 False，调用方跳过该收件人，
           绝不调用 ChatWith，从根上避免弹出搜索网页。
         任何异常/找不到搜索框时返回 True 放行，由原逻辑兜底。
+
+        预检期间会挂起弹窗守护线程（self._watchdog_suspend），避免把微信搜索
+        下拉浮层（Qt 工具窗，标题 'Weixin'）误判为"发送失败"弹窗关掉，
+        否则搜索结果一出现就被关，真实联系人也会被误判为不存在。
         """
         key = str(recipient or "").strip()
         if not key:
             return True
+        self._load_precheck_cache()
         now = time.time()
         cached = self._precheck_cache.get(key)
-        if cached and cached[1] > now:
+        if cached and (cached[1] == 0 or cached[1] > now):
             return cached[0]
 
+        # 预检期间挂起弹窗守护线程（finally 中先 Esc 关浮层再恢复计数）
+        self._watchdog_suspend += 1
         result = True
         try:
             import comtypes.client
@@ -1070,23 +1096,47 @@ class WeChatSender:
                 return True
 
             # 轮询读取搜索下拉：微信渲染慢/卡顿时多等几次再判定，
-            # 避免只读一次因渲染延迟误判"找不到"而跳过真实联系人
+            # 避免只读一次因渲染延迟误判"找不到"而跳过真实联系人。
+            # 搜索结果可能渲染在主窗口树里，也可能在独立的搜索浮层工具窗
+            # （class 常为 Qt51514QWindowToolSaveBits，标题 'Weixin'），
+            # 每轮同时扫描主窗口与全部微信顶层工具窗，避免漏掉结果项。
             kl = key.lower()
             result = False
             deadline = time.time() + 1.2
             while time.time() < deadline:
                 all_cond = ui.CreateTrueCondition()
-                items = root.FindAll(4, all_cond)
-                for i in range(items.Length):
-                    el = items.GetElement(i)
+                trees = []
+                try:
+                    trees.append(root)
+                except Exception:
+                    pass
+                # 每轮重新枚举顶层工具窗：搜索浮层可能是输入后才出现的窗口
+                try:
+                    _, tool_windows = self._find_wechat_dialogs()
+                except Exception:
+                    tool_windows = []
+                for _thw, _tt, _tc, _tw, _th in tool_windows:
                     try:
-                        cls = str(el.CurrentClassName or "")
-                        name = str(el.CurrentName or "").strip()
+                        trees.append(ui.ElementFromHandle(_thw))
+                    except Exception:
+                        pass
+                for tree in trees:
+                    try:
+                        items = tree.FindAll(4, all_cond)
                     except Exception:
                         continue
-                    # 联系人/群/公众号项均为 mmui::SearchContentCellView
-                    if cls == "mmui::SearchContentCellView" and kl and kl in name.lower():
-                        result = True
+                    for i in range(items.Length):
+                        el = items.GetElement(i)
+                        try:
+                            cls = str(el.CurrentClassName or "")
+                            name = str(el.CurrentName or "").strip()
+                        except Exception:
+                            continue
+                        # 联系人/群/公众号项均为 mmui::SearchContentCellView
+                        if cls == "mmui::SearchContentCellView" and kl and kl in name.lower():
+                            result = True
+                            break
+                    if result:
                         break
                 if result:
                     break
@@ -1095,18 +1145,106 @@ class WeChatSender:
             self.log(f"⚠ 收件人预检查异常，放行: {e}")
             result = True
         finally:
-            # 关闭搜索浮层（Esc），避免残留影响后续 ChatWith
+            # 先关掉搜索浮层（Esc），再恢复守护线程，避免浮层残留被误关
             try:
                 self._press_esc_on_wechat()
             except Exception:
                 pass
-            # 统一写缓存（含放行/失败路径，5 分钟内同收件人不再重复搜索）
-            self._precheck_cache[key] = (result, time.time() + 300)
+            self._watchdog_suspend = max(0, self._watchdog_suspend - 1)
+            # 统一写缓存（含放行/失败路径），有效期内同收件人不再重复搜索。
+            # ttl <= 0 表示永久不过期，用户手动清理；否则存到期时间戳
+            ttl = self._precheck_ttl
+            expiry = 0 if ttl <= 0 else time.time() + ttl
+            self._precheck_cache[key] = (result, expiry)
+            self._persist_precheck_cache()
         return result
+
+    @staticmethod
+    def _precheck_cache_path() -> str:
+        """预检缓存持久化文件：%LOCALAPPDATA%\\ExcelSendWx\\precheck_cache.json"""
+        import os
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        d = os.path.join(base, "ExcelSendWx")
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
+        return os.path.join(d, "precheck_cache.json")
+
+    def _load_precheck_cache(self):
+        """从磁盘加载预检缓存与 TTL，剔除已过期条目。幂等（只读一次）。"""
+        if self._precheck_cache_loaded:
+            return
+        self._precheck_cache_loaded = True
+        try:
+            import json
+            path = self._precheck_cache_path()
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            ttl = data.get("ttl_seconds")
+            if isinstance(ttl, (int, float)) and ttl >= 0:
+                self._precheck_ttl = int(ttl)
+            now = time.time()
+            cleaned = {}
+            for k, v in (data.get("entries") or {}).items():
+                try:
+                    if not isinstance(v, (list, tuple)) or len(v) < 2:
+                        continue
+                    result, expiry = bool(v[0]), float(v[1])
+                except Exception:
+                    continue
+                if expiry == 0 or expiry > now:
+                    cleaned[k] = (result, expiry)
+            self._precheck_cache = cleaned
+            if cleaned:
+                self.log(
+                    f"📂 已加载收件人预检缓存 {len(cleaned)} 条"
+                    f"（有效期={'永久' if self._precheck_ttl <= 0 else str(self._precheck_ttl) + ' 秒'}）"
+                )
+        except Exception:
+            self._precheck_cache = {}
+
+    def _persist_precheck_cache(self):
+        """把缓存与 TTL 原子写回磁盘（临时文件 + replace）。"""
+        try:
+            import json
+            import os
+            path = self._precheck_cache_path()
+            tmp = path + ".tmp"
+            data = {
+                "ttl_seconds": self._precheck_ttl,
+                "entries": {k: list(v) for k, v in self._precheck_cache.items()},
+            }
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, path)
+        except Exception:
+            pass
+
+    def set_precheck_ttl(self, seconds: int) -> None:
+        """设置预检缓存有效期（秒）；0 = 永久不过期，需手动清理。立即持久化。"""
+        self._load_precheck_cache()
+        self._precheck_ttl = max(0, int(seconds or 0))
+        self._persist_precheck_cache()
+
+    def clear_precheck_cache(self) -> int:
+        """清空预检缓存并持久化，返回清除条数。"""
+        self._load_precheck_cache()
+        n = len(self._precheck_cache)
+        self._precheck_cache = {}
+        self._persist_precheck_cache()
+        return n
+
+    def get_precheck_cache_stats(self):
+        """返回 (缓存条数, ttl_seconds)，供 GUI 展示。"""
+        self._load_precheck_cache()
+        return len(self._precheck_cache), self._precheck_ttl
 
     def _safe_chatwith(self, recipient: str, exact: bool = False) -> bool:
         if not self.wx:
             return False
+        # ChatWith 会再次打开搜索下拉；watchdog 通过 _is_suspect_failure_dialog
+        # 的 ToolSaveBits+Weixin 排除规则识别该浮层并跳过，无需挂起
         try:
             self.wx.ChatWith(recipient, exact=exact)
             # 切换了聊天窗口，清除 ChatInfo 缓存
