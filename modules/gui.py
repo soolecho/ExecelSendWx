@@ -3668,6 +3668,10 @@ class TableFilterTab(QWidget):
             self.cloud_file_edit.setEnabled(configured)
             self.cloud_browse_btn.setEnabled(configured)
             self.cloud_read_btn.setEnabled(configured)
+        else:
+            # 切回本地模式必须恢复按钮启用状态（云文档模式下 excel_btn 会被禁用）
+            loading = bool(self.excel_worker and self.excel_worker.isRunning())
+            self._set_excel_loading(loading)
         self._update_cloud_status()
         if refresh and is_cloud and not self.wps_store.is_configured():
             self.log("当前为云文档来源，请先点击“Cookie 凭证设置”粘贴浏览器里的 wps_sid")
