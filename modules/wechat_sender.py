@@ -64,6 +64,10 @@ class WeChatSender:
     _BATCH_LOCK = threading.Lock()
     _BATCH_ACTIVE = 0
     _BATCH_STATE_LOCK = threading.Lock()
+    # 批次级窗口尺寸检查标志：每批次（acquire_batch 成功）重置为 False，
+    # 批次内第一次预检时执行一次"窗口过小自动放大"，之后置 True，
+    # 避免同一批次的每个收件人都重复检查窗口尺寸
+    _WX_SIZE_CHECKED = False
 
     @classmethod
     def is_batch_active(cls) -> bool:
@@ -84,6 +88,7 @@ class WeChatSender:
             if cls._BATCH_LOCK.acquire(timeout=0.5):
                 with cls._BATCH_STATE_LOCK:
                     cls._BATCH_ACTIVE += 1
+                cls._WX_SIZE_CHECKED = False  # 新批次开始：窗口尺寸待检查一次
                 return True
             if should_stop and should_stop():
                 return False
@@ -1112,11 +1117,15 @@ class WeChatSender:
                     pass
 
             # 微信窗口被拖得过小时顶部搜索框会被压缩/隐藏，UIA 找不到搜索框
-            # → 预检跳过 → 切换窗口失败 → 发送失败；检测到过小先放大窗口再预检
-            try:
-                self._ensure_wechat_window_size(self.log)
-            except Exception:
-                pass
+            # → 预检跳过 → 切换窗口失败 → 发送失败；检测到过小先放大窗口再预检。
+            # 批次级一次：仅在该任务批次第一次预检时检查（acquire_batch 已重置
+            # 标志），避免同一批次的每个收件人都重复执行
+            if not WeChatSender._WX_SIZE_CHECKED:
+                try:
+                    self._ensure_wechat_window_size(self.log)
+                except Exception:
+                    pass
+                WeChatSender._WX_SIZE_CHECKED = True
 
             # 定位微信顶部搜索框（name='搜索' 或 class 含 XValidatorTextEdit）。
             # 窗口刚从托盘恢复时 UIA 树可能仍在懒加载，搜索框未立即暴露，
