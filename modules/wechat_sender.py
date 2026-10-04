@@ -340,6 +340,65 @@ class WeChatSender:
                     pass
             return False
 
+    # 微信窗口过小阈值：低于该尺寸时顶部搜索框会被压缩/隐藏，UIA 读不到
+    _MIN_WX_WIDTH = 600
+    _MIN_WX_HEIGHT = 450
+
+    @staticmethod
+    def _ensure_wechat_window_size(log_fn=None) -> bool:
+        """发送前检查微信主窗口是否过小（搜索框被压缩/隐藏）。
+
+        微信主窗口被拖得很小时，顶部搜索框会被裁剪/隐藏，UIA 读不到搜索框
+        → 预检"找不到微信搜索框"→ 跳过验证 → 切换窗口失败 → 发送失败。
+        检测到宽/高低于阈值时，把窗口放大到所在显示器工作区的 90%
+        （居中），恢复搜索框可见；窗口尺寸正常时不做任何改动。
+        返回 True 表示做了尺寸调整。
+        """
+        try:
+            import win32gui
+            import win32con
+        except ImportError:
+            return False
+        for cls_name in ("Qt51514QWindowIcon", "WeChatMainWndForPC"):
+            try:
+                hwnd = win32gui.FindWindow(cls_name, "微信")
+            except Exception:
+                hwnd = 0
+            if not hwnd:
+                continue
+            try:
+                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+                w, h = right - left, bottom - top
+                if w <= 0 or h <= 0:
+                    return False
+                if w >= WeChatSender._MIN_WX_WIDTH and h >= WeChatSender._MIN_WX_HEIGHT:
+                    return False  # 尺寸正常，保持用户窗口原样
+                # 取窗口所在显示器的工作区（不含任务栏），放大到其 90% 并居中
+                mon = win32gui.MonitorFromWindow(
+                    hwnd, win32con.MONITOR_DEFAULTTONEAREST
+                )
+                info = win32gui.GetMonitorInfo(mon)
+                wl, wt, wr, wb = info["Work"]
+                target_w = int((wr - wl) * 0.9)
+                target_h = int((wb - wt) * 0.9)
+                if target_w <= w and target_h <= h:
+                    return False
+                nx = wl + (wr - wl - target_w) // 2
+                ny = wt + (wb - wt - target_h) // 2
+                win32gui.MoveWindow(hwnd, nx, ny, target_w, target_h, True)
+                if log_fn:
+                    try:
+                        log_fn(
+                            f"⚠ 微信窗口过小({w}x{h})，已自动放大到 "
+                            f"{target_w}x{target_h} 以恢复搜索框"
+                        )
+                    except Exception:
+                        pass
+                return True
+            except Exception:
+                continue
+        return False
+
     def initialize(self):
         logger.info("Initializing WeChat client...")
         # 先激活微信主窗口，避免窗口最小化到托盘导致 wxauto 找不到句柄
@@ -1051,6 +1110,13 @@ class WeChatSender:
                     self._activate_wechat_window(self.log)
                 except Exception:
                     pass
+
+            # 微信窗口被拖得过小时顶部搜索框会被压缩/隐藏，UIA 找不到搜索框
+            # → 预检跳过 → 切换窗口失败 → 发送失败；检测到过小先放大窗口再预检
+            try:
+                self._ensure_wechat_window_size(self.log)
+            except Exception:
+                pass
 
             # 定位微信顶部搜索框（name='搜索' 或 class 含 XValidatorTextEdit）。
             # 窗口刚从托盘恢复时 UIA 树可能仍在懒加载，搜索框未立即暴露，
