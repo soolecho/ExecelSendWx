@@ -660,12 +660,13 @@ class WeChatSender:
         """
         if any(k in title for k in cls._DIALOG_TITLE_KEYWORDS):
             return True
-        # 排除微信搜索下拉浮层：class 含 ToolSaveBits 且标题为英文 'Weixin'
-        # （在搜索框输入收件人名时弹出的搜索结果工具窗）。它不是"发送失败"
-        # 弹窗——若被 watchdog 误关会导致真实联系人也被误判为找不到。
+        # 排除微信搜索下拉浮层：class 含 SaveBits 工具窗（ToolSaveBits /
+        # ToolTipSaveBits，标题为英文 'Weixin'）。这些是搜索框输入收件人名时
+        # 弹出的搜索结果工具窗/浮层，不是"发送失败"弹窗——若被 watchdog 误关
+        # 会导致真实联系人也被误判为找不到。
         # 真实失败弹窗标题为中文（'微信'/空/'发送失败'）或含失败关键词，
-        # 与该特征（英文 Weixin + ToolSaveBits 工具窗）不重叠。
-        if "ToolSaveBits" in class_name and title.strip() == "Weixin":
+        # 与该特征（英文 Weixin + SaveBits 工具窗）不重叠。
+        if "SaveBits" in class_name and title.strip() == "Weixin":
             return False
         # 兜底1：标题为空 + 尺寸较小（排除通话/朋友圈等大窗口），
         # 基本就是模态提示弹窗（微信 4.0 的"发送失败"框无标题栏，
@@ -1151,11 +1152,20 @@ class WeChatSender:
                 pass
             self._watchdog_suspend = max(0, self._watchdog_suspend - 1)
             # 统一写缓存（含放行/失败路径），有效期内同收件人不再重复搜索。
-            # ttl <= 0 表示永久不过期，用户手动清理；否则存到期时间戳
+            # ttl <= 0 表示永久不过期，用户手动清理；否则存到期时间戳。
+            # 失败（False）结果用独立短 TTL：微信搜索下拉偶发渲染延迟/界面残留
+            # 会导致预检一次误判"找不到"，若按用户长 TTL 持久化会被放大成
+            # "一直失败"（重启后仍加载缓存继续失败）。失败结果只短暂缓存，
+            # 且不写盘（跨重启自动重新验证），成功结果才按用户 TTL 持久化。
             ttl = self._precheck_ttl
-            expiry = 0 if ttl <= 0 else time.time() + ttl
-            self._precheck_cache[key] = (result, expiry)
-            self._persist_precheck_cache()
+            if result:
+                expiry = 0 if ttl <= 0 else time.time() + ttl
+                self._precheck_cache[key] = (result, expiry)
+                self._persist_precheck_cache()
+            else:
+                # 失败：只缓存 120 秒（内存），到期后重新搜索验证
+                self._precheck_cache[key] = (False, time.time() + 120)
+            self._precheck_cache_loaded = True
         return result
 
     @staticmethod
