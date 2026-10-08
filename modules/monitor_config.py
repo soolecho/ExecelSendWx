@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
-MONITOR_VERSION = 5
+MONITOR_VERSION = 6
 
 
 @dataclass
@@ -157,6 +157,12 @@ class MonitorTask:
     text_title: str = ""
     # 推送文字是否附带逐行明细（勾选才显示 列:值；否则只显示标题+条数）
     text_detail: bool = True
+    # 清洗后条数判断拦截：当 len(clean_rows) OP limit_count 为真时，本次不发送（命中拦截）。
+    # limit_op: ''=不启用（兼容旧配置）；'>'=条数大于阈值时拦截；'<'=条数小于阈值时拦截；
+    #          '=='=条数等于阈值时拦截。不发送时基线照常推进（避免被反复拦截刷日志）。
+    limit_enabled: bool = False
+    limit_op: str = ""          # ''/'>'/'<'/'=='
+    limit_count: int = 0
     # 是否递归扫描监控目录的子文件夹（默认仅当前层，避免大目录过慢）
     include_subdir: bool = False
     # 每天运行时间段（HH:MM，起:止）。空=全天；支持跨夜如 22:00-07:00。
@@ -244,6 +250,9 @@ class MonitorTask:
             snapshot_range=_s("snapshot_range"),
             text_title=_s("text_title"),
             text_detail=_b("text_detail", True),
+            limit_enabled=_b("limit_enabled", False),
+            limit_op=_s("limit_op", ""),
+            limit_count=max(0, _i("limit_count", 0)),
             include_subdir=_b("include_subdir", False),
             active_start=_s("active_start"),
             active_end=_s("active_end"),

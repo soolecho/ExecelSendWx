@@ -201,6 +201,13 @@ class MonitorWorker(QThread):
         for d in dropped:
             self.emit(f"{log_prefix} 任务「{task.name}」行{d['row_idx'] + 1} 清洗剔除（{d['column']}）: {d['reason']}")
 
+        # 清洗后条数判断拦截：若 len(clean_rows) OP limit_count 命中，则本次不发送。
+        # 基线照常推进（等同"已处理"），避免同批数据被反复拦截刷日志。
+        if task.limit_enabled and task.limit_op and self._limit_hit(task, len(clean_rows)):
+            self.emit(f"{log_prefix} 任务「{task.name}」文件「{name}」清洗后 {len(clean_rows)} 条命中条数判断（{task.limit_op} {task.limit_count}），本次不发送")
+            self._advance_baseline(task, fp, headers, rows, key_columns)
+            return None
+
         # 推送/生成基于清洗后的行 + 指定的提取列；文字说明基于裁剪后的结果
         view_headers, view_rows = monitor_engine.extract_columns_by(
             headers, clean_rows, task.extract_columns
@@ -345,6 +352,29 @@ class MonitorWorker(QThread):
         else:
             self.emit(f"{log_prefix} 任务「{task.name}」无可用接收人，跳过发送；已记录处理进度")
         return (msg_delivered, msg_failed)
+
+    @staticmethod
+    def _limit_hit(task: MonitorTask, n: int) -> bool:
+        """清洗后条数判断：len(clean_rows) OP limit_count 为真即拦截（本次不发送）。"""
+        op = task.limit_op
+        c = task.limit_count
+        if op == ">":
+            return n > c
+        if op == "<":
+            return n < c
+        if op == "==":
+            return n == c
+        return False
+
+    def _advance_baseline(self, task: MonitorTask, fp: str,
+                          headers, rows, key_columns) -> None:
+        """把当前文件推进为"已处理"基线（与发送成功语义一致），供条数判断拦截后调用。"""
+        if task.compare_enabled:
+            task.baseline = {"__prev__":
+                             monitor_engine.build_baseline(headers, rows, key_columns)}
+        else:
+            task.seen_files[os.path.basename(fp)] = monitor_engine.file_fingerprint(fp)
+        self.store.save(task)
 
     def _send_text(self, person: str, text: str, task: MonitorTask, prefix: str) -> None:
         sender = WeChatSender.shared_instance()
