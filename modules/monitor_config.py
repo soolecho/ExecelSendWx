@@ -20,7 +20,35 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
-MONITOR_VERSION = 6
+MONITOR_VERSION = 7
+
+
+def _default_send_order() -> List[str]:
+    """监控合并发送默认顺序：文字 → 图片 → 表格文件（旧行为兼容）。"""
+    return ["text", "image", "attachment"]
+
+
+def _parse_send_order(data: Dict) -> List[str]:
+    """解析发送顺序配置：仅允许 text/image/attachment，去重保序并补全缺项。
+
+    旧配置无 send_order 或值非法时回退默认（文字在前，然后图片、文件），
+    保证升级后行为与旧版一致。
+    """
+    allowed = ("text", "image", "attachment")
+    raw = data.get("send_order")
+    if not isinstance(raw, list):
+        return _default_send_order()
+    seen = set()
+    out = []
+    for it in raw:
+        k = str(it).strip()
+        if k in allowed and k not in seen:
+            seen.add(k)
+            out.append(k)
+    for k in allowed:
+        if k not in seen:
+            out.append(k)
+    return out
 
 
 @dataclass
@@ -157,6 +185,8 @@ class MonitorTask:
     text_title: str = ""
     # 推送文字是否附带逐行明细（勾选才显示 列:值；否则只显示标题+条数）
     text_detail: bool = True
+    # 合并发送的粘贴/排列顺序（text/image/attachment；缺省=文字在前，然后图片、文件）
+    send_order: List[str] = field(default_factory=_default_send_order)
     # 清洗后条数判断拦截：当 len(clean_rows) OP limit_count 为真时，本次不发送（命中拦截）。
     # limit_op: ''=不启用（兼容旧配置）；'>'=条数大于阈值时拦截；'<'=条数小于阈值时拦截；
     #          '=='=条数等于阈值时拦截。不发送时基线照常推进（避免被反复拦截刷日志）。
@@ -250,6 +280,7 @@ class MonitorTask:
             snapshot_range=_s("snapshot_range"),
             text_title=_s("text_title"),
             text_detail=_b("text_detail", True),
+            send_order=_parse_send_order(data),
             limit_enabled=_b("limit_enabled", False),
             limit_op=_s("limit_op", ""),
             limit_count=max(0, _i("limit_count", 0)),

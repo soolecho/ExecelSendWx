@@ -272,17 +272,17 @@ class MonitorWorker(QThread):
             return None
         msg_delivered = 0
         msg_failed = 0
+        # v1.5.0 批处理合并：文字/图片/附件合并为一次粘贴 + 一次 Enter 发送（text+files 混合
+        # 走两步粘贴、一次 Enter），绝不逐条发送；与本轮内容同批推送，保持消息完整。
+        # 粘贴顺序按任务配置 send_order（文字/图片/文件）联动：文字在前 → 先粘文字再粘文件。
+        text = "\n".join(texts) if texts else None
+        files, text_first = self._resolve_send_order(task, png_path, out_file)
         try:
             for person in task.recipients:
                 if self._stop or not person or not clean_rows:
                     continue
                 try:
-                    if texts:
-                        self._send_text(person, "\n".join(texts), task, log_prefix)
-                    if png_path and os.path.exists(png_path):
-                        self._send_file(person, png_path, task, log_prefix)
-                    if out_file and os.path.exists(out_file):
-                        self._send_file(person, out_file, task, log_prefix)
+                    self._send_merged(person, text, files, task, log_prefix, text_first)
                     msg_delivered += 1
                 except Exception as exc:
                     msg_failed += 1
@@ -376,30 +376,65 @@ class MonitorWorker(QThread):
             task.seen_files[os.path.basename(fp)] = monitor_engine.file_fingerprint(fp)
         self.store.save(task)
 
-    def _send_text(self, person: str, text: str, task: MonitorTask, prefix: str) -> None:
-        sender = WeChatSender.shared_instance()
-        ok = sender.send_message(
-            content=text,
-            recipient=person,
-            first_send=False,
-            chat_delay=task.chat_delay,
-            fast_mode=True,
-        )
-        if not ok:
-            raise RuntimeError("微信文本发送返回失败")
-        self.emit(f"{prefix} → 「{person}」已发送文字")
+    @staticmethod
+    def _resolve_send_order(task, png_path, out_file):
+        """按任务配置的发送顺序（text/image/attachment）解析本轮粘贴方案。
 
-    def _send_file(self, person: str, path: str, task: MonitorTask, prefix: str) -> None:
+        返回 (files, text_first)：
+        - files：图片/附件按顺序排成的文件列表（一次 CF_HDROP 粘贴，卡片顺序=列表顺序）
+        - text_first：文字类排最前 → 先粘文字再粘文件（文字在前）；否则文件在前
+        send_order 缺失或非法时回退默认（文字在前，然后图片、文件），兼容旧配置。
+        """
+        order = list(getattr(task, "send_order", None)
+                     or ["text", "image", "attachment"])
+        files_map = {}
+        if png_path and os.path.exists(png_path):
+            files_map["image"] = png_path
+        if out_file and os.path.exists(out_file):
+            files_map["attachment"] = out_file
+        kinds = [k for k in order if k in files_map]
+        for k in ("image", "attachment"):
+            if k in files_map and k not in kinds:
+                kinds.append(k)
+        files = [files_map[k] for k in kinds]
+        text_first = bool(order) and order[0] == "text"
+        return files, text_first
+
+    def _send_merged(self, person: str, text, files, task: MonitorTask,
+                     prefix: str, text_first: bool = False) -> None:
+        """合并推送：文字/图片/附件一次粘贴 + 一次 Enter（v1.5.0 批处理合并约束）。
+
+        - text+files → send_text_and_files（两步粘贴：文字/文件先后由 text_first 决定）
+        - 仅 files → send_files_batch（一次粘贴 + Enter）
+        - 仅 text → send_message（原逻辑）
+        发送返回 False 视为失败（抛异常由调用方计入 msg_failed）。
+        """
         sender = WeChatSender.shared_instance()
-        ok = sender.send_file(
-            file_path=path,
-            recipient=person,
-            chat_delay=task.chat_delay,
-            fast_mode=True,
-        )
+        if files and text:
+            ok = sender.send_text_and_files(
+                text=text, file_paths=files, recipient=person,
+                chat_delay=task.chat_delay, fast_mode=True,
+                text_first=text_first,
+            )
+        elif files:
+            ok = sender.send_files_batch(
+                file_paths=files, recipient=person,
+                chat_delay=task.chat_delay, fast_mode=True,
+            )
+        else:
+            ok = sender.send_message(
+                content=text or "", recipient=person, first_send=False,
+                chat_delay=task.chat_delay, fast_mode=True,
+            )
         if not ok:
-            raise RuntimeError("微信文件发送返回失败")
-        self.emit(f"{prefix} → 「{person}」已发送文件 {os.path.basename(path)}")
+            raise RuntimeError("微信合并发送返回失败")
+        names = [os.path.basename(f) for f in files]
+        if text and names:
+            self.emit(f"{prefix} → 「{person}」已发送文字+{len(names)}个文件")
+        elif names:
+            self.emit(f"{prefix} → 「{person}」已发送{len(names)}个文件")
+        else:
+            self.emit(f"{prefix} → 「{person}」已发送文字")
 
     def emit(self, msg: str) -> None:
         self.log.emit(msg)

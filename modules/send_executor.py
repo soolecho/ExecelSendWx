@@ -160,58 +160,162 @@ def run_send_tasks(
                         break
                     task["_chat_opened"] = True
 
-                step = task["pending_steps"][0]
-                step_type = step["type"]
-                start_index = step.get("index", 0)
-                success = False
+                steps = task["pending_steps"]
+                step_types = [s["type"] for s in steps]
+                has_text = "text" in step_types
+                has_custom = "custom" in step_types
+                has_files = ("image" in step_types) or (
+                    "attachment" in step_types and bool(attach_path)
+                )
 
-                if step_type == "image":
-                    success, next_index = sender.send_table_images_progress(
-                        table_data,
-                        recipient,
-                        chat_delay=chat_delay,
-                        start_index=start_index,
-                        stop_event=stop_event,
-                        fast_mode=True,
+                if has_files:
+                    # ---------- v1.5.0 批处理合并：文字/自定义文字 + 图片 + 附件 ----------
+                    # 合并为一次 send_text_and_files（一次粘贴 + 一次 Enter），绝不逐条发；
+                    # 仅当同一内容同时含 text 与 custom 两种文字时才拆两次：
+                    # text+图片+附件一批，custom 单独一批。
+                    images = []
+                    try:
+                        if "image" in step_types:
+                            images = list(
+                                sender._create_table_images(task["table_data"]) or []
+                            )
+                            for _p in images:
+                                _log(
+                                    f"{prefix}[{i+1}/{total_count}] 已生成表格图片: {os.path.basename(_p)}"
+                                )
+                    except Exception as exc:
+                        _log(
+                            f"{prefix}[{i+1}/{total_count}] ❌ 生成表格图片失败: {exc}"
+                        )
+                        for _p in images:
+                            try:
+                                sender._remove_temp_image(_p)
+                            except Exception:
+                                pass
+                        break
+                    file_paths = images + (
+                        [attach_path]
+                        if "attachment" in step_types and attach_path
+                        else []
                     )
-                    step["index"] = next_index
-                elif step_type == "text":
-                    success, next_index = sender.send_multiple_messages_progress(
-                        messages,
-                        recipient,
-                        chat_delay=chat_delay,
-                        start_index=start_index,
-                        stop_event=stop_event,
-                        fast_mode=True,
-                    )
-                    step["index"] = next_index
-                elif step_type == "attachment":
-                    _log(f"{prefix}[{i+1}/{total_count}] 发送附件给 {recipient}")
-                    success = sender.send_file(
-                        attach_path,
-                        recipient,
-                        chat_delay=chat_delay,
-                        fast_mode=True,
-                        stop_event=stop_event,
-                    )
-                    if success:
-                        _log(f"{prefix}[{i+1}/{total_count}] 已发送附加文件")
-                else:  # custom
-                    _log(f"{prefix}[{i+1}/{total_count}] 发送自定义消息给 {recipient}")
-                    success = sender.send_message(
-                        task["custom_msg"],
-                        recipient,
-                        chat_delay=chat_delay,
-                        fast_mode=True,
-                        stop_event=stop_event,
-                    )
-                    if success:
-                        _log(f"{prefix}[{i+1}/{total_count}] 已发送自定义消息")
+                    # 发送顺序联动粘贴顺序：按 send_order 中「文字类（text/custom）」
+                    # 与「文件类（image/attachment）」的相对先后，决定两步粘贴谁先谁后
+                    # （文字在前 → 先粘文字再粘文件；文件在前 → 先粘文件再追加文字），
+                    # 以及图片/附件卡片之间谁在前（一次 CF_HDROP 粘贴，卡片顺序=列表顺序）。
+                    order_kinds = [
+                        k for k in (send_order or [])
+                        if k in ("text", "custom", "image", "attachment")
+                    ]
+                    text_first = bool(order_kinds) and order_kinds[0] in ("text", "custom")
+                    if ("attachment" in order_kinds and "image" in order_kinds
+                            and order_kinds.index("attachment") < order_kinds.index("image")):
+                        file_paths = file_paths[len(images):] + file_paths[:len(images)]
+                    # 合并文字：text 形式优先（与 custom 并存时先发 text 批次）；
+                    # 仅 custom 时用自定义文字；都没有则纯文件批。
+                    if has_text:
+                        merge_text = "".join(messages)
+                    elif has_custom:
+                        merge_text = task["custom_msg"]
+                    else:
+                        merge_text = None
 
-                if not success:
-                    break
+                    if merge_text is not None:
+                        _log(
+                            f"{prefix}[{i+1}/{total_count}] 合并发送文字+{len(file_paths)}个文件给 {recipient}"
+                        )
+                        success = sender.send_text_and_files(
+                            merge_text,
+                            file_paths,
+                            recipient,
+                            chat_delay=chat_delay,
+                            fast_mode=True,
+                            stop_event=stop_event,
+                            text_first=text_first,
+                        )
+                    else:
+                        _log(
+                            f"{prefix}[{i+1}/{total_count}] 合并发送{len(file_paths)}个文件给 {recipient}"
+                        )
+                        success = sender.send_files_batch(
+                            file_paths,
+                            recipient,
+                            chat_delay=chat_delay,
+                            fast_mode=True,
+                            stop_event=stop_event,
+                        )
+                    # 清理表格图片临时文件（附件是用户文件，不删）
+                    for _p in images:
+                        try:
+                            sender._remove_temp_image(_p)
+                        except Exception:
+                            pass
+                    if not success:
+                        _log(
+                            f"{prefix}[{i+1}/{total_count}] ❌ 合并发送失败，整批保留待重发"
+                        )
+                        break
+                    # 消费整批：仅 text 与 custom 并存时留下 custom 单独发
+                    if has_text and has_custom:
+                        task["pending_steps"] = [
+                            s for s in steps if s["type"] == "custom"
+                        ]
+                    else:
+                        task["pending_steps"] = []
+                else:
+                    # ---------- 无图片/附件：逐项发送（原逻辑） ----------
+                    step = steps[0]
+                    step_type = step["type"]
+                    start_index = step.get("index", 0)
+                    success = False
 
-                task["pending_steps"].pop(0)
+                    if step_type == "image":
+                        success, next_index = sender.send_table_images_progress(
+                            table_data,
+                            recipient,
+                            chat_delay=chat_delay,
+                            start_index=start_index,
+                            stop_event=stop_event,
+                            fast_mode=True,
+                        )
+                        step["index"] = next_index
+                    elif step_type == "text":
+                        success, next_index = sender.send_multiple_messages_progress(
+                            messages,
+                            recipient,
+                            chat_delay=chat_delay,
+                            start_index=start_index,
+                            stop_event=stop_event,
+                            fast_mode=True,
+                        )
+                        step["index"] = next_index
+                    elif step_type == "attachment":
+                        _log(f"{prefix}[{i+1}/{total_count}] 发送附件给 {recipient}")
+                        success = sender.send_file(
+                            attach_path,
+                            recipient,
+                            chat_delay=chat_delay,
+                            fast_mode=True,
+                            stop_event=stop_event,
+                        )
+                        if success:
+                            _log(f"{prefix}[{i+1}/{total_count}] 已发送附加文件")
+                    else:  # custom
+                        _log(f"{prefix}[{i+1}/{total_count}] 发送自定义消息给 {recipient}")
+                        success = sender.send_message(
+                            task["custom_msg"],
+                            recipient,
+                            chat_delay=chat_delay,
+                            fast_mode=True,
+                            stop_event=stop_event,
+                        )
+                        if success:
+                            _log(f"{prefix}[{i+1}/{total_count}] 已发送自定义消息")
+
+                    if not success:
+                        break
+
+                    task["pending_steps"].pop(0)
+
                 if task["pending_steps"] and stop_event is not None:
                     if stop_event.wait(0.1):
                         break

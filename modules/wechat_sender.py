@@ -1,4 +1,4 @@
-from wxauto4 import WeChat
+from modules.uia_bridge import UiaBridge
 import logging
 import os
 import tempfile
@@ -120,7 +120,9 @@ class WeChatSender:
             pass
 
     def __init__(self):
-        self.wx = None
+        # WeChatUIA 桥接单例（进程内共享，线程锁串行驱动操作）
+        self.bridge = UiaBridge.instance()
+        self._initialized = False
         # 最近一次确认句柄可用的时间戳；超时会先做一次轻量探活
         self._last_healthy_ts = 0.0
         self._own_initialize_called = False
@@ -167,93 +169,6 @@ class WeChatSender:
         current_chat = str(current_chat or "").strip()
         recipient = str(recipient or "").strip()
         return bool(recipient and recipient in current_chat)
-
-    @staticmethod
-    def _activate_wechat_window(log_fn=None):
-        """在初始化 WeChat 句柄前激活微信主窗口。
-
-        微信窗口最小化到系统托盘时，wxauto4 找不到主窗口句柄，会导致
-        WeChatSender.initialize() 失败（定时任务最常见的失败原因）。
-        用 Win32 API 把微信主窗口恢复并置前，确保 wxauto4 能正常 attach。
-
-        新版微信 4.0 主窗口类名为 "Qt51514QWindowIcon"，标题为"微信"。
-        旧版微信 3.x 主窗口类名为 "WeChatMainWndForPC"。
-        """
-        try:
-            import win32gui
-            import win32con
-            import ctypes
-        except ImportError as exc:
-            if log_fn:
-                try:
-                    log_fn(f"⚠ win32gui 不可用，跳过微信窗口激活: {exc}")
-                except Exception:
-                    pass
-            return False
-
-        candidates = [
-            ("Qt51514QWindowIcon", "微信"),      # 微信 4.0 (Weixin.exe)
-            ("WeChatMainWndForPC", "微信"),      # 微信 3.x (WeChat.exe)
-        ]
-        hwnd = 0
-        for cls_name, title in candidates:
-            try:
-                hwnd = win32gui.FindWindow(cls_name, title)
-            except Exception:
-                hwnd = 0
-            if hwnd:
-                break
-
-        if not hwnd:
-            if log_fn:
-                try:
-                    log_fn("⚠ 未找到微信主窗口（微信可能未登录或未启动）")
-                except Exception:
-                    pass
-            return False
-
-        try:
-            was_visible = bool(win32gui.IsWindowVisible(hwnd))
-            was_minimized = False
-            if not was_visible:
-                # 从系统托盘恢复：SW_RESTORE=9
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                # 微信此前若是最大化，SW_RESTORE 会原样恢复成最大化（看起来像全屏）；
-                # 本程序仅因发送需要恢复窗口，归位为普通大小更自然
-                try:
-                    if win32gui.IsZoomed(hwnd):
-                        win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
-                except Exception:
-                    pass
-                was_minimized = True
-            # 解除 Windows 前台锁定（SystemParametersInfo, SPI_SETFOREGROUNDLOCKTIMEOUT=0x2001）
-            try:
-                user32 = ctypes.windll.user32
-                user32.SystemParametersInfoW(0x2001, 0, 0, 0)
-            except Exception:
-                pass
-            # 置前；偶尔会因前台锁定抛 OSError，重试一次
-            for _ in range(2):
-                try:
-                    win32gui.SetForegroundWindow(hwnd)
-                    break
-                except Exception:
-                    time.sleep(0.15)
-            # 给 wxauto 一点时间稳定 UIA 树
-            time.sleep(0.4)
-            if log_fn and was_minimized:
-                try:
-                    log_fn("✅ 已激活微信主窗口（之前最小化到托盘）")
-                except Exception:
-                    pass
-            return True
-        except Exception as exc:
-            if log_fn:
-                try:
-                    log_fn(f"⚠ 激活微信窗口失败: {exc}")
-                except Exception:
-                    pass
-            return False
 
     @staticmethod
     def _ensure_window_on_screen(log_fn=None) -> bool:
@@ -406,24 +321,23 @@ class WeChatSender:
 
     def initialize(self):
         logger.info("Initializing WeChat client...")
-        # 先激活微信主窗口，避免窗口最小化到托盘导致 wxauto 找不到句柄
-        # （这是定时任务"初始化微信失败"的主要根因）
-        self._activate_wechat_window(self.log)
         try:
-            # resize=False：不让 wxauto4 自动把聊天窗口拉大到 800x6000 并移到屏幕左侧。
-            # 拉大窗口是为了显示更多消息提高 UIA 识别容错（主要影响读取消息功能），
-            # 本程序只用发送链路（搜索+输入框），不依赖大窗口；保持用户窗口原样不跳动。
-            # ads=False：关闭 wxauto4 启动时的广告横幅输出。
-            self.wx = WeChat(ads=False, resize=False)
-            # 读一次 nickname 确认句柄真实可用
-            _ = getattr(self.wx, "nickname", None)
+            # bridge.ensure() 幂等热激活：唤醒/置前微信主窗口（含 Qt accessibility
+            # gate 热写），并校验主窗可用；失败即返回 False（定时任务"初始化微信
+            # 失败"的主要根因是窗口最小化到托盘，ensure 内部会先恢复窗口）。
+            if not self.bridge.ensure():
+                logger.error("Failed to initialize WeChat: 微信主窗口不可用（可能未登录或未启动）")
+                self._initialized = False
+                self._own_initialize_called = False
+                return False
+            self._initialized = True
             self._last_healthy_ts = time.time()
             self._own_initialize_called = True
             logger.info("WeChat client initialized successfully.")
             return True
         except Exception as e:
             logger.error(f"Failed to initialize WeChat: {e}")
-            self.wx = None
+            self._initialized = False
             self._own_initialize_called = False
             return False
 
@@ -439,7 +353,7 @@ class WeChatSender:
                     hwnd = 0
                 if hwnd:
                     # 若窗口当前是最大化，先归位为普通大小再最小化；否则下次任何恢复
-                    # （含 wxauto4 内部 SetActive 的 SW_RESTORE）会回到最大化，看起来像全屏
+                    # （含驱动内部激活的 SW_RESTORE）会回到最大化，看起来像全屏
                     try:
                         if win32gui.IsZoomed(hwnd):
                             win32gui.ShowWindow(hwnd, win32con.SW_SHOWNORMAL)
@@ -454,10 +368,10 @@ class WeChatSender:
     def _normalize_wechat_window() -> bool:
         """发送前把微信主窗口从「最大化」归位为普通大小。
 
-        wxauto4 每次激活窗口（SetActive/ChatWith 内部）会把最小化的窗口
-        SW_RESTORE 恢复；若窗口之前处于最大化状态，恢复后即以最大化（全屏）
-        显示，干扰用户。发送是自动化操作，统一在每次发送前把窗口归位为
-        普通大小，避免"全屏化"。窗口本就不是最大化时不改动。
+        微信驱动每次激活窗口会把最小化的窗口 SW_RESTORE 恢复；若窗口之前
+        处于最大化状态，恢复后即以最大化（全屏）显示，干扰用户。发送是
+        自动化操作，统一在每次发送前把窗口归位为普通大小，避免"全屏化"。
+        窗口本就不是最大化时不改动。
         """
         try:
             import win32gui
@@ -483,8 +397,8 @@ class WeChatSender:
     def reconnect(self, log_fn=None) -> bool:
         """当检测到微信句柄失效时重新初始化。失败会写日志但不抛异常。"""
         try:
-            # 解除旧引用，便于 GC 回收句柄相关资源
-            self.wx = None
+            # 重置初始化状态，便于下一次走完整初始化流程
+            self._initialized = False
             self._invalidate_chatinfo_cache()
             if log_fn:
                 try:
@@ -509,14 +423,14 @@ class WeChatSender:
 
     def _safe_chatinfo(self) -> tuple[bool, dict | None]:
         """
-        安全读取 ChatInfo。
-        返回 (is_healthy, chatinfo)。
-        is_healthy=False 意味着句柄已失效，调用方应主动 reconnect 再试一次。
-        带 1.5 秒短缓存：同一次发送流程中 ChatWith 后可能连续调用多次 ChatInfo，
+        安全读取当前会话信息（bridge.current_chat）。
+        返回 (is_healthy, chatinfo)，chatinfo = {'chat_name': 当前会话名}。
+        is_healthy=False 意味着句柄已失效/读不到会话，调用方应主动 reconnect 再试一次。
+        带 1.5 秒短缓存：同一次发送流程中切换后可能连续调用多次，
         缓存避免冗余 UIA 调用（每次 50-200ms），显著提升发送速度。
-        ChatWith 后调用方应通过 _invalidate_chatinfo_cache() 清除缓存。
+        切换聊天窗口后调用方应通过 _invalidate_chatinfo_cache() 清除缓存。
         """
-        if not self.wx:
+        if not self._initialized:
             return False, None
         # 短缓存命中
         now = time.time()
@@ -524,13 +438,14 @@ class WeChatSender:
                 and now - self._chatinfo_cache_ts < self._chatinfo_cache_ttl):
             return True, self._chatinfo_cache
         try:
-            chatinfo = self.wx.ChatInfo()
+            chat_name = self.bridge.current_chat()
         except Exception:
             self._chatinfo_cache = None
             return False, None
-        if not isinstance(chatinfo, dict):
+        if not chat_name:
             self._chatinfo_cache = None
             return False, None
+        chatinfo = {'chat_name': chat_name}
         self._chatinfo_cache = chatinfo
         self._chatinfo_cache_ts = now
         self._last_healthy_ts = now
@@ -543,9 +458,9 @@ class WeChatSender:
     def _press_esc_on_wechat(self):
         """按 Esc 关闭微信搜索面板 / 退出误点进入的页面（视频号、搜一搜等）。
 
-        ChatWith 搜不到联系人时，wxauto4 仍可能点击搜索下拉里的
-        "搜索: xxx / 视频号" 等入口，把主界面切走；不清理的话，
-        后续重试会在错误页面上连环失败。Esc 将微信恢复到主界面。
+        搜索失败/驱动误点时，微信可能停留在搜索下拉或切到"搜索: xxx / 视频号"
+        等页面，把主界面切走；不清理的话，后续重试会在错误页面上连环失败。
+        Esc 将微信恢复到主界面。
         """
         try:
             import win32gui
@@ -997,13 +912,13 @@ class WeChatSender:
         """发送消息，检测发送失败弹窗并重试。最多 3 次。
 
         弹窗失败通常因频率限制/网络问题，重试间隔 1 秒；
-        SendMsg 返回失败间隔 0.5 秒。
+        bridge.send_text 返回失败间隔 0.5 秒。
         """
         max_retries = 3
         for attempt in range(max_retries):
             if self._stop_requested(stop_event):
                 return False
-            resp = self.wx.SendMsg(content)
+            ok = self.bridge.send_text(content)
             # 等待弹窗可能出现
             if self._wait_or_stopped(0.3, stop_event):
                 return False
@@ -1015,60 +930,64 @@ class WeChatSender:
                     continue
                 self.log(f"❌ {recipient} 弹窗重试{max_retries}次仍失败")
                 return False
-            if resp is not None and not resp:
+            if not ok:
                 if attempt < max_retries - 1:
-                    self.log(f"⚠️ {recipient} SendMsg返回失败({resp})，第{attempt + 1}/{max_retries}次重试...")
+                    self.log(f"⚠️ {recipient} 消息发送返回失败，第{attempt + 1}/{max_retries}次重试...")
                     if self._wait_or_stopped(0.5, stop_event):
                         return False
                     continue
-                self.log(f"❌ {recipient} SendMsg重试{max_retries}次仍失败")
+                self.log(f"❌ {recipient} 消息发送重试{max_retries}次仍失败")
                 return False
             return True
         return False
 
-    def _send_file_with_dialog_retry(self, file_path, recipient, stop_event=None) -> bool:
-        """发送文件，检测发送失败弹窗并重试。最多 3 次。"""
+    def _send_files_with_dialog_retry(self, file_paths, text, recipient,
+                                      stop_event=None, text_first=False) -> bool:
+        """合并发送文件/图片（可带文字），检测发送失败弹窗并重试。最多 3 次。
+
+        text 为 None 时仅发文件；非 None 时「文件 + 文字」一次粘贴 + 一次
+        Enter（v1.5.0 批处理合并约束）。text_first 控制文字在前/文件在前。
+        """
         max_retries = 3
+        label = f"{recipient}" + (f" 文字+{len(file_paths)}文件" if text else f" {len(file_paths)}文件")
         for attempt in range(max_retries):
             if self._stop_requested(stop_event):
                 return False
-            resp = self.wx.SendFiles(file_path)
+            ok = self.bridge.send_files(file_paths, text=text, text_first=text_first)
             if self._wait_or_stopped(0.3, stop_event):
                 return False
             if self._dismiss_send_failure_dialog():
                 if attempt < max_retries - 1:
-                    self.log(f"⚠️ {recipient} 文件发送失败(微信弹窗)，第{attempt + 1}/{max_retries}次重试...")
+                    self.log(f"⚠️ {label} 发送失败(微信弹窗)，第{attempt + 1}/{max_retries}次重试...")
                     if self._wait_or_stopped(1.0, stop_event):
                         return False
                     continue
-                self.log(f"❌ {recipient} 文件弹窗重试{max_retries}次仍失败")
+                self.log(f"❌ {label} 弹窗重试{max_retries}次仍失败")
                 return False
-            if resp is not None and not resp:
+            if not ok:
                 if attempt < max_retries - 1:
-                    self.log(f"⚠️ {recipient} SendFiles返回失败({resp})，第{attempt + 1}/{max_retries}次重试...")
+                    self.log(f"⚠️ {label} 发送返回失败，第{attempt + 1}/{max_retries}次重试...")
                     if self._wait_or_stopped(0.5, stop_event):
                         return False
                     continue
-                self.log(f"❌ {recipient} SendFiles重试{max_retries}次仍失败")
+                self.log(f"❌ {label} 发送重试{max_retries}次仍失败")
                 return False
             return True
         return False
 
-    def _precheck_contact_exists(self, recipient: str) -> bool:
-        """发送前预验证收件人在微信里能搜到联系人项。
+    def _open_chat_cached(self, recipient: str, retries: int = 2) -> bool:
+        """确保已切换到收件人聊天窗口（bridge.open_chat），带存在性缓存。
 
-        原因：wxauto4 的 ChatWith 搜不到联系人时，会误点搜索下拉里的
-        「搜索网络结果」入口，把微信主界面切到网页搜索页（Esc 无效），
-        导致后续重试连环失败。本方法改用 UIA 直接往微信搜索框输入名字、
-        读取搜索结果下拉：
-        - 存在匹配的联系人/群/公众号项（mmui::SearchContentCellView）→ 放行
-        - 不存在 → 按 Esc 关闭搜索浮层并返回 False，调用方跳过该收件人，
-          绝不调用 ChatWith，从根上避免弹出搜索网页。
-        任何异常/找不到搜索框时返回 True 放行，由原逻辑兜底。
-
-        预检期间会挂起弹窗守护线程（self._watchdog_suspend），避免把微信搜索
-        下拉浮层（Qt 工具窗，标题 'Weixin'）误判为"发送失败"弹窗关掉，
-        否则搜索结果一出现就被关，真实联系人也会被误判为不存在。
+        bridge.open_chat 内部即「搜索 + 过滤网页结果 + 校验输入框」，天然充当
+        收件人存在性预检，一次调用同时完成"验证存在"与"切换窗口"：
+        - 命中"已验证存在"缓存（用户 TTL 内）：先轻量读当前会话名，若当前
+          窗口正是该收件人则直接放行（免搜索）；否则仍真正搜索切换一次，
+          避免缓存成功却"当前窗口不正确"的误判。
+        - 命中"已知不存在"（120 秒内）：直接返回 False，不再浪费搜索。
+        搜索期间挂起弹窗守护线程（_watchdog_suspend），避免把微信搜索浮层
+        （Qt 工具窗，标题 'Weixin'）误判为"发送失败"弹窗关掉。
+        成功结果按用户 TTL 持久化到 precheck_cache.json；失败只内存缓存
+        120 秒、不写盘，避免一次误判"找不到"被放大成"一直失败"。
         """
         key = str(recipient or "").strip()
         if not key:
@@ -1077,171 +996,51 @@ class WeChatSender:
         now = time.time()
         cached = self._precheck_cache.get(key)
         if cached and (cached[1] == 0 or cached[1] > now):
-            return cached[0]
-
-        # 预检期间挂起弹窗守护线程（finally 中先 Esc 关浮层再恢复计数）
+            if cached[0]:
+                # 已验证存在：若当前窗口正是目标则直接放行，否则继续真正切换
+                try:
+                    if self._is_target_chat(self.bridge.current_chat(), key):
+                        return True
+                except Exception:
+                    pass
+            else:
+                return False
+        # 搜索期间挂起弹窗守护线程
         self._watchdog_suspend += 1
-        result = True
+        result = False
         try:
-            import comtypes.client
-            import comtypes.gen.UIAutomationClient as UIA
-            import win32gui
-
-            hwnd = 0
-            for cls_name in ("Qt51514QWindowIcon", "WeChatMainWndForPC"):
-                try:
-                    hwnd = win32gui.FindWindow(cls_name, "微信")
-                except Exception:
-                    hwnd = 0
-                if hwnd:
-                    break
-            if not hwnd:
-                self.log("⚠ 找不到微信窗口，跳过收件人预检查")
-                return True
-
-            # 仅当微信窗口不可见/最小化到托盘时才恢复并置前：同一批连续预检
-            # 通常窗口已在前台，若每次都激活会反复抢焦点又拖慢速度
-            need_activate = True
-            try:
-                # 最小化窗口 IsWindowVisible 仍为 True，需同时排除 IsIconic
-                need_activate = not (
-                    win32gui.IsWindowVisible(hwnd) and not win32gui.IsIconic(hwnd)
-                )
-            except Exception:
-                pass
-            if need_activate:
-                # 隐藏窗口 UIA 读不到内容，先恢复并置前
-                try:
-                    self._activate_wechat_window(self.log)
-                except Exception:
-                    pass
-
-            # 微信窗口被拖得过小时顶部搜索框会被压缩/隐藏，UIA 找不到搜索框
-            # → 预检跳过 → 切换窗口失败 → 发送失败；检测到过小先放大窗口再预检。
-            # 批次级一次：仅在该任务批次第一次预检时检查（acquire_batch 已重置
-            # 标志），避免同一批次的每个收件人都重复执行
-            if not WeChatSender._WX_SIZE_CHECKED:
-                try:
-                    self._ensure_wechat_window_size(self.log)
-                except Exception:
-                    pass
-                WeChatSender._WX_SIZE_CHECKED = True
-
-            # 定位微信顶部搜索框（name='搜索' 或 class 含 XValidatorTextEdit）。
-            # 窗口刚从托盘恢复时 UIA 树可能仍在懒加载，搜索框未立即暴露，
-            # 需置前+短等重试；窗口已在前台时无需置前，改用更短的等待。
-            # 仍找不到则按 Ctrl+F 强制聚焦搜索框兜底。
-            import ctypes
-            edit = None
-            ui = None
-            root = None
-            # 已在前台时缩短等待：UIA 树已就绪，搜索框立即可读
-            wait_sleep = 0.3 if need_activate else 0.05
-            for _try in range(3):
-                if need_activate:
-                    try:
-                        win32gui.SetForegroundWindow(hwnd)
-                    except Exception:
-                        pass
-                time.sleep(wait_sleep)
-                ui_unknown = comtypes.client.CreateObject(
-                    "{FF48DBA4-60EF-4201-AA87-54103EEF594E}"
-                )
-                ui = ui_unknown.QueryInterface(UIA.IUIAutomation)
-                root = ui.ElementFromHandle(hwnd)
-                cond = ui.CreatePropertyCondition(30005, "搜索")
-                edit = root.FindFirst(4, cond)
-                if edit:
-                    break
-                # 按名字找不到：遍历 class 含 XValidatorTextEdit 的元素
-                all_cond = ui.CreateTrueCondition()
-                found_all = root.FindAll(4, all_cond)
-                for i in range(found_all.Length):
-                    el = found_all.GetElement(i)
-                    try:
-                        if "XValidatorTextEdit" in str(el.CurrentClassName or ""):
-                            edit = el
-                            break
-                    except Exception:
-                        continue
-                if edit:
-                    break
-                # 兜底：Ctrl+F 聚焦搜索框后下一轮重试
-                try:
-                    ctypes.windll.user32.keybd_event(0x11, 0, 0, 0)
-                    ctypes.windll.user32.keybd_event(0x46, 0, 0, 0)
-                    ctypes.windll.user32.keybd_event(0x46, 0, 2, 0)
-                    ctypes.windll.user32.keybd_event(0x11, 0, 2, 0)
-                except Exception:
-                    pass
-                time.sleep(0.5)
-            if not edit:
-                self.log("⚠ 找不到微信搜索框，跳过收件人预检查")
-                return True
-
-            try:
-                vp = edit.GetCurrentPattern(10002)  # ValuePatternId
-                vp.QueryInterface(UIA.IUIAutomationValuePattern).SetValue(key)
-            except Exception:
-                self.log("⚠ 收件人预检查输入失败，放行")
-                return True
-
-            # 轮询读取搜索下拉：微信渲染慢/卡顿时多等几次再判定，
-            # 避免只读一次因渲染延迟误判"找不到"而跳过真实联系人。
-            # 结果通常渲染在主窗口树；个别情况下搜索浮层是独立 Qt 工具窗
-            # （class 常为 Qt51514QWindowToolSaveBits，标题 'Weixin'），
-            # 主窗口树未命中时才枚举顶层工具窗补扫，避免每轮 FindWindow 开销。
-            kl = key.lower()
-            result = False
-            deadline = time.time() + 1.2
-            while time.time() < deadline:
-                all_cond = ui.CreateTrueCondition()
-                # 1) 先扫主窗口树（最常见情况）
-                if self._scan_tree_for_contact(root, all_cond, kl):
-                    result = True
-                    break
-                # 2) 主窗口树未命中：补扫顶层 Qt 工具窗（搜索浮层独立成窗时）
-                try:
-                    _, tool_windows = self._find_wechat_dialogs()
-                except Exception:
-                    tool_windows = []
-                for _thw, _tt, _tc, _tw, _th in tool_windows:
-                    try:
-                        tree = ui.ElementFromHandle(_thw)
-                    except Exception:
-                        continue
-                    if self._scan_tree_for_contact(tree, all_cond, kl):
-                        result = True
-                        break
-                if result:
-                    break
-                time.sleep(0.2)
+            result = self.bridge.open_chat(key, retries=max(1, retries))
         except Exception as e:
             self.log(f"⚠ 收件人预检查异常，放行: {e}")
             result = True
         finally:
-            # 先关掉搜索浮层（Esc），再恢复守护线程，避免浮层残留被误关
-            try:
-                self._press_esc_on_wechat()
-            except Exception:
-                pass
             self._watchdog_suspend = max(0, self._watchdog_suspend - 1)
-            # 统一写缓存（含放行/失败路径），有效期内同收件人不再重复搜索。
-            # ttl <= 0 表示永久不过期，用户手动清理；否则存到期时间戳。
-            # 失败（False）结果用独立短 TTL：微信搜索下拉偶发渲染延迟/界面残留
-            # 会导致预检一次误判"找不到"，若按用户长 TTL 持久化会被放大成
-            # "一直失败"（重启后仍加载缓存继续失败）。失败结果只短暂缓存，
-            # 且不写盘（跨重启自动重新验证），成功结果才按用户 TTL 持久化。
             ttl = self._precheck_ttl
             if result:
                 expiry = 0 if ttl <= 0 else time.time() + ttl
-                self._precheck_cache[key] = (result, expiry)
+                self._precheck_cache[key] = (True, expiry)
                 self._persist_precheck_cache()
             else:
                 # 失败：只缓存 120 秒（内存），到期后重新搜索验证
                 self._precheck_cache[key] = (False, time.time() + 120)
             self._precheck_cache_loaded = True
         return result
+
+    def _is_known_missing(self, recipient: str) -> bool:
+        """只读缓存判断：该收件人最近 120 秒内被验证为"搜不到"，直接跳过发送。
+
+        不做任何搜索/切换，仅查内存缓存；用于发送入口快速跳过已知不存在的
+        收件人并给出明确日志，其余情况由切换流程（_open_chat_cached）天然校验。
+        """
+        key = str(recipient or "").strip()
+        if not key:
+            return False
+        self._load_precheck_cache()
+        cached = self._precheck_cache.get(key)
+        if not cached:
+            return False
+        ok, expiry = cached
+        return not ok and (expiry == 0 or expiry > time.time())
 
     @staticmethod
     def _precheck_cache_path() -> str:
@@ -1324,42 +1123,26 @@ class WeChatSender:
         self._load_precheck_cache()
         return len(self._precheck_cache), self._precheck_ttl
 
-    @staticmethod
-    def _scan_tree_for_contact(tree, all_cond, kl: str) -> bool:
-        """扫描一个 UIA 树，返回是否命中收件人搜索结果项。
-
-        WeChat 的联系人/群/公众号搜索结果项均为 mmui::SearchContentCellView，
-        且元素名包含收件人关键字。任何异常视为未命中。
-        """
-        if tree is None:
-            return False
-        try:
-            items = tree.FindAll(4, all_cond)
-        except Exception:
-            return False
-        for i in range(items.Length):
-            el = items.GetElement(i)
-            try:
-                cls = str(el.CurrentClassName or "")
-                name = str(el.CurrentName or "").strip()
-            except Exception:
-                continue
-            if cls == "mmui::SearchContentCellView" and kl and kl in name.lower():
-                return True
-        return False
-
     def _safe_chatwith(self, recipient: str, exact: bool = False) -> bool:
-        if not self.wx:
+        """搜索并切换到收件人聊天窗口（bridge.open_chat 自带存在性校验）。
+
+        exact 参数保留旧签名（调用方仍传 exact=False）；bridge 内部为半模糊
+        匹配 + 输入框 Name 校验。搜索会再次打开下拉浮层，watchdog 通过
+        _is_suspect_failure_dialog 的 ToolSaveBits+Weixin 排除规则识别并跳过。
+        """
+        if not self._initialized:
             return False
-        # ChatWith 会再次打开搜索下拉；watchdog 通过 _is_suspect_failure_dialog
-        # 的 ToolSaveBits+Weixin 排除规则识别该浮层并跳过，无需挂起
         try:
-            self.wx.ChatWith(recipient, exact=exact)
-            # 切换了聊天窗口，清除 ChatInfo 缓存
-            self._invalidate_chatinfo_cache()
-            return True
+            ok = self._open_chat_cached(recipient)
+            if ok:
+                # 切换了聊天窗口，清除 ChatInfo 缓存
+                self._invalidate_chatinfo_cache()
+            else:
+                # 搜索失败可能残留搜索浮层/误入页面，恢复主界面再继续
+                self._press_esc_on_wechat()
+            return ok
         except Exception:
-            # 搜不到目标时 ChatWith 内部可能已把界面切到搜索结果/视频号页，
+            # 搜不到目标时可能已把界面切到搜索结果/视频号页，
             # 按 Esc 恢复主界面，避免后续重试在错误页面上连环失败
             self._press_esc_on_wechat()
             return False
@@ -1370,13 +1153,19 @@ class WeChatSender:
 
         供多内容发送时调用一次：之后的 text/image/attachment/custom 步骤
         直接用 fast_mode 在当前窗口发送，不再重复搜索-切换-确认。
+        bridge.open_chat 内部自带"搜索+过滤网页结果+校验输入框"，
+        搜索不到即返回 False，天然充当联系人存在性预检（含缓存）。
         """
-        if not self.wx:
+        if not self._initialized:
             if not self.initialize():
                 return False
-        if not self._precheck_contact_exists(recipient):
-            self.log(f"❌ 微信中找不到联系人「{recipient}」，跳过发送（避免误点搜索网页）")
-            return False
+        # 批次级一次：窗口过小时先放大以恢复顶部搜索框（acquire_batch 已重置标志）
+        if not WeChatSender._WX_SIZE_CHECKED:
+            try:
+                self._ensure_wechat_window_size(self.log)
+            except Exception:
+                pass
+            WeChatSender._WX_SIZE_CHECKED = True
         max_retries = 3
         for attempt in range(max_retries):
             if self._stop_requested(stop_event):
@@ -1429,13 +1218,13 @@ class WeChatSender:
         if self._stop_requested(stop_event):
             return False
 
-        if not self.wx:
+        if not self._initialized:
             self.log(f"初始化微信客户端...")
             if not self.initialize():
                 self.log(f"❌ 微信初始化失败")
                 return False
 
-        # 轻量探活：距离上次健康超过 60 秒，做一次 ChatInfo 预检
+        # 轻量探活：距离上次健康超过 60 秒，做一次当前会话探测
         now = time.time()
         if now - self._last_healthy_ts > 60.0:
             ok, _ = self._safe_chatinfo()
@@ -1444,15 +1233,22 @@ class WeChatSender:
                 return False
 
         # 启动弹窗守护线程：发送期间独立扫描关闭'发送失败'模态弹窗，
-        # 防止其阻塞 SendMsg 的 UIA 调用导致批量任务整体卡死
+        # 防止其阻塞 UIA 调用导致批量任务整体卡死
         self._ensure_dialog_watchdog()
         # 进入发送前，先清理可能残留的发送失败弹窗（上一次发送可能遗留）
         self._dismiss_send_failure_dialog()
-        # 预验证收件人存在：微信搜不到时跳过，避免 ChatWith 误点搜索网页
-        if not self._precheck_contact_exists(recipient):
+        # 已知最近 120 秒内"搜不到"的收件人直接跳过（其余由下方切换流程天然校验）
+        if self._is_known_missing(recipient):
             self.log(f"❌ 微信中找不到联系人「{recipient}」，跳过发送（避免误点搜索网页）")
             return False
-        # 发送前把微信窗口从最大化归位普通大小，避免 wxauto4 激活后"全屏化"
+        # 批次级一次：窗口过小时先放大以恢复顶部搜索框
+        if not WeChatSender._WX_SIZE_CHECKED:
+            try:
+                self._ensure_wechat_window_size(self.log)
+            except Exception:
+                pass
+            WeChatSender._WX_SIZE_CHECKED = True
+        # 发送前把微信窗口从最大化归位普通大小，避免激活后"全屏化"
         self._normalize_wechat_window()
 
         def attempt_once(allow_reconnect: bool) -> bool:
@@ -1552,10 +1348,66 @@ class WeChatSender:
         fast_mode=False,
         stop_event=None
     ):
+        """发送单个文件（兼容旧接口）。"""
+        return self._send_files_inner(
+            [file_path], None, recipient,
+            chat_delay=chat_delay, fast_mode=fast_mode, stop_event=stop_event,
+        )
+
+    def send_text_and_files(
+        self,
+        text,
+        file_paths,
+        recipient,
+        chat_delay=0.3,
+        fast_mode=False,
+        stop_event=None,
+        text_first=False
+    ):
+        """合并发送「文字 + 文件/图片」：一次粘贴 + 一次 Enter（v1.5.0 批处理合并）。
+
+        text_first=True 时先粘文字再粘文件（合并消息里文字在前、文件卡片在后）；
+        默认 False 保持「文件卡片在前、文字追加在后」（与发送顺序配置联动）。
+        """
+        return self._send_files_inner(
+            list(file_paths), text, recipient,
+            chat_delay=chat_delay, fast_mode=fast_mode,
+            stop_event=stop_event, text_first=text_first,
+        )
+
+    def send_files_batch(
+        self,
+        file_paths,
+        recipient,
+        chat_delay=0.3,
+        fast_mode=False,
+        stop_event=None
+    ):
+        """合并发送「仅文件/图片（无文字）」：一次粘贴 + 一次 Enter。"""
+        return self._send_files_inner(
+            list(file_paths), None, recipient,
+            chat_delay=chat_delay, fast_mode=fast_mode, stop_event=stop_event,
+        )
+
+    def _send_files_inner(
+        self,
+        file_paths,
+        text,
+        recipient,
+        chat_delay=0.3,
+        fast_mode=False,
+        stop_event=None,
+        text_first=False
+    ):
+        """合并发送实现：文件列表（可含图片/附件）+ 可选文字，一次粘贴 + 一次 Enter。
+
+        send_file / send_text_and_files / send_files_batch 的统一底层。
+        text_first 透传给桥接层控制「文字在前」还是「文件在前」的粘贴顺序。
+        """
         if self._stop_requested(stop_event):
             return False
 
-        if not self.wx:
+        if not self._initialized:
             if not self.initialize():
                 return False
 
@@ -1565,17 +1417,28 @@ class WeChatSender:
             if not ok and not self.reconnect(self.log):
                 return False
 
-        self.log(f"发送文件: {file_path}")
+        n = len(file_paths)
+        if text:
+            self.log(f"发送文字+{n}个文件: {str(text)[:50]}")
+        else:
+            self.log(f"发送{n}个文件")
 
         # 启动弹窗守护线程（同 send_message，防止模态弹窗阻塞卡死）
         self._ensure_dialog_watchdog()
         # 进入发送前，先清理可能残留的发送失败弹窗（上一次发送可能遗留）
         self._dismiss_send_failure_dialog()
-        # 预验证收件人存在：微信搜不到时跳过，避免 ChatWith 误点搜索网页
-        if not self._precheck_contact_exists(recipient):
+        # 已知最近 120 秒内"搜不到"的收件人直接跳过（其余由下方切换流程天然校验）
+        if self._is_known_missing(recipient):
             self.log(f"❌ 微信中找不到联系人「{recipient}」，跳过发送（避免误点搜索网页）")
             return False
-        # 发送前把微信窗口从最大化归位普通大小，避免 wxauto4 激活后"全屏化"
+        # 批次级一次：窗口过小时先放大以恢复顶部搜索框
+        if not WeChatSender._WX_SIZE_CHECKED:
+            try:
+                self._ensure_wechat_window_size(self.log)
+            except Exception:
+                pass
+            WeChatSender._WX_SIZE_CHECKED = True
+        # 发送前把微信窗口从最大化归位普通大小，避免激活后"全屏化"
         self._normalize_wechat_window()
 
         def attempt_once(allow_reconnect: bool) -> bool:
@@ -1591,7 +1454,8 @@ class WeChatSender:
                         return False
                     current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
                     if self._is_target_chat(current_chat, recipient):
-                        if not self._send_file_with_dialog_retry(file_path, recipient, stop_event):
+                        if not self._send_files_with_dialog_retry(
+                                file_paths, text, recipient, stop_event, text_first):
                             return False
                         self.log(f"✅ 图片发送成功")
                         return True
@@ -1626,7 +1490,8 @@ class WeChatSender:
                     current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
                     self.log(f"当前窗口: {current_chat}")
                     if self._is_target_chat(current_chat, recipient):
-                        if not self._send_file_with_dialog_retry(file_path, recipient, stop_event):
+                        if not self._send_files_with_dialog_retry(
+                                file_paths, text, recipient, stop_event, text_first):
                             return False
                         self.log(f"✅ 图片发送成功")
                         return True
@@ -2022,24 +1887,23 @@ class WeChatSender:
         return success
 
     def get_chat_list(self):
-        if not self.wx:
+        if not self._initialized:
             if not self.initialize():
                 return []
-        
+
         try:
-            sessions = self.wx.GetSession()
-            return [s.name for s in sessions if hasattr(s, 'name') and s.name]
+            return self.bridge.get_chat_list()
         except Exception as e:
             self.log(f"❌ 获取会话列表失败: {e}")
             return []
 
     def is_online(self):
-        if not self.wx:
+        if not self._initialized:
             if not self.initialize():
                 return False
-        
+
         try:
-            return self.wx.IsOnline()
+            return self.bridge.is_online()
         except Exception as e:
             self.log(f"❌ 检查在线状态失败: {e}")
             return False

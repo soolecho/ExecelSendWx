@@ -34,10 +34,10 @@ _LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 def configure_logging():
     """配置 root logger；幂等，可在第三方库清空 handlers 后反复调用恢复。
 
-    wxauto4 在 import 时会执行 ``root_logger.handlers.clear()``
-    （wxauto4/logger.py 的 WxautoLogger.setup_logger），会把本函数先前
-    挂载的 RotatingFileHandler 一并清掉。2026-08-29 起因该导入副作用，
-    业务日志整整一个月只进控制台、app.log 仅剩启动行。因此 gui/wxauto4
+    wechatauto 在 import 时会执行 ``root_logger.handlers.clear()``
+    （wechatauto/logger.py 的 wxlog），会把本函数先前挂载的
+    RotatingFileHandler 一并清掉。2026-08-29 起因该导入副作用，
+    业务日志整整一个月只进控制台、app.log 仅剩启动行。因此 gui/wechatauto
     导入完成后必须再调用本函数一次，把文件 handler 挂回去。
     """
     root = logging.getLogger()
@@ -58,7 +58,7 @@ def configure_logging():
         file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
         root.addHandler(file_handler)
 
-    # wxauto4 已自带一个控制台 StreamHandler，避免重复刷屏；只有在不存在
+    # wechatauto 已自带一个控制台 StreamHandler，避免重复刷屏；只有在不存在
     # 非文件型 StreamHandler 时才补一个 stdout 处理器。
     # 注意 RotatingFileHandler 也是 StreamHandler 的子类，判断时要排除 FileHandler。
     if sys.stdout is not None and not any(
@@ -70,7 +70,7 @@ def configure_logging():
         stream_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
         root.addHandler(stream_handler)
 
-    # wxauto4 把 root 设为 DEBUG（同时把 comtypes 等提到 WARNING）。
+    # wechatauto 把 root 设为 DEBUG（同时把 comtypes 等提到 WARNING）。
     # 统一收到 INFO，避免第三方库 DEBUG 洪水把 app.log 撑爆轮转。
     root.setLevel(logging.INFO)
 
@@ -116,15 +116,15 @@ def main():
     try:
         from modules.gui import run_gui
     except ImportError as exc:
-        # gui 导入链中的 wxauto4 可能已清空 root handlers，先恢复再记录异常
+        # gui 导入链中的 wechatauto 可能已清空 root handlers，先恢复再记录异常
         configure_logging()
         logger.exception("无法导入图形界面")
         if sys.stdout is not None:
             print(f"无法启动图形界面: {exc}")
-            print("请安装依赖: pip install PyQt6 pandas openpyxl python-calamine wxauto4 requests")
+            print("请安装依赖: pip install PyQt6 pandas openpyxl python-calamine wechatauto uiautomation requests")
         return 1
 
-    # 关键：导入 modules.gui 会连带导入 wxauto4，其 import 时副作用
+    # 关键：导入 modules.gui 会连带导入 wechatauto，其 import 时副作用
     # root_logger.handlers.clear() 会抹掉文件 handler，必须在此恢复，
     # 否则整个运行期（手动/定时/链路发送）业务日志都无法写入 app.log。
     configure_logging()

@@ -1190,30 +1190,39 @@ class ScheduleSendWorker(QThread):
                 # 文字/附件直接在当前窗口用 fast_mode 发送，不再重复
                 # "搜索-切换-确认"（与数据发送 Tab 逻辑一致）。
                 chat_opened = False
-                # 按任务配置的发送顺序逐项发送；接收人成败以消息文字为准，附件失败不计入失败
-                for kind in self.send_order:
+                # v1.5.0 批处理合并：文字 + 附件合并为一次 send_text_and_files
+                # （一次粘贴 + 一次 Enter），绝不逐条发；仅附件时单独发文件。
+                # 接收人成败以消息文字为准，附件失败不计入失败。
+                kinds = [k for k in self.send_order if k in ("message", "attachment")]
+                has_msg = "message" in kinds
+                has_attach = "attachment" in kinds and attachment_ok
+                # 发送顺序联动粘贴顺序：message 排在 attachment 前 → 先粘文字再粘附件
+                text_first = bool(kinds) and kinds[0] == "message"
+                if has_msg or has_attach:
                     if self.stopped_event.is_set():
                         break
-                    if not chat_opened:
-                        if not self._sender.open_chat(
-                            recipient,
-                            chat_delay=self.chat_delay,
-                            stop_event=self.stopped_event,
-                        ):
-                            self.log(f"[定时] ✗ 打开聊天窗口失败: {recipient}")
-                            break
+                    if not self._sender.open_chat(
+                        recipient,
+                        chat_delay=self.chat_delay,
+                        stop_event=self.stopped_event,
+                    ):
+                        self.log(f"[定时] ✗ 打开聊天窗口失败: {recipient}")
+                        chat_opened = False
+                    else:
                         chat_opened = True
-                    if kind == "attachment":
-                        if attachment_ok:
-                            if not self._sender.send_file(
-                                self.attachment,
-                                recipient,
-                                chat_delay=self.chat_delay,
-                                fast_mode=True,
-                                stop_event=self.stopped_event,
-                            ):
-                                self.log(f"[定时] ⚠ 附加文件发送失败: {recipient}")
-                    elif kind == "message":
+                if chat_opened:
+                    if has_msg and has_attach:
+                        self.log(f"[定时] 合并发送文字+附件给 {recipient}")
+                        text_ok = self._sender.send_text_and_files(
+                            text=self.message,
+                            file_paths=[self.attachment],
+                            recipient=recipient,
+                            chat_delay=self.chat_delay,
+                            fast_mode=True,
+                            stop_event=self.stopped_event,
+                            text_first=text_first,
+                        )
+                    elif has_msg:
                         text_ok = self._sender.send_message(
                             content=self.message,
                             recipient=recipient,
@@ -1221,6 +1230,18 @@ class ScheduleSendWorker(QThread):
                             fast_mode=True,
                             stop_event=self.stopped_event,
                         )
+                    elif has_attach:
+                        if not self._sender.send_file(
+                            self.attachment,
+                            recipient,
+                            chat_delay=self.chat_delay,
+                            fast_mode=True,
+                            stop_event=self.stopped_event,
+                        ):
+                            self.log(f"[定时] ⚠ 附加文件发送失败: {recipient}")
+                            text_ok = False
+                        else:
+                            text_ok = True
                 ok = text_ok
                 if ok:
                     success += 1
@@ -6094,7 +6115,7 @@ class MonitorTab(QWidget):
         left_bar = ChipBar(exclusive=False)
         left_column.addWidget(left_bar)
 
-        list_group = left_bar.add_section("📋 监控配置")
+        list_group = left_bar.add_section("📋 监控配置", collapsed=True)
         left_layout = list_group.contentLayout()
 
         self.task_list = QListWidget()
@@ -6136,7 +6157,7 @@ class MonitorTab(QWidget):
         right_layout.addWidget(right_bar)
 
         # 1. 基本设置
-        base_group = right_bar.add_section("📌 基本设置")
+        base_group = right_bar.add_section("📌 基本设置", collapsed=True)
         base_layout = base_group.contentLayout()
         row = QHBoxLayout()
         row.addWidget(QLabel("名称:"))
@@ -6182,7 +6203,7 @@ class MonitorTab(QWidget):
         right_layout.addWidget(base_group)
 
         # 2. 筛选与对比
-        filter_group = right_bar.add_section("🔍 筛选与对比")
+        filter_group = right_bar.add_section("🔍 筛选与对比", collapsed=True)
         filter_layout = filter_group.contentLayout()
 
         row = QHBoxLayout()
@@ -6218,7 +6239,7 @@ class MonitorTab(QWidget):
         right_layout.addWidget(filter_group)
 
         # 3. 推送内容
-        send_group = right_bar.add_section("📤 推送内容")
+        send_group = right_bar.add_section("📤 推送内容", collapsed=True)
         send_layout = send_group.contentLayout()
         title_row = QHBoxLayout()
         title_row.addWidget(QLabel("文字标题:"))
@@ -6241,9 +6262,24 @@ class MonitorTab(QWidget):
         send_layout.addWidget(self.send_file_check)
         send_layout.addWidget(self.monitor_minimize_check)
 
+        # 合并发送顺序（文字/图片/文件）：决定两步粘贴先后与文件卡片排列（未勾选内容自动跳过）
+        order_row = QHBoxLayout()
+        order_row.addWidget(QLabel("发送顺序:"))
+        self.send_order_combo = QComboBox()
+        self.send_order_combo.addItem("文字 → 图片 → 文件", ["text", "image", "attachment"])
+        self.send_order_combo.addItem("文字 → 文件 → 图片", ["text", "attachment", "image"])
+        self.send_order_combo.addItem("图片 → 文字 → 文件", ["image", "text", "attachment"])
+        self.send_order_combo.addItem("图片 → 文件 → 文字", ["image", "attachment", "text"])
+        self.send_order_combo.addItem("文件 → 文字 → 图片", ["attachment", "text", "image"])
+        self.send_order_combo.addItem("文件 → 图片 → 文字", ["attachment", "image", "text"])
+        self.send_order_combo.setToolTip("合并发送时消息里的排列顺序：文字在前则先粘文字再粘文件卡片；文件间按图片/文件先后一次粘贴")
+        order_row.addWidget(self.send_order_combo, 1)
+        send_layout.addLayout(order_row)
+
         # 清洗后条数判断拦截：len(clean_rows) 与 阈值 满足 操作符 关系时，本次不发送
         self.limit_enabled_check = QCheckBox("条数判断拦截")
         self.limit_enabled_check.setToolTip("对清洗后待发送的行数做判断：满足【大于/小于/等于】设定条数时本次不发送。基线照常推进")
+        send_layout.addWidget(self.limit_enabled_check)
         limit_row = QHBoxLayout()
         self.limit_op_combo = QComboBox()
         self.limit_op_combo.addItem("条数不满足时不拦截(关闭)", "")
@@ -6282,7 +6318,7 @@ class MonitorTab(QWidget):
         right_layout.addWidget(send_group)
 
         # 3.5. 列设置：清洗列 + 发送保留列 + 对比列（统一面板）
-        col_group = right_bar.add_section("🧰 列设置")
+        col_group = right_bar.add_section("🧰 列设置", collapsed=True)
         col_layout = col_group.contentLayout()
 
         col_layout.addWidget(QLabel("清洗列（要清洗的列，可多选/手动添加）:"))
@@ -6342,7 +6378,7 @@ class MonitorTab(QWidget):
         right_layout.addWidget(col_group)
 
         # 4. 微信接收人
-        recv_group = right_bar.add_section("👤 微信接收人")
+        recv_group = right_bar.add_section("👤 微信接收人", collapsed=True)
         recv_layout = recv_group.contentLayout()
         self.recipients_edit = QTextEdit()
         self.recipients_edit.setMaximumHeight(90)
@@ -6351,7 +6387,7 @@ class MonitorTab(QWidget):
         right_layout.addWidget(recv_group)
 
         # 5. 时间窗
-        time_group = right_bar.add_section("🕐 时间窗")
+        time_group = right_bar.add_section("🕐 时间窗", collapsed=True)
         time_layout = time_group.contentLayout()
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("重复模式:"))
@@ -6404,7 +6440,7 @@ class MonitorTab(QWidget):
         right_layout.addWidget(time_group)
 
         # 6. 保存
-        save_group = right_bar.add_section("💾 保存")
+        save_group = right_bar.add_section("💾 保存", collapsed=True)
         save_layout = save_group.contentLayout()
         save_row = QHBoxLayout()
         self.save_btn = QPushButton("保存配置")
@@ -6415,7 +6451,7 @@ class MonitorTab(QWidget):
         right_layout.addWidget(save_group)
 
         # 运行日志 + 停止轮询
-        log_group = right_bar.add_section("📜 运行日志", collapsed=True)
+        log_group = right_bar.add_section("📜 运行日志")
         log_layout = log_group.contentLayout()
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
@@ -6484,6 +6520,7 @@ class MonitorTab(QWidget):
         self.limit_enabled_check.stateChanged.connect(mark)
         self.limit_op_combo.currentIndexChanged.connect(mark)
         self.limit_count_spin.valueChanged.connect(mark)
+        self.send_order_combo.currentIndexChanged.connect(mark)
         self.snapshot_check.stateChanged.connect(mark)
         self.snapshot_range_edit.textChanged.connect(mark)
         self.text_title_edit.textChanged.connect(mark)
@@ -6810,6 +6847,9 @@ class MonitorTab(QWidget):
             self.snapshot_range_edit.setText(task.snapshot_range)
             self.text_title_edit.setText(task.text_title)
             self.text_detail_check.setChecked(task.text_detail)
+            idx_order = self.send_order_combo.findData(
+                getattr(task, "send_order", None))
+            self.send_order_combo.setCurrentIndex(idx_order if idx_order >= 0 else 0)
             self.include_subdir_check.setChecked(task.include_subdir)
             # 列设置：勾选清洗/保留/对比列，并应用统一清洗方式
             self.strip_space_check.setChecked(True)
@@ -6886,6 +6926,8 @@ class MonitorTab(QWidget):
         task.snapshot_range = self.snapshot_range_edit.text().strip()
         task.text_title = self.text_title_edit.text().strip()
         task.text_detail = self.text_detail_check.isChecked()
+        task.send_order = list(
+            self.send_order_combo.currentData() or ["text", "image", "attachment"])
         task.include_subdir = self.include_subdir_check.isChecked()
         task.compare_columns = self._selected_cols(self.compare_cols_list)
         task.extract_columns = self._selected_cols(self.extract_cols_list)
@@ -7006,6 +7048,7 @@ class MonitorTab(QWidget):
             self.snapshot_range_edit.clear()
             self.text_title_edit.clear()
             self.text_detail_check.setChecked(True)
+            self.send_order_combo.setCurrentIndex(0)
             self.include_subdir_check.setChecked(False)
             self.strip_space_check.setChecked(True)
             self.digits_check.setChecked(False)

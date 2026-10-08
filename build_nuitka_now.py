@@ -81,6 +81,8 @@ cmd = [
     f"--jobs={workers}",
     # LTO 关闭：开发期打包提速；如果要正式版更小更快可以再打开
     "--lto=no",
+    # 明确不跟随 wxauto4：底层已迁移到 wechatauto/uia_bridge，不再打包旧依赖
+    "--nofollow-import-to=wxauto4",
     # 函数内延迟导入的 Rust xlsx 引擎（大表格秒开，替代慢速 openpyxl），显式收进打包
     "--include-package=python_calamine",
     "--output-dir=dist_nuitka_config",
