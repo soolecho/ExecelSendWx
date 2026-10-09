@@ -3047,15 +3047,39 @@ class TableFilterTab(QWidget):
 
     @classmethod
     def _split_rm_values(cls, raw):
-        """按 / ; 、 ， , 拆分多值，去空白和空串。"""
+        """按 / ; 、 ， , 拆分多值，去空白和空串。
+
+        引号包裹的整串视为一个完整值：其内部的分隔符（含逗号）不生效，
+        并去掉两端引号——如 `"孙中枢,孙中枢"` 应保留为单个 `孙中枢,孙中枢`，
+        而不是被拆成 `孙中枢` 与 `孙中枢"`（与全量默认映射导入
+        _plain_split_values 行为一致，名字本身可能含逗号）。
+        """
         if not raw:
             return []
         text = str(raw).strip()
         if not text:
             return []
-        for sep in cls._RM_SEPARATORS:
-            text = text.replace(sep, "\n")
-        return [s.strip() for s in text.split("\n") if s.strip()]
+        parts = []
+        buf = []
+        in_quote = False
+        for ch in text:
+            if ch == '"':
+                in_quote = not in_quote
+                buf.append(ch)
+            elif ch in cls._RM_SEPARATORS and not in_quote:
+                parts.append("".join(buf).strip())
+                buf = []
+            else:
+                buf.append(ch)
+        parts.append("".join(buf).strip())
+        out = []
+        for p in parts:
+            p = p.strip()
+            if p.startswith('"') and p.endswith('"') and len(p) >= 2:
+                p = p[1:-1].strip()
+            if p:
+                out.append(p)
+        return out
 
     def _on_rm_add_row(self):
         """添加一行空白映射，方便手动填写。"""
@@ -3329,12 +3353,16 @@ class TableFilterTab(QWidget):
         if enabled and value_to_recipients:
             return enabled, value_to_recipients, default_recipient, mapping_file, from_ui
 
-        # 面板无有效映射 → 尝试从当前/最近配置恢复
+        # 面板无有效映射 → 尝试从配置恢复。
+        # 显式加载了配置（current_config_path 非空）时**只**认当前配置自身的映射：
+        # 若用户关闭了该配置的「启用映射表」，应继续走到全量默认映射兜底，而不是
+        # 被「最近使用的配置」里其他配置的映射抢占（否则全量兜底永远轮不到）。
+        # 仅当未加载任何配置（纯手动选 Excel 发送）时才从最近使用的配置恢复映射。
         candidates = []
         if self.current_config_path:
             candidates.append(self.current_config_path)
-        for p in self.config_manager.get_recent_profiles():
-            if p not in candidates:
+        else:
+            for p in self.config_manager.get_recent_profiles():
                 candidates.append(p)
 
         for path in candidates:

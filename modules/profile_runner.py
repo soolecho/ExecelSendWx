@@ -30,15 +30,39 @@ _RM_SEPARATORS = ("/", ";", "、", "，", ",")
 
 
 def _split_rm_values(raw):
-    """按 / ; 、 ， , 拆分多值，去空白和空串。"""
+    """按 / ; 、 ， , 拆分多值，去空白和空串。
+
+    引号包裹的整串视为一个完整值：其内部的分隔符（含逗号）不生效，
+    并去掉两端引号——如 `"孙中枢,孙中枢"` 应保留为单个 `孙中枢,孙中枢`，
+    而不是被拆成 `孙中枢` 与 `孙中枢"`（与 gui._split_rm_values 行为一致，
+    名字本身可能含逗号）。
+    """
     if not raw:
         return []
     text = str(raw).strip()
     if not text:
         return []
-    for sep in _RM_SEPARATORS:
-        text = text.replace(sep, "\n")
-    return [s.strip() for s in text.splitlines() if s.strip()]
+    parts = []
+    buf = []
+    in_quote = False
+    for ch in text:
+        if ch == '"':
+            in_quote = not in_quote
+            buf.append(ch)
+        elif ch in _RM_SEPARATORS and not in_quote:
+            parts.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf).strip())
+    out = []
+    for p in parts:
+        p = p.strip()
+        if p.startswith('"') and p.endswith('"') and len(p) >= 2:
+            p = p[1:-1].strip()
+        if p:
+            out.append(p)
+    return out
 
 
 def _load_mappings_from_file(path, log):
