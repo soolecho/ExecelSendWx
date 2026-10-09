@@ -7470,19 +7470,42 @@ class GlobalSettingsTab(QWidget):
     # ---------------- 映射表文件：关联 / 导入 / 打开 ----------------
     @staticmethod
     def _plain_split_values(raw):
-        """把映射表文件单元格拆成多个值：按 / ; 、 。， 分隔，去空白空串。
+        """把映射表文件单元格拆成多个值：按 / ; ；、。， 分隔，去空白空串。
 
         与 field 版 _split_rm_values 一致（普通联系人也用这套分隔符），
         保证「导入」与「数据发送」的映射表文件格式互通。
+
+        引号包裹的整串视为一个完整值：其内部的分隔符（含逗号）不生效，
+        并去掉两端引号——如 `"孙中枢,孙中枢"` 应保留为单个 `孙中枢,孙中枢`，
+        而不是被拆成 `孙中枢` 与 `孙中枢"`（与 _split_mapping_names 行为一致）。
         """
         if not raw:
             return []
         text = str(raw).strip()
         if not text:
             return []
-        for sep in ("/", ";", "；", "、", "。", "，", ",", " ", "\t"):
-            text = text.replace(sep, "\n")
-        return [s.strip() for s in text.split("\n") if s.strip()]
+        seps = ("/", ";", "；", "、", "。", "，", ",", " ", "\t")
+        parts = []
+        buf = []
+        in_quote = False
+        for ch in text:
+            if ch == '"':
+                in_quote = not in_quote
+                buf.append(ch)
+            elif ch in seps and not in_quote:
+                parts.append("".join(buf).strip())
+                buf = []
+            else:
+                buf.append(ch)
+        parts.append("".join(buf).strip())
+        out = []
+        for p in parts:
+            p = p.strip()
+            if p.startswith('"') and p.endswith('"') and len(p) >= 2:
+                p = p[1:-1].strip()
+            if p:
+                out.append(p)
+        return out
 
     def _update_map_file_label(self):
         if self._map_linked_file:
