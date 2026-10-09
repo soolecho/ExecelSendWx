@@ -130,6 +130,16 @@ def main():
     configure_logging()
     logger.info("Logging reconfigured after GUI imports; log file: %s", LOG_PATH)
 
+    # 应用全量设置中的拟人节流（读 global_settings.json），使第三方驱动在
+    # 启动时即按用户配置的档位/延迟运行，避免默认拟人节奏导致的发送过慢。
+    try:
+        from modules.config_manager import ConfigManager
+        from modules.rhythm_settings import apply_rhythm
+        apply_rhythm(ConfigManager().load_global_settings().get("rhythm") or {})
+        logger.info("拟人节流已按全量设置应用")
+    except Exception:
+        logger.warning("应用拟人节流失败（不影响启动）", exc_info=True)
+
     run_gui()
     return 0
 

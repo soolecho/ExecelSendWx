@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QLayout, QRadioButton, QButtonGroup, QFrame,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QPlainTextEdit,
 )
 from PyQt6.QtCore import (
     Qt, pyqtSignal, QObject, QThread, QTimer, QLockFile, QStandardPaths,
@@ -3291,6 +3292,89 @@ class TableFilterTab(QWidget):
             return [default_recipient]
         return [fallback_recipient] if fallback_recipient else []
 
+    def _profile_mapping_to_dict(self, profile):
+        """把 profile 里的 recipient_mapping 展开为 (enabled, value_to_recipients, default_recipient, mapping_file)。"""
+        rm = profile.get("recipient_mapping") or {}
+        enabled = bool(rm.get("enabled", False))
+        default_recipient = str(rm.get("default_recipient", "") or "").strip()
+        mapping_file = str(rm.get("mapping_file", "") or "").strip()
+        value_to_recipients = {}
+        if enabled:
+            for m in (rm.get("mappings") or []):
+                src = str(m.get("source_value", "") or "").strip()
+                recips_raw = m.get("recipients") or []
+                if not isinstance(recips_raw, list):
+                    continue
+                recips = [str(r).strip() for r in recips_raw if str(r).strip()]
+                if src and recips:
+                    value_to_recipients[src] = recips
+        return enabled, value_to_recipients, default_recipient, mapping_file
+
+    def _resolve_mapping_for_send(self):
+        """统一解析本次发送应使用的联系人映射。
+
+        优先用 UI 联系人映射面板当前状态；若面板未配置任何映射
+        （手动选 Excel 发送、未先加载配置的场景），则回退从"当前配置
+        /最近使用的配置"恢复已保存的联系人映射，确保手动选人/全选同
+        自动发送一样走映射关系。
+        返回 (enabled, value_to_recipients, default_recipient, mapping_file, from_ui)。
+        """
+        rm_cfg = self._collect_recipient_mapping_from_ui()
+        enabled = rm_cfg.get("enabled", False)
+        value_to_recipients = rm_cfg.get("value_to_recipients", {})
+        default_recipient = rm_cfg.get("default_recipient", "")
+        mapping_file = str(rm_cfg.get("mapping_file", "") or "")
+        from_ui = True
+
+        if enabled and value_to_recipients:
+            return enabled, value_to_recipients, default_recipient, mapping_file, from_ui
+
+        # 面板无有效映射 → 尝试从当前/最近配置恢复
+        candidates = []
+        if self.current_config_path:
+            candidates.append(self.current_config_path)
+        for p in self.config_manager.get_recent_profiles():
+            if p not in candidates:
+                candidates.append(p)
+
+        for path in candidates:
+            try:
+                profile = self.config_manager.load_profile(path)
+            except Exception:
+                continue
+            rm = profile.get("recipient_mapping") or {}
+            if not rm.get("enabled"):
+                continue
+            pe, p2r, pdefault, pfile = self._profile_mapping_to_dict(profile)
+            if pe and p2r:
+                self.log(
+                    f"⚙ 手动发送：UI 未配置联系人映射，已从配置恢复 "
+                    f"{len(p2r)} 条映射（{os.path.basename(path)}）"
+                )
+                return pe, p2r, pdefault, pfile, False
+
+        # 最后兜底：全量默认映射（仅当 UI 面板、当前/最近配置都未启用映射时）
+        try:
+            gs_settings = self.config_manager.load_global_settings()
+        except Exception:
+            gs_settings = {}
+        g_dm = gs_settings.get("default_mapping") or {}
+        if g_dm.get("enabled"):
+            g_v2r = {}
+            for m in (g_dm.get("mappings") or []):
+                src = str(m.get("source_value", "") or "").strip()
+                recips = [str(r).strip() for r in (m.get("recipients") or []) if str(r).strip()]
+                if src and recips:
+                    g_v2r[src] = recips
+            g_default = str(g_dm.get("default_recipient", "") or "").strip()
+            if g_v2r or g_default:
+                self.log(
+                    f"⚙ 未匹配到配置映射，已应用「全量默认映射」"
+                    f"{len(g_v2r)} 条作为最后兜底"
+                )
+                return True, g_v2r, g_default, "", False
+        return enabled, value_to_recipients, default_recipient, mapping_file, from_ui
+
     # ------------------------- 发送预检缓存 -------------------------
     def _on_precheck_ttl_changed(self, _idx=None):
         """缓存有效期下拉变化：写入 WeChatSender 并持久化。"""
@@ -4085,15 +4169,14 @@ class TableFilterTab(QWidget):
         tasks = []
         missing_wechat = []
 
-        # 联系人映射：从 UI 同步当前配置
-        rm_cfg = self._collect_recipient_mapping_from_ui()
-        value_to_recipients = rm_cfg.get("value_to_recipients", {})
-        default_recipient = rm_cfg.get("default_recipient", "")
-        mapping_enabled = rm_cfg.get("enabled", False)
+        # 联系人映射：统一解析（优先 UI 面板，面板缺失时从当前/最近配置恢复）
+        (_enabled, value_to_recipients, default_recipient, mapping_file,
+         _from_ui) = self._resolve_mapping_for_send()
+        mapping_enabled = _enabled
         # 未启用但已有映射条目/关联文件时醒目标志提醒，
         # 避免用户以为映射已生效（需勾选「启用联系人映射」）
         if not mapping_enabled and (
-            rm_cfg.get("mappings") or rm_cfg.get("mapping_file")
+            value_to_recipients or mapping_file
         ):
             self.log(
                 "⚠️ 检测到联系人映射条目/关联文件，但「启用联系人映射」未勾选，"
@@ -4102,7 +4185,6 @@ class TableFilterTab(QWidget):
         # 关联了映射表文件 → 发送前自动读取最新内容，
         # 用户改了文件不用手动"导入表格"
         if mapping_enabled:
-            mapping_file = str(rm_cfg.get("mapping_file", "") or "").strip()
             if mapping_file and os.path.isfile(mapping_file):
                 try:
                     from modules.profile_runner import _load_mappings_from_file
@@ -4148,6 +4230,12 @@ class TableFilterTab(QWidget):
                 # 全部兜底失败（仅当映射启用但未命中且无 fallback 时可能）
                 missing_wechat.append(name)
                 continue
+
+            # 命中映射时明确提示"谁 → 映射给谁发送"，便于核对哪个名字被替换
+            if mapping_enabled and name in value_to_recipients and len(recipients_list) > 0:
+                self.log(f"◈ {name} → 映射给 {', '.join(recipients_list)} 发送")
+            elif name != recipients_list[0]:
+                self.log(f"◈ {name} → 发送给 {', '.join(recipients_list)}")
 
             for recipient in recipients_list:
                 tasks.append({
@@ -7183,6 +7271,262 @@ class MonitorTab(QWidget):
         super().closeEvent(event)
 
 
+class GlobalSettingsTab(QWidget):
+    """「⚙️ 全量设置」主页签：应用级全局设置（跨所有 profile）。
+
+    手风琴栏组（exclusive）容纳：
+    - 「🎯 拟人节流」：全局开关 + 档位 + 自定义写动作随机延迟区间，
+      关闭可显著加快批量发送（第三方驱动内置拟人节奏默认很慢）。
+    - 「🔁 全量默认映射」：作为映射的**最后兜底层**。优先级：
+      profile 自身映射 > 最近配置恢复的映射 > 全量默认映射 > 按原名发送。
+    """
+
+    # 全局设置被修改后发出，MainWindow 可据此同步应用（如重新 apply_rhythm）
+    settings_changed = pyqtSignal()
+
+    # (显示文本, 档位 key)；addItem(text, key) 存数据时以 key 为准
+    _PROFILE_TEXT = [("关闭", "off"), ("快速", "fast"), ("自然", "natural"), ("保守", "calm")]
+
+    def __init__(self, config_manager):
+        super().__init__()
+        self.config_manager = config_manager
+        self.settings = config_manager.load_global_settings()
+        # UI 回填期间屏蔽 onChange 触发，避免写入未初始化控件值
+        self._loading = True
+        self._change_timer = QTimer(self)
+        self._change_timer.setSingleShot(True)
+        self._change_timer.setInterval(400)
+        self._change_timer.timeout.connect(self._flush_and_emit)
+
+        main_layout = QVBoxLayout(self)
+        bar = ChipBar(exclusive=True)
+        main_layout.addWidget(bar)
+
+        # ---------------- 拟人节流 ----------------
+        rhythm_group = bar.add_section("🎯 拟人节流", collapsed=True)
+        rl = rhythm_group.contentLayout()
+
+        self.rhythm_enable_check = QCheckBox("启用拟人节流（关闭可显著提升批量发送速度）")
+        rl.addWidget(self.rhythm_enable_check)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("节流档位："))
+        self.rhythm_profile_combo = QComboBox()
+        for text, key in self._PROFILE_TEXT:
+            self.rhythm_profile_combo.addItem(text, key)
+        row.addWidget(self.rhythm_profile_combo)
+        row.addWidget(QLabel("写动作随机间隔(秒)："))
+        self.rhythm_min_spin = QDoubleSpinBox()
+        self.rhythm_min_spin.setRange(0.0, 30.0)
+        self.rhythm_min_spin.setDecimals(1)
+        self.rhythm_min_spin.setSingleStep(0.5)
+        row.addWidget(self.rhythm_min_spin)
+        row.addWidget(QLabel("~"))
+        self.rhythm_max_spin = QDoubleSpinBox()
+        self.rhythm_max_spin.setRange(0.0, 30.0)
+        self.rhythm_max_spin.setDecimals(1)
+        self.rhythm_max_spin.setSingleStep(0.5)
+        row.addWidget(self.rhythm_max_spin)
+        row.addStretch()
+        rl.addLayout(row)
+
+        tip = QLabel(
+            "拟人节流模拟真人操作节奏以降低微信风控风险。若批量发送等待过久，\n"
+            "可将档位设为「快速」或手动把间隔调小，甚至直接关闭本开关。"
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#888;font-size:11px;")
+        rl.addWidget(tip)
+
+        # ---------------- 全量默认映射 ----------------
+        map_group = bar.add_section("🔁 全量默认映射", collapsed=True)
+        ml = map_group.contentLayout()
+
+        self.map_enable_check = QCheckBox("启用全量默认映射（作为映射兜底层）")
+        ml.addWidget(self.map_enable_check)
+
+        drow = QHBoxLayout()
+        drow.addWidget(QLabel("未命中映射时的兜底接收人："))
+        self.map_default_edit = QLineEdit()
+        self.map_default_edit.setPlaceholderText("留空则不使用兜底")
+        drow.addWidget(self.map_default_edit)
+        ml.addLayout(drow)
+
+        ml.addWidget(QLabel("映射列表（每行一个，格式：来源1;来源2=接收人1;接收人2）："))
+        self.map_edit = QPlainTextEdit()
+        self.map_edit.setPlaceholderText('张三;李四=王五\n"孙中枢，孙中枢"=孙中枢')
+        self.map_edit.setFixedHeight(140)
+        ml.addWidget(self.map_edit)
+
+        tip2 = QLabel(
+            "等号左侧可写多个来源名（用 ; 分隔），每个都映射到右侧的接收人列表；\n"
+            "逗号属于名字本身，不用作分隔；可用\"\"包裹含分号的完整名字。\n"
+            "优先级：配置自身映射 > 最近配置恢复的映射 > 全量默认映射 > 按原名发送。"
+        )
+        tip2.setWordWrap(True)
+        tip2.setStyleSheet("color:#888;font-size:11px;")
+        ml.addWidget(tip2)
+
+        # 立即生效的信号连接
+        self.rhythm_enable_check.toggled.connect(self._on_immediate_change)
+        self.rhythm_profile_combo.currentIndexChanged.connect(self._on_immediate_change)
+        # 文本类控件（含拖拽/粘贴）用防抖合并，避免一次编辑多次落盘
+        self.map_enable_check.toggled.connect(self._on_debounced_change)
+        self.map_default_edit.editingFinished.connect(self._on_debounced_change)
+        self.map_edit.textChanged.connect(self._on_debounced_change)
+
+        self._load_to_ui()
+        self._loading = False
+
+    # ---------------- UI <-> 设置 -----------------
+    def _load_to_ui(self):
+        rh = self.settings.get("rhythm") or {}
+        self.rhythm_enable_check.setChecked(bool(rh.get("enabled", False)))
+        idx = self.rhythm_profile_combo.findData(str(rh.get("profile", "off")))
+        if idx < 0:
+            idx = 0
+        self.rhythm_profile_combo.setCurrentIndex(idx)
+        self.rhythm_min_spin.setValue(float(rh.get("min_delay", 0.0)))
+        self.rhythm_max_spin.setValue(float(rh.get("max_delay", 0.0)))
+
+        dm = self.settings.get("default_mapping") or {}
+        self.map_enable_check.setChecked(bool(dm.get("enabled", False)))
+        self.map_default_edit.setText(str(dm.get("default_recipient", "") or ""))
+        lines = []
+        for m in (dm.get("mappings") or []):
+            src = str(m.get("source_value", "") or "").strip()
+            recips = [str(r).strip() for r in (m.get("recipients") or []) if str(r).strip()]
+            if src and recips:
+                lines.append(
+                    f"{self._fmt_mapping_name(src)}="
+                    f"{';'.join(self._fmt_mapping_name(r) for r in recips)}"
+                )
+        self.map_edit.setPlainText("\n".join(lines))
+
+    @staticmethod
+    def _fmt_mapping_name(name):
+        """名字含分隔符/等号时用引号包裹，保证往返解析不歧义。"""
+        if any(c in name for c in (";", "；", "=")):
+            return f'"{name}"'
+        return name
+
+    @staticmethod
+    def _split_mapping_names(text):
+        """按分隔符切分名字；分隔符为 ; ；（引号内的分隔符不生效）。
+
+        逗号**不是**分隔符——名字本身可能含逗号（如"孙中枢，孙中枢"）。
+        返回去引号后的干净名字列表（含空串，由调用方过滤）。
+        """
+        parts = []
+        buf = []
+        in_quote = False
+        for ch in text:
+            if ch == '"':
+                in_quote = not in_quote
+                buf.append(ch)
+            elif ch in (";", "；") and not in_quote:
+                parts.append("".join(buf).strip())
+                buf = []
+            else:
+                buf.append(ch)
+        parts.append("".join(buf).strip())
+        out = []
+        for p in parts:
+            p = p.strip()
+            if p.startswith('"') and p.endswith('"') and len(p) >= 2:
+                p = p[1:-1].strip()
+            out.append(p)
+        return out
+
+    def _collect_settings(self):
+        profile = str(self.rhythm_profile_combo.currentData() or "off")
+        min_delay = round(float(self.rhythm_min_spin.value()), 1)
+        max_delay = round(float(self.rhythm_max_spin.value()), 1)
+        if min_delay > max_delay:
+            min_delay, max_delay = max_delay, min_delay
+            self.rhythm_min_spin.setValue(min_delay)
+            self.rhythm_max_spin.setValue(max_delay)
+
+        # 解析映射文本：来源1;来源2=接收人1;接收人2
+        # - 等号左侧可含多个来源名（; 分隔），每个都映射到右侧整个接收人列表
+        #   （"两个名字指向一个发送人" / 也可指向多个）
+        # - 右侧接收人用 ; ； 分隔；"" 包裹的分隔符不生效
+        # - 同一来源出现在多行时合并接收人，不做去重删除
+        merged = {}
+        for line in self.map_edit.toPlainText().splitlines():
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            src_raw, recips_raw = line.split("=", 1)
+            srcs = [s for s in self._split_mapping_names(src_raw) if s]
+            recips = [r for r in self._split_mapping_names(recips_raw) if r]
+            if not srcs or not recips:
+                continue
+            for src in srcs:
+                merged.setdefault(src, []).extend(recips)
+        mappings = [
+            {"source_value": src, "recipients": recips}
+            for src, recips in merged.items()
+        ]
+        return {
+            "rhythm": {
+                "enabled": self.rhythm_enable_check.isChecked(),
+                "profile": profile,
+                "min_delay": min_delay,
+                "max_delay": max_delay,
+            },
+            "default_mapping": {
+                "enabled": self.map_enable_check.isChecked(),
+                "default_recipient": self.map_default_edit.text().strip(),
+                "mappings": mappings,
+            },
+        }
+
+    # ---------------- 落盘 + 应用 -----------------
+    def _save(self):
+        try:
+            self.settings = self.config_manager.save_global_settings(self._collect_settings())
+        except Exception as exc:
+            logger.warning(f"保存全量设置失败: {exc}")
+
+    def apply_rhythm(self):
+        """将当前拟人节流设置应用到第三方驱动（startup 与变更时调用）。"""
+        try:
+            from modules.rhythm_settings import apply_rhythm
+            apply_rhythm(self._collect_settings().get("rhythm") or {})
+        except Exception as exc:
+            logger.warning(f"应用拟人节流失败: {exc}")
+
+    def get_default_mapping(self):
+        """返回全量默认映射 (enabled, value_to_recipients, default_recipient)。"""
+        enabled = self.map_enable_check.isChecked()
+        if not enabled:
+            return False, {}, ""
+        value_to_recipients = {}
+        for m in self._collect_settings().get("default_mapping", {}).get("mappings", []):
+            value_to_recipients[m["source_value"]] = m["recipients"]
+        default = self.map_default_edit.text().strip()
+        return enabled, value_to_recipients, default
+
+    def _on_immediate_change(self, *_):
+        if self._loading:
+            return
+        self._save()
+        self.apply_rhythm()
+        self.settings_changed.emit()
+
+    def _on_debounced_change(self, *_):
+        if self._loading:
+            return
+        self._change_timer.start()
+
+    def _flush_and_emit(self):
+        if self._loading:
+            return
+        self._save()
+        self.settings_changed.emit()
+
+
 class MainWindow(QMainWindow):
     # 跨线程日志投递：子线程 emit -> 主线程 slot 写 UI
     _schedule_log_signal = pyqtSignal(str)
@@ -7289,9 +7633,17 @@ class MainWindow(QMainWindow):
         pl3 = QVBoxLayout(page3)
         pl3.setContentsMargins(0, 0, 0, 0)
         pl3.addWidget(self.monitor_tab)
+        # 全量设置：应用级全局设置（拟人节流 + 全量默认映射）
+        self.config_manager = ConfigManager()
+        self.global_settings_tab = GlobalSettingsTab(self.config_manager)
+        page4 = ElasticPage()
+        pl4 = QVBoxLayout(page4)
+        pl4.setContentsMargins(0, 0, 0, 0)
+        pl4.addWidget(self.global_settings_tab)
         self.tab_widget.addTab(page1, "📊 数据发送")
         self.tab_widget.addTab(page2, "⏰ 定时发送")
         self.tab_widget.addTab(page3, "📡 监控")
+        self.tab_widget.addTab(page4, "⚙️ 全量设置")
 
         # 全局精简/详细开关：放 QTabWidget 右上角 corner
         self._compact_mode = False

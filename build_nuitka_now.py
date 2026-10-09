@@ -23,8 +23,11 @@ log_path = os.path.join(
 )
 
 env = os.environ.copy()
-# 本地缓存目录，避免临时文件散落到 AppData，升级/切换时好清理
-env["NUITKA_CACHE_DIR"] = os.path.join(PROJECT, "nuitka_cache")
+# 本地缓存目录，避免临时文件散落到 AppData，升级/切换时好清理。
+# Nuitka 通过 env NUITKA_CACHE_DIR 读取缓存根目录（AppDirs._getCacheDir），
+# ccache/bytecode 等子缓存都落在它下面；没有 CLI 参数 --cache-dir（4.1.3 不支持）。
+N_CACHE = os.path.join(PROJECT, "nuitka_cache")
+env["NUITKA_CACHE_DIR"] = N_CACHE
 # 首次编译如果没装 C/C++ 编译器，让 Nuitka 静默自动下载 winlibs
 env.setdefault("NUITKA_NON_INTERACTIVE", "1")
 
@@ -81,7 +84,9 @@ cmd = [
     f"--jobs={workers}",
     # LTO 关闭：开发期打包提速；如果要正式版更小更快可以再打开
     "--lto=no",
-    # 明确不跟随 wxauto4：底层已迁移到 wechatauto/uia_bridge，不再打包旧依赖
+    # 编译产物缓存由 env NUITKA_CACHE_DIR 指定根目录（见上方 N_CACHE），
+    # ccache/bytecode/dll-dependencies 子缓存自动落盘到该目录，后续增量编译
+    # 只重编改动模块，显著加速迭代（4.1.3 无 --cache-dir CLI 选项）
     "--nofollow-import-to=wxauto4",
     # 函数内延迟导入的 Rust xlsx 引擎（大表格秒开，替代慢速 openpyxl），显式收进打包
     "--include-package=python_calamine",

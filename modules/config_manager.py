@@ -19,6 +19,8 @@ class ConfigManager:
         self.profile_dir = self.base_dir / "profiles"
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self.recent_file = self.base_dir / "recent_profiles.json"
+        # 应用级全局设置（跨所有 profile）：拟人节流 + 全量默认映射等
+        self.global_settings_file = self.base_dir / "global_settings.json"
 
     @staticmethod
     def _create_base_dir(base_dir):
@@ -253,6 +255,107 @@ class ConfigManager:
             ).strip(),
             "mappings": mappings,
         }
+
+    # ------------------------------------------------------------------
+    # 应用级全局设置（global_settings.json）：
+    #  - rhythm: 拟人节流开关/档位/自定义随机延迟
+    #  - default_mapping: 全量默认映射（仅作具体配置无映射时的最后兜底）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_global_default_mapping(raw):
+        """全量默认映射规范化：同一来源多行时**合并**接收人（不覆盖删除），保序。
+
+        与 profile 的 _normalize_recipient_mapping（后者覆盖前者）不同——
+        全局映射是用户在「全量设置」手打的文本，多行同源应累积而非丢弃，
+        避免"保存后重新打开条目消失"。
+        """
+        if not isinstance(raw, dict):
+            raw = {}
+        merged = {}
+        for item in (raw.get("mappings") or []):
+            if not isinstance(item, dict):
+                continue
+            src = str(item.get("source_value", "") or "").strip()
+            recips_raw = item.get("recipients") or []
+            if not isinstance(recips_raw, list):
+                continue
+            recips = [
+                str(r).strip()
+                for r in recips_raw
+                if str(r).strip()
+            ]
+            if src and recips:
+                merged.setdefault(src, []).extend(recips)
+        mappings = [
+            {"source_value": src, "recipients": recips}
+            for src, recips in merged.items()
+        ]
+        return {
+            "enabled": bool(raw.get("enabled", False)),
+            "default_recipient": str(
+                raw.get("default_recipient", "") or ""
+            ).strip(),
+            "mapping_file": "",
+            "mappings": mappings,
+        }
+
+    @staticmethod
+    def _normalize_global_settings(raw):
+        """规范化全局设置，返回一个含默认值的完整 dict。"""
+        if not isinstance(raw, dict):
+            raw = {}
+        rhythm = raw.get("rhythm") or {}
+        if not isinstance(rhythm, dict):
+            rhythm = {}
+        profile = str(rhythm.get("profile", "off")).strip()
+        if profile not in ("off", "fast", "natural", "calm"):
+            profile = "off"
+        try:
+            min_delay = float(rhythm.get("min_delay", 0.0))
+            max_delay = float(rhythm.get("max_delay", 0.0))
+        except (TypeError, ValueError):
+            min_delay = 0.0
+            max_delay = 0.0
+        min_delay = max(0.0, min(30.0, min_delay))
+        max_delay = max(0.0, min(30.0, max_delay))
+        if max_delay < min_delay:
+            max_delay = min_delay
+
+        default_mapping = ConfigManager._normalize_global_default_mapping(
+            raw.get("default_mapping")
+        )
+
+        return {
+            "_version": 1,
+            "rhythm": {
+                "enabled": bool(rhythm.get("enabled", False)),
+                "profile": profile,
+                "min_delay": min_delay,
+                "max_delay": max_delay,
+            },
+            "default_mapping": default_mapping,
+        }
+
+    def load_global_settings(self):
+        """读取全局设置；文件不存在或损坏时返回默认值（并确保文件存在）。"""
+        try:
+            with self.global_settings_file.open(
+                "r", encoding="utf-8"
+            ) as file:
+                data = json.load(file)
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        settings = self._normalize_global_settings(data)
+        return settings
+
+    def save_global_settings(self, settings):
+        """保存全局设置（先规范化再原子写）。"""
+        normalized = self._normalize_global_settings(settings)
+        try:
+            self._write_json(self.global_settings_file, normalized)
+        except OSError as exc:
+            raise ConfigError(f"全局设置保存失败: {exc}") from exc
+        return normalized
 
     def save_profile(self, path, data):
         profile = self.normalize_profile(data)

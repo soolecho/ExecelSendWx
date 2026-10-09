@@ -290,6 +290,38 @@ def prepare_profile(profile, log_fn=None):
             mapping_cfg.get("default_recipient", "") or ""
         ).strip()
 
+        # 全量默认映射兜底：profile 自身未启用映射（或未命中）时，
+        # 回退到应用级「全量设置」的默认映射（最后兜底层）。
+        if not mapping_enabled:
+            from modules.config_manager import ConfigManager
+            try:
+                gs_cfg = ConfigManager().load_global_settings()
+            except Exception:
+                gs_cfg = {}
+            g_dm = gs_cfg.get("default_mapping") or {}
+            if g_dm.get("enabled"):
+                g_v2r = {}
+                for m in (g_dm.get("mappings") or []):
+                    src = str(m.get("source_value", "") or "").strip()
+                    recips = [
+                        str(r).strip()
+                        for r in (m.get("recipients") or [])
+                        if str(r).strip()
+                    ]
+                    if src and recips:
+                        g_v2r[src] = recips
+                g_default = str(
+                    g_dm.get("default_recipient", "") or ""
+                ).strip()
+                if g_v2r or g_default:
+                    mapping_enabled = True
+                    value_to_recipients = g_v2r
+                    default_recipient = g_default
+                    log(
+                        f"⚙ 未启用配置映射，已应用「全量默认映射」"
+                        f"{len(g_v2r)} 条作为最后兜底"
+                    )
+
         custom_enabled = bool(send.get("custom_message_enabled", False))
         custom_msg = str(send.get("custom_message", "") or "") if custom_enabled else ""
         if custom_msg:
