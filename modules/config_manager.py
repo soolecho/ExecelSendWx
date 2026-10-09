@@ -295,7 +295,9 @@ class ConfigManager:
             "default_recipient": str(
                 raw.get("default_recipient", "") or ""
             ).strip(),
-            "mapping_file": "",
+            "mapping_file": str(
+                raw.get("mapping_file", "") or ""
+            ).strip(),
             "mappings": mappings,
         }
 

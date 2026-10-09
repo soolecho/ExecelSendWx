@@ -7293,6 +7293,8 @@ class GlobalSettingsTab(QWidget):
         self.settings = config_manager.load_global_settings()
         # UI 回填期间屏蔽 onChange 触发，避免写入未初始化控件值
         self._loading = True
+        # 关联的映射表文件路径（内存态，随 _collect_settings 持久化）
+        self._map_linked_file = ""
         self._change_timer = QTimer(self)
         self._change_timer.setSingleShot(True)
         self._change_timer.setInterval(400)
@@ -7304,6 +7306,9 @@ class GlobalSettingsTab(QWidget):
 
         # ---------------- 拟人节流 ----------------
         rhythm_group = bar.add_section("🎯 拟人节流", collapsed=True)
+        ## add_section 只登记 section，面板必须由调用方 addWidget 到同列布局，
+        ## 否则只有芯片按钮、点击不会显示内容区（与其余页面装配一致）
+        main_layout.addWidget(rhythm_group)
         rl = rhythm_group.contentLayout()
 
         self.rhythm_enable_check = QCheckBox("启用拟人节流（关闭可显著提升批量发送速度）")
@@ -7340,6 +7345,7 @@ class GlobalSettingsTab(QWidget):
 
         # ---------------- 全量默认映射 ----------------
         map_group = bar.add_section("🔁 全量默认映射", collapsed=True)
+        main_layout.addWidget(map_group)
         ml = map_group.contentLayout()
 
         self.map_enable_check = QCheckBox("启用全量默认映射（作为映射兜底层）")
@@ -7351,6 +7357,24 @@ class GlobalSettingsTab(QWidget):
         self.map_default_edit.setPlaceholderText("留空则不使用兜底")
         drow.addWidget(self.map_default_edit)
         ml.addLayout(drow)
+
+        # 映射表文件操作：导入 / 打开 / 关联，与「数据发送」的联系人映射一致
+        mrow = QHBoxLayout()
+        self.map_link_btn = QPushButton("🔗 关联映射表")
+        self.map_import_btn = QPushButton("📥 导入映射表")
+        self.map_open_btn = QPushButton("📂 打开映射表")
+        self.map_link_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.map_import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.map_open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        mrow.addWidget(self.map_link_btn)
+        mrow.addWidget(self.map_import_btn)
+        mrow.addWidget(self.map_open_btn)
+        self.map_file_label = QLabel("未关联映射表文件")
+        self.map_file_label.setStyleSheet("color:#888;font-size:11px;")
+        self.map_file_label.setWordWrap(True)
+        mrow.addWidget(self.map_file_label, 1)
+        mrow.addStretch()
+        ml.addLayout(mrow)
 
         ml.addWidget(QLabel("映射列表（每行一个，格式：来源1;来源2=接收人1;接收人2）："))
         self.map_edit = QPlainTextEdit()
@@ -7374,6 +7398,9 @@ class GlobalSettingsTab(QWidget):
         self.map_enable_check.toggled.connect(self._on_debounced_change)
         self.map_default_edit.editingFinished.connect(self._on_debounced_change)
         self.map_edit.textChanged.connect(self._on_debounced_change)
+        self.map_link_btn.clicked.connect(self._on_link_mapping_file)
+        self.map_import_btn.clicked.connect(self._on_import_mapping_file)
+        self.map_open_btn.clicked.connect(self._on_open_mapping_file)
 
         self._load_to_ui()
         self._loading = False
@@ -7392,6 +7419,8 @@ class GlobalSettingsTab(QWidget):
         dm = self.settings.get("default_mapping") or {}
         self.map_enable_check.setChecked(bool(dm.get("enabled", False)))
         self.map_default_edit.setText(str(dm.get("default_recipient", "") or ""))
+        self._map_linked_file = str(dm.get("mapping_file", "") or "").strip()
+        self._update_map_file_label()
         lines = []
         for m in (dm.get("mappings") or []):
             src = str(m.get("source_value", "") or "").strip()
@@ -7438,6 +7467,169 @@ class GlobalSettingsTab(QWidget):
             out.append(p)
         return out
 
+    # ---------------- 映射表文件：关联 / 导入 / 打开 ----------------
+    @staticmethod
+    def _plain_split_values(raw):
+        """把映射表文件单元格拆成多个值：按 / ; 、 。， 分隔，去空白空串。
+
+        与 field 版 _split_rm_values 一致（普通联系人也用这套分隔符），
+        保证「导入」与「数据发送」的映射表文件格式互通。
+        """
+        if not raw:
+            return []
+        text = str(raw).strip()
+        if not text:
+            return []
+        for sep in ("/", ";", "；", "、", "。", "，", ",", " ", "\t"):
+            text = text.replace(sep, "\n")
+        return [s.strip() for s in text.split("\n") if s.strip()]
+
+    def _update_map_file_label(self):
+        if self._map_linked_file:
+            self.map_file_label.setText("已关联: " + self._map_linked_file)
+            self.map_link_btn.setToolTip(self._map_linked_file)
+        else:
+            self.map_file_label.setText("未关联映射表文件")
+            self.map_link_btn.setToolTip("关联一个映射表文件路径")
+
+    def _map_file_dir(self):
+        cur = self._map_linked_file
+        if cur and os.path.isdir(os.path.dirname(cur)):
+            return os.path.dirname(cur)
+        return ""
+
+    def _on_link_mapping_file(self):
+        """关联一个映射表文件（.xlsx/.csv），保存到 global settings 的 mapping_file。"""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择映射表文件",
+            self._map_file_dir(),
+            "映射表 (*.xlsx *.xls *.csv);;所有文件 (*.*)",
+        )
+        if not path:
+            return
+        self._map_linked_file = os.path.abspath(path)
+        self._update_map_file_label()
+        logger.info(f"已关联全量默认映射表文件: {self._map_linked_file}")
+        self._on_debounced_change()  # 持久化 mapping_file
+
+    def _on_open_mapping_file(self):
+        """用系统默认编辑器（Excel/WPS）打开已关联的映射表文件。"""
+        path = self._map_linked_file
+        if not path or not os.path.isfile(path):
+            start_dir = self._map_file_dir()
+            picked, _ = QFileDialog.getOpenFileName(
+                self,
+                "选择要打开的映射表文件",
+                start_dir,
+                "映射表 (*.xlsx *.xls *.csv);;所有文件 (*.*)",
+            )
+            if not picked:
+                return
+            path = os.path.abspath(picked)
+            self._map_linked_file = path
+            self._update_map_file_label()
+            self._on_debounced_change()
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(path)
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+            logger.info(f"已用系统默认程序打开全量映射表: {path}")
+        except OSError as exc:
+            QMessageBox.warning(
+                self, "打开失败",
+                f"无法打开映射表文件:\n{path}\n\n错误: {exc}",
+            )
+
+    def _on_import_mapping_file(self):
+        """从 .xlsx/.csv 导入映射关系，合并进全量默认映射列表。
+
+        两列结构（与「数据发送」映射表一致）：
+          第一列 = 来源名（可 / ; 分隔多个，共享同一组接收人）
+          第二列 = 接收人（可 / ; 分隔多人）
+        合并规则：同一来源若已存在于文本里，用文件数据覆盖；文件里多行同源合并。
+        """
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择映射表文件",
+            self._map_file_dir(),
+            "映射表 (*.xlsx *.xls *.csv);;所有文件 (*.*)",
+        )
+        if not path:
+            return
+
+        try:
+            from modules.wps_cloud import read_one_sheet, read_sheet_names
+        except ImportError as exc:
+            QMessageBox.critical(self, "导入失败", f"缺少必要模块: {exc}")
+            return
+
+        try:
+            names = read_sheet_names(path, log_fn=lambda m: logger.info(m))
+            if not names:
+                QMessageBox.warning(self, "导入失败", "无法读取工作表名称")
+                return
+            rows = read_one_sheet(path, names[0], log_fn=lambda m: logger.info(m))
+        except Exception as exc:
+            QMessageBox.warning(self, "导入失败", f"读取映射表失败:\n{path}\n\n错误: {exc}")
+            return
+        if not rows:
+            QMessageBox.warning(self, "导入失败", "映射表为空或无有效数据")
+            return
+
+        # 先读回当前文本编辑框里的映射，合并后覆盖写回
+        merged = {}
+        for m in self._collect_mapping_rows_from_edit():
+            merged[m["source_value"]] = m["recipients"]
+
+        imported_count = 0
+        for row in rows:
+            if not row or len(row) < 2:
+                continue
+            srcs = self._plain_split_values(row[0])
+            recips = self._plain_split_values(row[1])
+            if not srcs or not recips:
+                continue
+            for s in srcs:
+                merged[s] = list(recips)
+                imported_count += 1
+
+        lines = []
+        for src, recips in merged.items():
+            lines.append(
+                f"{self._fmt_mapping_name(src)}="
+                f"{';'.join(self._fmt_mapping_name(r) for r in recips)}"
+            )
+        self.map_edit.setPlainText("\n".join(lines))
+
+        self._map_linked_file = os.path.abspath(path)
+        self._update_map_file_label()
+        self._on_debounced_change()
+        logger.info(
+            f"导入全量映射完成：合并后共 {len(merged)} 条映射"
+            f"（本次新增/覆盖 {imported_count} 条），来源: {path}"
+        )
+
+    def _collect_mapping_rows_from_edit(self):
+        """把全量映射文本解析为 [{source_value, recipients}]，key 去重合并。"""
+        merged = {}
+        for line in self.map_edit.toPlainText().splitlines():
+            line = line.strip()
+            if not line or "=" not in line:
+                continue
+            src_raw, recips_raw = line.split("=", 1)
+            srcs = [s for s in self._split_mapping_names(src_raw) if s]
+            recips = [r for r in self._split_mapping_names(recips_raw) if r]
+            if not srcs or not recips:
+                continue
+            for src in srcs:
+                merged.setdefault(src, []).extend(recips)
+        return [
+            {"source_value": src, "recipients": recips}
+            for src, recips in merged.items()
+        ]
+
     def _collect_settings(self):
         profile = str(self.rhythm_profile_combo.currentData() or "off")
         min_delay = round(float(self.rhythm_min_spin.value()), 1)
@@ -7452,22 +7644,7 @@ class GlobalSettingsTab(QWidget):
         #   （"两个名字指向一个发送人" / 也可指向多个）
         # - 右侧接收人用 ; ； 分隔；"" 包裹的分隔符不生效
         # - 同一来源出现在多行时合并接收人，不做去重删除
-        merged = {}
-        for line in self.map_edit.toPlainText().splitlines():
-            line = line.strip()
-            if not line or "=" not in line:
-                continue
-            src_raw, recips_raw = line.split("=", 1)
-            srcs = [s for s in self._split_mapping_names(src_raw) if s]
-            recips = [r for r in self._split_mapping_names(recips_raw) if r]
-            if not srcs or not recips:
-                continue
-            for src in srcs:
-                merged.setdefault(src, []).extend(recips)
-        mappings = [
-            {"source_value": src, "recipients": recips}
-            for src, recips in merged.items()
-        ]
+        mappings = self._collect_mapping_rows_from_edit()
         return {
             "rhythm": {
                 "enabled": self.rhythm_enable_check.isChecked(),
@@ -7478,6 +7655,7 @@ class GlobalSettingsTab(QWidget):
             "default_mapping": {
                 "enabled": self.map_enable_check.isChecked(),
                 "default_recipient": self.map_default_edit.text().strip(),
+                "mapping_file": self._map_linked_file,
                 "mappings": mappings,
             },
         }
