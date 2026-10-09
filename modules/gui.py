@@ -6364,6 +6364,67 @@ class MonitorTab(QWidget):
         order_row.addWidget(self.send_order_combo, 1)
         send_layout.addLayout(order_row)
 
+        # 写入智能表格（AirScript webhook，独立可选出口）：勾选后显示配置。
+        self.airsync_check = QCheckBox("写入智能表格(AirScript)")
+        self.airsync_check.setToolTip(
+            "把清洗/提取后的数据（去掉首行标题）追加写入自己拥有的金山智能表格\n"
+            "指定 sheet 的指定列，从最后一个非空行往下逐行写入。\n"
+            "凭证使用脚本令牌 AirScript-Token（webhook 请求头），与现有 wps_sid 读取链路完全独立。")
+        send_layout.addWidget(self.airsync_check)
+
+        self.airsync_detail = QWidget()
+        adl = QVBoxLayout(self.airsync_detail)
+        adl.setContentsMargins(0, 0, 0, 0)
+
+        row_web = QHBoxLayout()
+        row_web.addWidget(QLabel("Webhook:"))
+        self.airsync_webhook_edit = QLineEdit()
+        self.airsync_webhook_edit.setPlaceholderText("脚本 webhook 链接（脚本编辑器复制）")
+        row_web.addWidget(self.airsync_webhook_edit, 1)
+        adl.addLayout(row_web)
+
+        row_tok = QHBoxLayout()
+        row_tok.addWidget(QLabel("脚本令牌:"))
+        self.airsync_token_edit = QLineEdit()
+        self.airsync_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.airsync_token_edit.setPlaceholderText("AirScript-Token（脚本编辑器盾牌图标创建）")
+        row_tok.addWidget(self.airsync_token_edit, 1)
+        adl.addLayout(row_tok)
+
+        row_sheet = QHBoxLayout()
+        row_sheet.addWidget(QLabel("目标Sheet:"))
+        self.airsync_sheet_edit = QLineEdit()
+        self.airsync_sheet_edit.setPlaceholderText("留空 = 表内活动表")
+        row_sheet.addWidget(self.airsync_sheet_edit, 1)
+        adl.addLayout(row_sheet)
+
+        row_col = QHBoxLayout()
+        row_col.addWidget(QLabel("起始列:"))
+        self.airsync_start_col_spin = QSpinBox()
+        self.airsync_start_col_spin.setRange(1, 702)
+        self.airsync_start_col_spin.setValue(1)
+        self.airsync_start_col_spin.setToolTip("数据追加写入的起始列，1=A，2=B …")
+        row_col.addWidget(self.airsync_start_col_spin)
+        row_col.addSpacing(8)
+        row_col.addWidget(QLabel("列数:"))
+        self.airsync_col_count_spin = QSpinBox()
+        self.airsync_col_count_spin.setRange(0, 200)
+        self.airsync_col_count_spin.setValue(0)
+        self.airsync_col_count_spin.setSpecialValueText("全部")
+        self.airsync_col_count_spin.setToolTip("0=写入每行全部列；>0=只写前 N 列")
+        row_col.addWidget(self.airsync_col_count_spin)
+        row_col.addStretch(1)
+        adl.addLayout(row_col)
+
+        self.airsync_hint = QLabel("写入列 = 清洗后提取列；去首行标题，从末尾非空行往下追加。")
+        self.airsync_hint.setWordWrap(True)
+        self.airsync_hint.setStyleSheet("color: #808080;")
+        adl.addWidget(self.airsync_hint)
+
+        self.airsync_detail.setVisible(False)
+        send_layout.addWidget(self.airsync_detail)
+        self.airsync_check.toggled.connect(self._on_airsync_toggled)
+
         # 清洗后条数判断拦截：len(clean_rows) 与 阈值 满足 操作符 关系时，本次不发送
         self.limit_enabled_check = QCheckBox("条数判断拦截")
         self.limit_enabled_check.setToolTip("对清洗后待发送的行数做判断：满足【大于/小于/等于】设定条数时本次不发送。基线照常推进")
@@ -6611,6 +6672,12 @@ class MonitorTab(QWidget):
         self.send_order_combo.currentIndexChanged.connect(mark)
         self.snapshot_check.stateChanged.connect(mark)
         self.snapshot_range_edit.textChanged.connect(mark)
+        self.airsync_check.stateChanged.connect(mark)
+        self.airsync_webhook_edit.textChanged.connect(mark)
+        self.airsync_token_edit.textChanged.connect(mark)
+        self.airsync_sheet_edit.textChanged.connect(mark)
+        self.airsync_start_col_spin.valueChanged.connect(mark)
+        self.airsync_col_count_spin.valueChanged.connect(mark)
         self.text_title_edit.textChanged.connect(mark)
         self.text_detail_check.stateChanged.connect(mark)
         self.include_subdir_check.stateChanged.connect(mark)
@@ -6705,6 +6772,10 @@ class MonitorTab(QWidget):
         if checked and not self.send_image_check.isChecked():
             self.send_image_check.setChecked(True)
         self._refresh_snapshot_hint()
+
+    def _on_airsync_toggled(self, _checked=None):
+        # 勾选「写入智能表格」才显示其配置区（程序填充阶段无需额外处理）
+        self.airsync_detail.setVisible(self.airsync_check.isChecked())
 
     def _refresh_snapshot_hint(self):
         # 开启对比时提示该功能不生效（与关闭对比模式并存，用户自由选择）
@@ -6938,6 +7009,13 @@ class MonitorTab(QWidget):
             idx_order = self.send_order_combo.findData(
                 getattr(task, "send_order", None))
             self.send_order_combo.setCurrentIndex(idx_order if idx_order >= 0 else 0)
+            self.airsync_check.setChecked(task.airsync_enabled)
+            self.airsync_webhook_edit.setText(task.airsync_webhook)
+            self.airsync_token_edit.setText(task.airsync_token)
+            self.airsync_sheet_edit.setText(task.airsync_sheet)
+            self.airsync_start_col_spin.setValue(task.airsync_start_col)
+            self.airsync_col_count_spin.setValue(task.airsync_col_count)
+            self.airsync_detail.setVisible(task.airsync_enabled)
             self.include_subdir_check.setChecked(task.include_subdir)
             # 列设置：勾选清洗/保留/对比列，并应用统一清洗方式
             self.strip_space_check.setChecked(True)
@@ -7016,6 +7094,12 @@ class MonitorTab(QWidget):
         task.text_detail = self.text_detail_check.isChecked()
         task.send_order = list(
             self.send_order_combo.currentData() or ["text", "image", "attachment"])
+        task.airsync_enabled = self.airsync_check.isChecked()
+        task.airsync_webhook = self.airsync_webhook_edit.text().strip()
+        task.airsync_token = self.airsync_token_edit.text().strip()
+        task.airsync_sheet = self.airsync_sheet_edit.text().strip()
+        task.airsync_start_col = self.airsync_start_col_spin.value()
+        task.airsync_col_count = self.airsync_col_count_spin.value()
         task.include_subdir = self.include_subdir_check.isChecked()
         task.compare_columns = self._selected_cols(self.compare_cols_list)
         task.extract_columns = self._selected_cols(self.extract_cols_list)
@@ -7137,6 +7221,13 @@ class MonitorTab(QWidget):
             self.text_title_edit.clear()
             self.text_detail_check.setChecked(True)
             self.send_order_combo.setCurrentIndex(0)
+            self.airsync_check.setChecked(False)
+            self.airsync_webhook_edit.clear()
+            self.airsync_token_edit.clear()
+            self.airsync_sheet_edit.clear()
+            self.airsync_start_col_spin.setValue(1)
+            self.airsync_col_count_spin.setValue(0)
+            self.airsync_detail.setVisible(False)
             self.include_subdir_check.setChecked(False)
             self.strip_space_check.setChecked(True)
             self.digits_check.setChecked(False)

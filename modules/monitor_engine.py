@@ -462,3 +462,156 @@ def build_out_file(
         pass
     wb.save(out_path)
     return out_path
+
+
+# ---------------------------------------------------------------- AirScript 智能表格写入
+_AIRSCRIPT_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+
+def _col_letter(n: int) -> str:
+    """1 → A, 26 → Z, 27 → AA ..."""
+    n = int(n or 1)
+    if n < 1:
+        n = 1
+    s = ""
+    while n > 0:
+        rem = (n - 1) % 26
+        s = chr(65 + rem) + s
+        n = (n - 1) // 26
+    return s
+
+
+def airsync_append(
+    webhook: str,
+    token: str,
+    sheet: str,
+    start_col: int,
+    col_count: int,
+    rows: List[List[str]],
+    timeout: int = 30,
+) -> Tuple[bool, str]:
+    """把清洗/提取后的多行数据追加写入智能表格（AirScript 通用工具库脚本）。
+
+    脚本需为「文档共享脚本」并内置 wps_airscript_client_api.js（Http 工具库，
+    支持 function= getUsedRangeData / setRangeValues）。流程分两步：
+      1) getUsedRangeData 取已用区域 [startRow, startCol, nRows, nCols] → 计算末尾空行
+      2) setRangeValues 把 rows（已去掉首行标题）从末尾空行写入指定列起
+    rows 为空时跳过写入；返回 (成功?, 详情)。
+    """
+    import requests
+
+    if not webhook or not token:
+        return False, "未配置 AirScript webhook 或脚本令牌"
+    if not rows:
+        return True, "无可写入行（0 行），跳过"
+
+    # 按列数剪裁、统一转字符串
+    data_rows: List[List[str]] = []
+    for r in rows:
+        src = r[:col_count] if col_count > 0 else r
+        data_rows.append([str(c) for c in src])
+    if not data_rows:
+        return True, "剪裁后无可写入行，跳过"
+
+    headers = {
+        "Content-Type": "application/json",
+        "AirScript-Token": token,
+        "User-Agent": _AIRSCRIPT_UA,
+    }
+
+    def _call(argv: dict) -> tuple:
+        """POST 一次 webhook，返回 (ok, result_payload)。"""
+        try:
+            resp = requests.post(
+                webhook,
+                json={"Context": {"argv": argv}},
+                headers=headers,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            return False, {"http_error": repr(exc)}
+        if resp.status_code != 200:
+            return False, {"http_status": resp.status_code, "body": resp.text[:200]}
+        try:
+            body = resp.json()
+        except ValueError:
+            return True, {"non_json": resp.text[:120]}
+        if body.get("error"):
+            return False, {"script_error": body["error"]}
+        return True, body
+
+    # ---------- 第 1 步：读已用区域，定位末尾 ----------
+    ok, body = _call({"function": "getUsedRangeData", "isGetData": False})
+    if not ok:
+        return False, f"读取表格末尾失败: {body}"
+    if body.get("non_json"):
+        return False, f"读取表格末尾失败: {body['non_json']}"
+    result = body.get("data", {}).get("result") or []
+    used = None
+    if isinstance(result, list) and result:
+        item = result[0]
+        d = item.get("data") if isinstance(item, dict) else None
+        if isinstance(d, list) and len(d) >= 4:
+            used = d  # [startRow, startCol, nRows, nCols]
+    if not used:
+        return False, f"读取表格末尾失败: 无法解析 getUsedRangeData 响应 {result}"
+
+    start_row, start_col_used, used_rows, used_cols = (int(x) for x in used[:4])
+    # 末尾空行 = 起始行 + 已用行数（即最后一个非空行的下一行）
+    insert_row = start_row + used_rows
+    col_begin = int(start_col or 1)
+    if col_begin < start_col_used:
+        # 用户指定的起始列可能在工作表已用区域的左侧，直接以指定列为准
+        col_begin = max(int(start_col or 1), 1)
+    n_cols = len(data_rows[0])
+    col_end = col_begin + n_cols - 1
+
+    # ---------- 第 2 步：批量写入（写值 + 跟随上方行格式） ----------
+    address = f"{_col_letter(col_begin)}{insert_row}:{_col_letter(col_end)}{insert_row + len(data_rows) - 1}"
+    ok, body = _call(
+        {
+            "function": "setRangeValuesWithFormat",
+            "address": address,
+            "values": data_rows,
+            "thisSheetName": sheet or "",
+            "formatFromRow": max(start_row, insert_row - 1),  # 参考格式行 = 最后一非空行
+        }
+    )
+    if not ok:
+        return False, f"写入失败: {body}"
+    if body.get("non_json"):
+        return False, f"写入失败: {body['non_json']}"
+    result2 = body.get("data", {}).get("result") or []
+    ok_flag = bool(
+        isinstance(result2, list)
+        and result2
+        and (isinstance(result2[0], dict) and result2[0].get("success"))
+        and not (isinstance(result2[0], dict) and result2[0].get("error"))
+    )
+    if not ok_flag:
+        # 脚本端未实现 setRangeValuesWithFormat（旧脚本库）→ 回退纯写值
+        ok_fb, body_fb = _call(
+            {
+                "function": "setRangeValues",
+                "address": address,
+                "values": data_rows,
+                "thisSheetName": sheet or "",
+            }
+        )
+        if not ok_fb:
+            return False, f"写入失败: {body_fb}"
+        if body_fb.get("non_json"):
+            return False, f"写入失败: {body_fb['non_json']}"
+        result3 = body_fb.get("data", {}).get("result") or []
+        ok_flag = bool(
+            isinstance(result3, list)
+            and result3
+            and (isinstance(result3[0], dict) and result3[0].get("success"))
+        )
+        if not ok_flag:
+            return False, f"脚本未确认写入成功: {result3}"
+        return True, f"追加 {len(data_rows)} 行到 {address}（旧脚本，无格式跟随）"
+    return True, f"追加 {len(data_rows)} 行到 {address}（含格式跟随）"

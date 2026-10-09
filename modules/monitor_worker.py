@@ -258,6 +258,28 @@ class MonitorWorker(QThread):
                                 f"monitor_{datetime.now().strftime('%H%M%S%f')}.xlsx")
             out_file = monitor_engine.build_out_file(view_headers, view_rows, tmpx)
 
+        # 可选出口：写入智能表格（AirScript webhook）。纯 HTTP，不占用微信发送批次锁。
+        # 将清洗/提取后的行（去掉首行标题）追加写入用户自己的金山智能表格指定 sheet 指定列。
+        airsync_failed = False
+        if task.airsync_enabled and clean_rows:
+            try:
+                ok, detail = monitor_engine.airsync_append(
+                    task.airsync_webhook, task.airsync_token,
+                    task.airsync_sheet, task.airsync_start_col,
+                    task.airsync_col_count, view_rows,
+                )
+                if ok:
+                    self.emit(f"{log_prefix} 任务「{task.name}」已写入智能表格（{detail}）")
+                else:
+                    airsync_failed = True
+                    self.emit(f"{log_prefix} 任务「{task.name}」写入智能表格失败: {detail}")
+            except Exception as exc:
+                airsync_failed = True
+                logger.exception("写入智能表格失败 %s", task.name)
+                self.emit(f"{log_prefix} 任务「{task.name}」写入智能表格失败: {exc}")
+
+        any_failed = False  # 微信推送 或 智能表格写入 任一失败即视为本次未完成 → 保留基线重试
+
         self.emit(f"{log_prefix} 任务「{task.name}」文件「{name}」检出新增 {len(new_rows)} 条，清洗后保留 {len(clean_rows)} 条，开始推送…")
 
         # 全局发送批次锁：与其他发送任务（手动/定时/链路）排队串行，
@@ -300,22 +322,24 @@ class MonitorWorker(QThread):
                     WeChatSender.shared_instance().minimize_window()
                 except Exception:
                     pass
+        # 微信推送 或 智能表格写入 任一失败即视为本次未完成 → 保留基线重试
+        any_failed = bool(msg_failed or airsync_failed)
 
         # 更新基线 / 已见文件：只有发送全部成功才推进，否则保留上一基线，
         # 让下次轮询重新检出同一批新增并重试（避免"有新增但发送失败"被当作已处理而永久丢失）
         if task.compare_enabled:
-            if msg_failed:
-                # 存在发送失败：不更新 __prev__ 基线 → 下次轮询重新检出新增行重试
-                self.emit(f"{log_prefix} 任务「{task.name}」有接收人发送失败，保留对比基线，下次轮询将重试推送")
+            if any_failed:
+                # 存在发送/写入失败：不更新 __prev__ 基线 → 下次轮询重新检出新增行重试
+                self.emit(f"{log_prefix} 任务「{task.name}」存在失败（微信/写入智能表格），保留对比基线，下次轮询将重试推送")
             else:
                 # 只保留「当前这份文件的全部行键」作为下一轮对比基线（滚动快照，只对比上一个时间点）。
                 # 注意必须存当前文件所有行的键，而非仅 new_keys（新增行），否则下轮会重复推上轮已存在的行。
                 task.baseline = {"__prev__": monitor_engine.build_baseline(headers, rows, key_columns)}
         else:
-            if not msg_failed:
+            if not any_failed:
                 task.seen_files[name] = monitor_engine.file_fingerprint(fp)
             else:
-                self.emit(f"{log_prefix} 任务「{task.name}」有接收人发送失败，不标记已见文件，下次轮询将重试推送")
+                self.emit(f"{log_prefix} 任务「{task.name}」存在失败（微信/写入智能表格），不标记已见文件，下次轮询将重试推送")
         self.store.save(task)
 
         # 清理临时图/表：延迟 15s 再删。wxauto 的 SendFiles 返回时微信只是开始异步上传，

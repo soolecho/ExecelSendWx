@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
-MONITOR_VERSION = 7
+MONITOR_VERSION = 8
 
 
 def _default_send_order() -> List[str]:
@@ -198,6 +198,15 @@ class MonitorTask:
     # 每天运行时间段（HH:MM，起:止）。空=全天；支持跨夜如 22:00-07:00。
     active_start: str = ""
     active_end: str = ""
+    # 写入智能表格（AirScript webhook，独立可选出口）：把清洗/提取后的行"去掉首行标题"
+    # 追加写入自己拥有的金山智能表格指定 sheet 的指定列，从最后一个非空行往下逐行写入。
+    # 凭证使用 AirScript-Token（webhook 请求头），与现有 wps_sid 读取链路完全独立。
+    airsync_enabled: bool = False
+    airsync_webhook: str = ""   # 脚本 webhook 链接
+    airsync_token: str = ""     # AirScript 脚本令牌（放请求头 AirScript-Token）
+    airsync_sheet: str = ""     # 目标 sheet 名；留空 = 表内活动表
+    airsync_start_col: int = 1  # 起始列，1=A，2=B ...
+    airsync_col_count: int = 0  # 每行写入列数；0=写入该行全部列
     created_at: str = ""
     updated_at: str = ""
 
@@ -287,6 +296,12 @@ class MonitorTask:
             include_subdir=_b("include_subdir", False),
             active_start=_s("active_start"),
             active_end=_s("active_end"),
+            airsync_enabled=_b("airsync_enabled", False),
+            airsync_webhook=_s("airsync_webhook"),
+            airsync_token=_s("airsync_token"),
+            airsync_sheet=_s("airsync_sheet"),
+            airsync_start_col=max(1, _i("airsync_start_col", 1)),
+            airsync_col_count=max(0, _i("airsync_col_count", 0)),
             created_at=_s("created_at"),
             updated_at=_s("updated_at"),
         )
