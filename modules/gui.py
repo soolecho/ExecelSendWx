@@ -7145,13 +7145,23 @@ class MonitorTab(QWidget):
             task.active_start = ""
             task.active_end = ""
 
-        # 编辑已有任务时，保留历史 baseline/seen_files，避免重复推送
-        if existing_id and existing_id in self.tasks:
-            old = self.tasks[existing_id]
-            task.baseline = dict(old.baseline)
-            task.seen_files = dict(old.seen_files)
-            task.created_at = old.created_at
-            task.enabled = old.enabled
+        # 编辑已有任务时，保留历史 baseline/seen_files，避免重复推送。
+        # 必须从磁盘读最新值：worker 轮询推进基线后只落盘，GUI 内存 self.tasks
+        # 是加载时的旧快照——若用内存旧值覆盖保存，会冲掉 worker 刚推进的新基线，
+        # 下一轮轮询把已推送过的行当"新增"重复推送（实测 07:20/07:25 同批数据重复发 3 次）。
+        if existing_id:
+            disk = self.store.get(existing_id)  # load_all 从磁盘读最新配置
+            if disk is not None:
+                task.baseline = dict(disk.baseline)
+                task.seen_files = dict(disk.seen_files)
+                task.created_at = disk.created_at
+                task.enabled = disk.enabled
+            elif existing_id in self.tasks:
+                old = self.tasks[existing_id]
+                task.baseline = dict(old.baseline)
+                task.seen_files = dict(old.seen_files)
+                task.created_at = old.created_at
+                task.enabled = old.enabled
         return task
 
     def _parse_filter_values(self, text: str) -> List[str]:

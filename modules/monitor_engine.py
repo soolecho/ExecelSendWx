@@ -369,14 +369,15 @@ def apply_clean_rules(
             if rule.strip_space:
                 val = val.replace(" ", "").replace("\u3000", "")
             if rule.drop_empty and not val.strip():
+                # 去空(空剔除)：该列清洗后为空 → 整行剔除，不受 on_fail 影响。
+                # on_fail 只决定"校验失败"（前缀等）时剔/留；空值属数据质量过滤，
+                # 若受 on_fail="keep" 门控，空行会混进推送/智能表格（实测空账号行被粘贴）。
                 dropped.append(
                     {"row_idx": r_idx, "column": rule.column,
                      "reason": f"内容为空(清洗后): {raw}"}
                 )
-                if rule.on_fail == "drop":
-                    keep_row = False
-                    break
-                continue
+                keep_row = False
+                break
             if rule.keep_digits_only:
                 val = "".join(ch for ch in val if ch.isdigit())
             if rule.take_first_n > 0:
