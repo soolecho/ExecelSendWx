@@ -212,6 +212,13 @@ class MonitorWorker(QThread):
         view_headers, view_rows = monitor_engine.extract_columns_by(
             headers, clean_rows, task.extract_columns
         )
+        # 自定义备注列：非空时在提取列每行末尾追加一列固定文案（所有行相同，紧随提取列之后），
+        # 作用于文字/图片/文件/智能表格四个共享 view_rows 的输出。
+        remark = getattr(task, "remark_text", "") or ""
+        remark = remark.strip()
+        if remark:
+            view_headers = [*view_headers, "备注"]
+            view_rows = [list(r) + [remark] for r in view_rows]
 
         # 指定区域截图（仅「关闭对比」模式生效，与筛选/清洗/提取列并存、独立勾选）：
         # 勾选后图片内容改为截取 sheet 原始区域（不参与筛选/清洗），留空范围 = 整表已用区域。
@@ -262,21 +269,30 @@ class MonitorWorker(QThread):
         # 将清洗/提取后的行（去掉首行标题）追加写入用户自己的金山智能表格指定 sheet 指定列。
         airsync_failed = False
         if task.airsync_enabled and clean_rows:
-            try:
-                ok, detail = monitor_engine.airsync_append(
-                    task.airsync_webhook, task.airsync_token,
-                    task.airsync_sheet, task.airsync_start_col,
-                    task.airsync_col_count, view_rows,
-                )
-                if ok:
-                    self.emit(f"{log_prefix} 任务「{task.name}」已写入智能表格（{detail}）")
-                else:
+            # 同一批重试去重：上次 airsync 已成功写入的行键与本次 new_keys 一致时，
+            # 本轮是「微信发送失败保留基线」后的重试 → 跳过重复写入，仅重发微信。
+            written_keys = list(task.airsync_written_keys or [])
+            if written_keys and set(written_keys) == set(new_keys):
+                self.emit(f"{log_prefix} 任务「{task.name}」本轮新增已写入过智能表格，跳过重复写入（仅重试微信）")
+            else:
+                try:
+                    ok, detail = monitor_engine.airsync_append(
+                        task.airsync_webhook, task.airsync_token,
+                        task.airsync_sheet, task.airsync_start_col,
+                        task.airsync_col_count, view_rows,
+                    )
+                    if ok:
+                        # 记录已写标记并立即落盘：失败重试时据此跳过 airsync；成功后随基线清空
+                        task.airsync_written_keys = list(new_keys)
+                        self.store.save(task)
+                        self.emit(f"{log_prefix} 任务「{task.name}」已写入智能表格（{detail}）")
+                    else:
+                        airsync_failed = True
+                        self.emit(f"{log_prefix} 任务「{task.name}」写入智能表格失败: {detail}")
+                except Exception as exc:
                     airsync_failed = True
-                    self.emit(f"{log_prefix} 任务「{task.name}」写入智能表格失败: {detail}")
-            except Exception as exc:
-                airsync_failed = True
-                logger.exception("写入智能表格失败 %s", task.name)
-                self.emit(f"{log_prefix} 任务「{task.name}」写入智能表格失败: {exc}")
+                    logger.exception("写入智能表格失败 %s", task.name)
+                    self.emit(f"{log_prefix} 任务「{task.name}」写入智能表格失败: {exc}")
 
         any_failed = False  # 微信推送 或 智能表格写入 任一失败即视为本次未完成 → 保留基线重试
 
@@ -324,6 +340,10 @@ class MonitorWorker(QThread):
                     pass
         # 微信推送 或 智能表格写入 任一失败即视为本次未完成 → 保留基线重试
         any_failed = bool(msg_failed or airsync_failed)
+
+        # 微信全部发送成功时，清空 airsync 已写标记（该批已完全处理，后续新增行重新正常写入）
+        if not any_failed and task.airsync_written_keys:
+            task.airsync_written_keys = []
 
         # 更新基线 / 已见文件：只有发送全部成功才推进，否则保留上一基线，
         # 让下次轮询重新检出同一批新增并重试（避免"有新增但发送失败"被当作已处理而永久丢失）

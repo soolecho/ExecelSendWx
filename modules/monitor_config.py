@@ -183,6 +183,9 @@ class MonitorTask:
     snapshot_range: str = ""  # 如 "A1:F20"；留空 = 整表已用区域
     # 推送文字自定义标题（如"光缆故障新增提醒"），未配置用默认
     text_title: str = ""
+    # 自定义备注列：非空时，在提取列每行末尾追加一列该固定文案（所有行相同）。
+    # 紧随提取列之后（如提取3列 → 第4列为备注），作用于文字/图片/文件/智能表格。
+    remark_text: str = ""
     # 推送文字是否附带逐行明细（勾选才显示 列:值；否则只显示标题+条数）
     text_detail: bool = True
     # 合并发送的粘贴/排列顺序（text/image/attachment；缺省=文字在前，然后图片、文件）
@@ -207,6 +210,10 @@ class MonitorTask:
     airsync_sheet: str = ""     # 目标 sheet 名；留空 = 表内活动表
     airsync_start_col: int = 1  # 起始列，1=A，2=B ...
     airsync_col_count: int = 0  # 每行写入列数；0=写入该行全部列
+    # airsync 已写标记：记录最近一次成功写入智能表格的行键（new_keys 副本）。
+    # 同一批因微信发送失败保留基线重试时，若行键与已写标记一致则跳过 airsync 重复写入；
+    # 微信发送全部成功后随基线推进一并清空。旧配置默认空 = 正常写入。
+    airsync_written_keys: List[str] = field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
 
@@ -289,6 +296,7 @@ class MonitorTask:
             snapshot_range=_s("snapshot_range"),
             text_title=_s("text_title"),
             text_detail=_b("text_detail", True),
+            remark_text=_s("remark_text"),
             send_order=_parse_send_order(data),
             limit_enabled=_b("limit_enabled", False),
             limit_op=_s("limit_op", ""),
@@ -302,6 +310,10 @@ class MonitorTask:
             airsync_sheet=_s("airsync_sheet"),
             airsync_start_col=max(1, _i("airsync_start_col", 1)),
             airsync_col_count=max(0, _i("airsync_col_count", 0)),
+            airsync_written_keys=[
+                str(k) for k in data.get("airsync_written_keys", [])
+                if isinstance(k, (str, int, float))
+            ],
             created_at=_s("created_at"),
             updated_at=_s("updated_at"),
         )

@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # ============================== 常量 ==============================
 
 # 当前客户端版本（与 installer.iss 的 MyAppVersion 保持一致）
-APP_VERSION = "1.5.6"
+APP_VERSION = "1.5.7"
 
 REPO_OWNER = "soolecho"
 REPO_NAME = "ExecelSendWx"

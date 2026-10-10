@@ -390,7 +390,10 @@ def apply_clean_rules(
                 if rule.on_fail == "drop":
                     keep_row = False
                     break
-                # on_fail="keep" 保留原值，但记录提示
+                # on_fail="keep"：行保留，但该列仍应应用清洗变换（val 已去非数字/取前N位），
+                # 否则前缀失败的行会以原始未清洗值写入推送/智能表格（如 12 位原始账号而非前 11 位）
+                if idx < len(row_out):
+                    row_out[idx] = val
                 continue
             if idx < len(row_out):
                 row_out[idx] = val
