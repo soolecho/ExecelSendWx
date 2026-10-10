@@ -547,31 +547,66 @@ def airsync_append(
             return False, {"script_error": body["error"]}
         return True, body
 
-    # ---------- 第 1 步：读已用区域，定位末尾 ----------
-    ok, body = _call({"function": "getUsedRangeData", "isGetData": False})
-    if not ok:
-        return False, f"读取表格末尾失败: {body}"
-    if body.get("non_json"):
-        return False, f"读取表格末尾失败: {body['non_json']}"
-    result = body.get("data", {}).get("result") or []
-    used = None
-    if isinstance(result, list) and result:
-        item = result[0]
-        d = item.get("data") if isinstance(item, dict) else None
-        if isinstance(d, list) and len(d) >= 4:
-            used = d  # [startRow, startCol, nRows, nCols]
-    if not used:
-        return False, f"读取表格末尾失败: 无法解析 getUsedRangeData 响应 {result}"
-
-    start_row, start_col_used, used_rows, used_cols = (int(x) for x in used[:4])
-    # 末尾空行 = 起始行 + 已用行数（即最后一个非空行的下一行）
-    insert_row = start_row + used_rows
-    col_begin = int(start_col or 1)
-    if col_begin < start_col_used:
-        # 用户指定的起始列可能在工作表已用区域的左侧，直接以指定列为准
-        col_begin = max(int(start_col or 1), 1)
+    # ---------- 第 1 步：定位末尾 ----------
+    # 优先按「用户指定起始列」的最底非空行定位（getRangeValues 读该列真实值向下扫），
+    # 避免 getUsedRangeData 返回的外接矩形（含其它列/格式残留）误把空白区当末尾，
+    # 导致写入落到已有数据中间造成覆盖。
+    col_begin = max(int(start_col or 1), 1)
     n_cols = len(data_rows[0])
     col_end = col_begin + n_cols - 1
+
+    insert_row = None
+    ok0, body0 = _call({"function": "getUsedRangeData", "isGetData": False})
+    if ok0 and not body0.get("non_json"):
+        result0 = body0.get("data", {}).get("result") or []
+        item0 = result0[0] if (isinstance(result0, list) and result0) else None
+        d0 = item0.get("data") if isinstance(item0, dict) else None
+        if isinstance(d0, list) and len(d0) >= 2:
+            start_row, start_col_used = int(d0[0]), int(d0[1])
+            used_rows = int(d0[2]) if len(d0) >= 3 else 0
+            # 读取起始列真实值，从下向上找最后一个非空单元格
+            look_rows = max(used_rows, 1) + 200  # 多读一段兜底
+            start_cell = _col_letter(col_begin)
+            col_addr = f"{start_cell}{start_row}:{start_cell}{start_row + look_rows}"
+            ok1, body1 = _call({"function": "getRangeValues", "address": col_addr})
+            if ok1 and not body1.get("non_json"):
+                res1 = body1.get("data", {}).get("result")
+                if isinstance(res1, list) and res1 and isinstance(res1[0], dict):
+                    vals = res1[0].get("values") or []
+                    last_row = None
+                    for k in range(len(vals) - 1, -1, -1):
+                        cell = vals[k]
+                        if isinstance(cell, list):
+                            cell = cell[0] if cell else None
+                        empty = cell is None or (
+                            isinstance(cell, str) and not cell.strip()
+                        )
+                        if not empty:
+                            last_row = start_row + k
+                            break
+                    if last_row is not None:
+                        insert_row = last_row + 1
+    # 兜底：外接矩形法（找不到真实末尾/脚本不支持读值时）
+    if insert_row is None:
+        ok, body = _call({"function": "getUsedRangeData", "isGetData": False})
+        if not ok:
+            return False, f"读取表格末尾失败: {body}"
+        if body.get("non_json"):
+            return False, f"读取表格末尾失败: {body['non_json']}"
+        result = body.get("data", {}).get("result") or []
+        used = None
+        if isinstance(result, list) and result:
+            item = result[0]
+            d = item.get("data") if isinstance(item, dict) else None
+            if isinstance(d, list) and len(d) >= 4:
+                used = d  # [startRow, startCol, nRows, nCols]
+        if not used:
+            return False, f"读取表格末尾失败: 无法解析 getUsedRangeData 响应 {result}"
+        start_row = int(used[0])
+        insert_row = start_row + int(used[2])
+        if col_begin < int(used[1]):
+            # 用户指定的起始列可能在工作表已用区域的左侧，直接以指定列为准
+            col_begin = max(int(start_col or 1), 1)
 
     # ---------- 第 2 步：批量写入（写值 + 跟随上方行格式） ----------
     address = f"{_col_letter(col_begin)}{insert_row}:{_col_letter(col_end)}{insert_row + len(data_rows) - 1}"
