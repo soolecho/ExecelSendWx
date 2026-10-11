@@ -1,7 +1,9 @@
 import sys
 import os
 import glob
+import html
 import logging
+import re
 import threading
 import time
 from typing import List, Optional, Set, Dict, Tuple, Any
@@ -63,6 +65,36 @@ from modules.updater import (
 
 # gui 模块自己的日志（Toast、定时触发/完成、跨线程信号等关键路径均需可追溯）
 logger = logging.getLogger(__name__)
+
+
+# 日志面板着色：按内容关键词区分级别（红=失败/错误，橙=警告/跳过，绿=成功/完成）
+_LOG_COLOR_ERR = "#d93025"
+_LOG_COLOR_WARN = "#e67e22"
+_LOG_COLOR_OK = "#1e8e3e"
+
+
+def _colorize_log(text: str) -> str:
+    """按内容关键词给日志行着色，返回带 HTML 的字符串。
+
+    红色：失败/出错/错误/异常；橙色：警告/跳过/超时；绿色：成功/完成/启动。
+    "失败 0"（无失败计数）不视为失败，避免「成功 X / 失败 0」被误标红。
+    """
+    esc = html.escape(str(text))
+    if re.search(r"失败(?!\s*0\b)|出错|错误|异常|❌|Error|Traceback", text):
+        color = _LOG_COLOR_ERR
+    elif re.search(r"警告|⚠|跳过|超时|WARN", text):
+        color = _LOG_COLOR_WARN
+    elif re.search(r"成功|完成|已启动|运行中|✅|恢复", text):
+        color = _LOG_COLOR_OK
+    else:
+        return esc
+    return f'<span style="color:{color};">{esc}</span>'
+
+
+def _append_log_rich(edit, message: str, ts: str = "") -> None:
+    """把日志行按级别着色后追加到 QTextEdit 日志框（ts 为空则不显示时间）。"""
+    line = f"[{ts}] {message}" if ts else str(message)
+    edit.append(_colorize_log(line))
 
 
 APP_TITLE = "表格自动发送By春风予Lu"
@@ -4142,7 +4174,7 @@ class TableFilterTab(QWidget):
                 g.set_collapsed(False)
 
     def log(self, message):
-        self.log_text.append(message)
+        _append_log_rich(self.log_text, message)
         self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
         
         # 用 QTextDocument 原生上限做裁剪，CPU 比手动逐块删除更低
@@ -4582,6 +4614,7 @@ class ToastNotification(QFrame):
                     toast.width(), toast.height(), toast.isVisible())
             except Exception:
                 pass
+            return toast
         except Exception:
             # 不再静默吞掉：记录异常便于定位"通知不显示"类问题
             logger.exception("[Toast] show_toast 失败 title=%s", title)
@@ -6645,11 +6678,17 @@ class MonitorTab(QWidget):
         self.log_text.setFont(QFont("Consolas", 9))
         log_layout.addWidget(self.log_text)
         log_btn_row = QHBoxLayout()
+        self.auto_follow_check = QCheckBox("自动跟随")
+        self.auto_follow_check.setChecked(True)
+        self.auto_follow_check.setToolTip(
+            "勾选后新日志自动滚动到底部；取消勾选可停在当前位置回看旧日志")
+        log_btn_row.addWidget(self.auto_follow_check)
         self.stop_poll_btn = QPushButton("停止轮询")
         log_btn_row.addWidget(self.stop_poll_btn)
         log_btn_row.addStretch()
         log_layout.addLayout(log_btn_row)
         right_layout.addWidget(log_group)
+        self.log_group = log_group
 
         right_layout.addStretch()
         main_layout.addWidget(right, 1)
@@ -7360,20 +7399,76 @@ class MonitorTab(QWidget):
 
     def _on_task_finished(self, task_name: str, success: int, failed: int):
         self.log(f"[监控] 任务「{task_name}」完成: 成功 {success} / 失败 {failed}")
-        # 发送失败 → 右下角常驻通知（同定时任务：红色图标、不自动隐藏、点击置前）。
+        # 发送失败 → 右下角常驻通知（同定时任务：红色图标、不自动隐藏、点击跳转详情）。
         # 仅在该任务由成功/无失败转入失败时弹一次；恢复成功后重新布防，避免反复失败堆积。
         if failed > 0:
             if task_name not in self._monitor_fail_notified:
                 self._monitor_fail_notified.add(task_name)
                 try:
-                    ToastNotification.show_toast(
+                    toast = ToastNotification.show_toast(
                         "监控发送失败",
-                        f"监控「{task_name}」发送失败 {failed} 条，成功 {success} 条（点击查看）",
-                        success=False, parent=self.window())
+                        f"监控「{task_name}」发送失败 {failed} 条，成功 {success} 条（点击查看详情）",
+                        success=False, parent=self.window(),
+                        on_click=lambda: self._on_fail_toast_clicked(toast, task_name))
                 except Exception:
                     logger.exception("[监控] 失败通知弹出失败")
         else:
             self._monitor_fail_notified.discard(task_name)
+
+    def _on_fail_toast_clicked(self, toast, task_name):
+        """点击失败通知：关闭通知并跳转到该失败任务详情。"""
+        try:
+            toast.close()
+        except Exception:
+            pass
+        self._jump_to_failed_task(task_name)
+
+    def _jump_to_failed_task(self, task_name):
+        """跳转到失败任务详情：选中任务表单 + 展开运行日志并滚动到其最近日志。"""
+        try:
+            tid = next(
+                (tid for tid, t in self.tasks.items() if t.name == task_name),
+                None)
+            if tid is not None:
+                self._set_list_selection(tid)
+                self.current_task_id = tid
+                self._load_task_to_form(self.tasks[tid])
+        except Exception:
+            logger.exception("[监控] 跳转到失败任务表单失败")
+        # 主窗口切到「📡 监控」页并前置
+        try:
+            mw = self.window()
+            if mw is not None and hasattr(mw, "tab_widget") \
+                    and hasattr(mw, "monitor_tab"):
+                mw.tab_widget.setCurrentWidget(mw.monitor_tab)
+                mw.showNormal()
+                mw.raise_()
+                mw.activateWindow()
+        except Exception:
+            logger.exception("[监控] 切换到监控页失败")
+        # 展开运行日志面板
+        try:
+            if getattr(self, "log_group", None) is not None \
+                    and self.log_group.is_collapsed():
+                self.log_group.set_collapsed(False, animate=True)
+        except Exception:
+            pass
+        # 滚动到该任务最近一条日志（找不到则到底部）
+        try:
+            doc = self.log_text.document()
+            cur = doc.find(task_name)
+            last = None
+            while not cur.isNull():
+                last = cur
+                cur = doc.find(task_name, cur)
+            if last is not None:
+                self.log_text.setTextCursor(last)
+            else:
+                sb = self.log_text.verticalScrollBar()
+                sb.setValue(sb.maximum())
+            self.log_text.ensureCursorVisible()
+        except Exception:
+            logger.exception("[监控] 滚动到失败日志失败")
 
     def _on_run_finished(self):
         self.log("[监控] 本轮执行完毕")
@@ -7383,10 +7478,15 @@ class MonitorTab(QWidget):
         if hasattr(self, "log_text") and self.log_text is not None:
             from datetime import datetime
             ts = datetime.now().strftime("%H:%M:%S")
-            self.log_text.append(f"[{ts}] {message}")
+            _append_log_rich(self.log_text, message, ts)
             if not self._log_max_applied:
                 self.log_text.document().setMaximumBlockCount(1200)
                 self._log_max_applied = True
+            # 自动跟随：勾选后新日志滚动到底部（默认开，取消可回看旧日志）
+            if getattr(self, "auto_follow_check", None) is not None \
+                    and self.auto_follow_check.isChecked():
+                sb = self.log_text.verticalScrollBar()
+                sb.setValue(sb.maximum())
         logger.info(message)
         # 同时推送给 MainWindow，用于主界面统一日志面板
         if self.log_callback:
