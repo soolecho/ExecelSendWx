@@ -556,7 +556,8 @@ def airsync_append(
     col_end = col_begin + n_cols - 1
 
     insert_row = None
-    ok0, body0 = _call({"function": "getUsedRangeData", "isGetData": False})
+    ok0, body0 = _call({"function": "getUsedRangeData", "isGetData": False,
+                        "thisSheetName": sheet or ""})
     if ok0 and not body0.get("non_json"):
         result0 = body0.get("data", {}).get("result") or []
         item0 = result0[0] if (isinstance(result0, list) and result0) else None
@@ -568,7 +569,8 @@ def airsync_append(
             look_rows = max(used_rows, 1) + 200  # 多读一段兜底
             start_cell = _col_letter(col_begin)
             col_addr = f"{start_cell}{start_row}:{start_cell}{start_row + look_rows}"
-            ok1, body1 = _call({"function": "getRangeValues", "address": col_addr})
+            ok1, body1 = _call({"function": "getRangeValues", "address": col_addr,
+                                "thisSheetName": sheet or ""})
             if ok1 and not body1.get("non_json"):
                 res1 = body1.get("data", {}).get("result")
                 if isinstance(res1, list) and res1 and isinstance(res1[0], dict):
@@ -588,7 +590,8 @@ def airsync_append(
                         insert_row = last_row + 1
     # 兜底：外接矩形法（找不到真实末尾/脚本不支持读值时）
     if insert_row is None:
-        ok, body = _call({"function": "getUsedRangeData", "isGetData": False})
+        ok, body = _call({"function": "getUsedRangeData", "isGetData": False,
+                          "thisSheetName": sheet or ""})
         if not ok:
             return False, f"读取表格末尾失败: {body}"
         if body.get("non_json"):
