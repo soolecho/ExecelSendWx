@@ -214,6 +214,11 @@ class MonitorTask:
     # 同一批因微信发送失败保留基线重试时，若行键与已写标记一致则跳过 airsync 重复写入；
     # 微信发送全部成功后随基线推进一并清空。旧配置默认空 = 正常写入。
     airsync_written_keys: List[str] = field(default_factory=list)
+    # 连续发送失败暂停重试：fail_streak 记录连续失败次数，达到阈值后暂停自动重试
+    # 「该批次旧内容」；fail_file 记录最近一次失败处理的文件名，用于判定下轮是否仍是
+    # 同一批旧内容（新文件到来自动清零恢复）。旧配置默认 0/空，不影响既有行为。
+    fail_streak: int = 0
+    fail_file: str = ""
     created_at: str = ""
     updated_at: str = ""
 
@@ -314,6 +319,8 @@ class MonitorTask:
                 str(k) for k in data.get("airsync_written_keys", [])
                 if isinstance(k, (str, int, float))
             ],
+            fail_streak=max(0, _i("fail_streak", 0)),
+            fail_file=_s("fail_file"),
             created_at=_s("created_at"),
             updated_at=_s("updated_at"),
         )

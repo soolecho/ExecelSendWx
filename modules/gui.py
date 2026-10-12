@@ -7395,25 +7395,32 @@ class MonitorTab(QWidget):
     def _bind_worker_signals(self, worker: MonitorWorker):
         worker.log.connect(self._worker_log_signal.emit)
         worker.task_finished.connect(self._on_task_finished)
+        worker.task_paused.connect(self._on_task_paused)
         worker.run_finished.connect(self._on_run_finished)
 
     def _on_task_finished(self, task_name: str, success: int, failed: int):
         self.log(f"[监控] 任务「{task_name}」完成: 成功 {success} / 失败 {failed}")
-        # 发送失败 → 右下角常驻通知（同定时任务：红色图标、不自动隐藏、点击跳转详情）。
-        # 仅在该任务由成功/无失败转入失败时弹一次；恢复成功后重新布防，避免反复失败堆积。
-        if failed > 0:
-            if task_name not in self._monitor_fail_notified:
-                self._monitor_fail_notified.add(task_name)
-                try:
-                    toast = ToastNotification.show_toast(
-                        "监控发送失败",
-                        f"监控「{task_name}」发送失败 {failed} 条，成功 {success} 条（点击查看详情）",
-                        success=False, parent=self.window(),
-                        on_click=lambda: self._on_fail_toast_clicked(toast, task_name))
-                except Exception:
-                    logger.exception("[监控] 失败通知弹出失败")
-        else:
+        # 失败弹窗已迁移至 _on_task_paused（连续失败达阈值才弹一次，避免每轮刷屏）。
+        # 此处仅负责：全部成功（连败已清零）时对该任务的暂停通知重新布防，
+        # 使下次连续失败再次达到阈值时能重新弹窗提醒。
+        if failed == 0:
             self._monitor_fail_notified.discard(task_name)
+
+    def _on_task_paused(self, task_name: str):
+        """监控任务连续发送失败达阈值、被暂停自动重试 → 弹一次红色常驻通知。
+        不自动消失；点击关闭并跳转到该失败任务详情。同一任务只在暂停态弹一次，
+        恢复成功后（failed==0）重新布防，下次再次达到阈值会重新提醒。"""
+        if task_name in self._monitor_fail_notified:
+            return
+        self._monitor_fail_notified.add(task_name)
+        try:
+            toast = ToastNotification.show_toast(
+                "监控发送失败",
+                f"监控「{task_name}」连续发送失败多次，已暂停自动重试该批次；新数据到来会自动恢复（点击查看详情）",
+                success=False, parent=self.window(),
+                on_click=lambda: self._on_fail_toast_clicked(toast, task_name))
+        except Exception:
+            logger.exception("[监控] 暂停提醒通知弹出失败")
 
     def _on_fail_toast_clicked(self, toast, task_name):
         """点击失败通知：关闭通知并跳转到该失败任务详情。"""

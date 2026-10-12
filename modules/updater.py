@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 # ============================== 常量 ==============================
 
 # 当前客户端版本（与 installer.iss 的 MyAppVersion 保持一致）
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 
 REPO_OWNER = "soolecho"
 REPO_NAME = "ExecelSendWx"
@@ -55,8 +55,10 @@ SUMS_ASSET_NAME = "SHA256SUMS.txt"
 # 元组: (显示名, URL 前缀)；前缀为 DIRECT_KEY 表示 GitHub 直连。
 DIRECT_KEY = "DIRECT"
 MIRROR_OPTIONS = [
-    ("gh-proxy 镜像（推荐）", "https://gh-proxy.org/"),
-    ("ghfast.top 镜像", "https://ghfast.top/"),
+    ("gh-proxy.org 镜像（推荐）", "https://gh-proxy.org/"),
+    ("gh-proxy.com 镜像", "https://gh-proxy.com/"),
+    ("ghps.cc 镜像", "https://ghps.cc/"),
+    ("ghproxy.link 镜像", "https://ghproxy.link/"),
     ("GitHub 直连", DIRECT_KEY),
 ]
 

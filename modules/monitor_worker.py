@@ -31,6 +31,11 @@ class MonitorWorker(QThread):
     log = pyqtSignal(str)
     task_finished = pyqtSignal(str, int, int)  # task_name, success, failed
     run_finished = pyqtSignal()  # 一轮（manual/一次循环）完成
+    # 连续发送失败达阈值、被暂停自动重试时发出（只在「未暂停→已暂停」边沿发一次）
+    task_paused = pyqtSignal(str)
+
+    # 连续发送失败阈值：达到后暂停自动重试「该批次旧内容」，新文件到来自动恢复
+    PAUSE_THRESHOLD = 3
 
     # 任务级互斥：同一任务可能同时被「常驻轮询」与「手动执行」两个 worker 处理，
     # 用 busy 标志保证同一时刻只有一个 worker 在处理同一任务，避免重复推送
@@ -116,6 +121,18 @@ class MonitorWorker(QThread):
         # 开启对比时，基于已记录的 baseline 做行增量（等同与上一个时间点的内容对比），
         # 避免首次/每次轮询把目录里的历史表全部读一遍并重复推送。
         latest = files[-1]  # _match_files 已按 mtime 升序，最后一个是最新
+        # 连续失败暂停重试：仅作用于自动轮询（one_shot=False），手动执行不受影响；
+        # 检测到新文件（latest 与上次失败文件不同）自动清零连败并恢复正常推送，不丢新数据。
+        if not self.one_shot and task.fail_streak >= MonitorWorker.PAUSE_THRESHOLD:
+            cur_name = os.path.basename(latest)
+            if cur_name == task.fail_file:
+                self.emit(f"{log_prefix} 任务「{task.name}」连续失败达 {MonitorWorker.PAUSE_THRESHOLD} 次，已暂停自动重试该批次，等待新文件到来自动恢复")
+                return
+            else:
+                task.fail_streak = 0
+                task.fail_file = ""
+                self.store.save(task)
+                self.emit(f"{log_prefix} 任务「{task.name}」检测到新文件，恢复正常推送")
         success = 0
         failed = 0
         try:
@@ -341,6 +358,18 @@ class MonitorWorker(QThread):
         # 微信推送 或 智能表格写入 任一失败即视为本次未完成 → 保留基线重试
         any_failed = bool(msg_failed or airsync_failed)
 
+        # 连续失败计数：发送/写入全部成功则清零；任一失败则累加并记录当前失败文件。
+        # 从「未暂停」刚达到阈值（fail_streak 从 <N 升到 >=N）的边沿只发一次暂停信号，
+        # 由 GUI 弹常驻提醒；成功清零后下次再次达到会重新提醒。
+        was_paused = task.fail_streak >= MonitorWorker.PAUSE_THRESHOLD
+        if any_failed:
+            task.fail_streak += 1
+            task.fail_file = name  # name = os.path.basename(fp)
+        else:
+            task.fail_streak = 0
+            task.fail_file = ""
+        if not was_paused and task.fail_streak >= MonitorWorker.PAUSE_THRESHOLD:
+            self.task_paused.emit(task.name)
         # 微信全部发送成功时，清空 airsync 已写标记（该批已完全处理，后续新增行重新正常写入）
         if not any_failed and task.airsync_written_keys:
             task.airsync_written_keys = []
