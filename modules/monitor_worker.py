@@ -286,21 +286,32 @@ class MonitorWorker(QThread):
         # 将清洗/提取后的行（去掉首行标题）追加写入用户自己的金山智能表格指定 sheet 指定列。
         airsync_failed = False
         if task.airsync_enabled and clean_rows:
-            # 同一批重试去重：上次 airsync 已成功写入的行键与本次 new_keys 一致时，
-            # 本轮是「微信发送失败保留基线」后的重试 → 跳过重复写入，仅重发微信。
-            written_keys = list(task.airsync_written_keys or [])
-            if written_keys and set(written_keys) == set(new_keys):
+            # 逐行去重：微信发送失败保留基线后，下一轮对比旧基线检出的行 = 上轮已写行 + 新文件新增行
+            # （集合变大）。按行键过滤掉已写入过的行，只追加真正新增的行，避免同批数据写两次。
+            # 行键算法与 diff_incremental/build_baseline 一致（key_columns 对应列值 / 整行哈希）。
+            written_keys = set(task.airsync_written_keys or [])
+            _, clean_keys = monitor_engine.diff_incremental(
+                headers, clean_rows, [], key_columns
+            )
+            pending_keys: List[str] = []
+            pending_rows: List[List[str]] = []
+            for r, k in zip(view_rows, clean_keys):
+                if k not in written_keys:
+                    pending_rows.append(r)
+                    pending_keys.append(k)
+            if not pending_rows:
                 self.emit(f"{log_prefix} 任务「{task.name}」本轮新增已写入过智能表格，跳过重复写入（仅重试微信）")
             else:
                 try:
                     ok, detail = monitor_engine.airsync_append(
                         task.airsync_webhook, task.airsync_token,
                         task.airsync_sheet, task.airsync_start_col,
-                        task.airsync_col_count, view_rows,
+                        task.airsync_col_count, pending_rows,
                     )
                     if ok:
-                        # 记录已写标记并立即落盘：失败重试时据此跳过 airsync；成功后随基线清空
-                        task.airsync_written_keys = list(new_keys)
+                        # 合并（并集）而非覆盖：本轮真正新增的行键并入历史已写记录，
+                        # 保留上一轮已写但本轮因失败被再次检出的行键，防止重复写入。
+                        task.airsync_written_keys = sorted(written_keys | set(pending_keys))
                         self.store.save(task)
                         self.emit(f"{log_prefix} 任务「{task.name}」已写入智能表格（{detail}）")
                     else:
