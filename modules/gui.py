@@ -3638,7 +3638,8 @@ class TableFilterTab(QWidget):
         
         self.persons_list.clear()
         for person in persons:
-            self.persons_list.addItem(person)
+            # 异常行可能把 datetime 等非字符串值带进人名，直接转 str 显示，避免 addItem 崩溃
+            self.persons_list.addItem(str(person))
 
         # 列表重建会丢失选中项：只要还有人员就保持"开始发送"可点击，
         # 未选中人员时点击会弹提示，避免禁用按钮导致"点击毫无反应"
@@ -4154,6 +4155,18 @@ class TableFilterTab(QWidget):
             self.table_data,
             header_row=self.header_row_spin.value(),
         )
+        # 读取表格结构异常行检测：仅日志提示，不拦截任何数据
+        try:
+            anomalies = self.processor.detect_anomalous_name_rows(name_column)
+            if anomalies:
+                log_list = "；".join(f"第{r}行(值: {v})" for r, v in anomalies[:20])
+                if len(anomalies) > 20:
+                    log_list += f"；…共 {len(anomalies)} 行"
+                self.log(f"⚠ 读取表格发现 {len(anomalies)} 行人名列类型异常，请核对：{log_list}")
+            else:
+                self.log(f"读取表格校验通过：人名列「{name_column}」无类型异常行")
+        except Exception as e:
+            self.log(f"⚠ 读取表格异常行检测失败: {e}")
         self.refresh_persons_list()
         
         if wechat_column:

@@ -192,9 +192,14 @@ class TableProcessor:
             return []
         
         filtered_rows = []
+        search = str(name) if name is not None else ""
         for row in self.rows:
-            if len(row) > name_column_index and name in row[name_column_index]:
-                filtered_rows.append(row)
+            if len(row) > name_column_index:
+                val = row[name_column_index]
+                # 错位行/异常行可能把 datetime、int 等非字符串值放进姓名列，
+                # in 对非字符串必然 TypeError，统一转字符串做子串匹配
+                if val is not None and search in str(val):
+                    filtered_rows.append(row)
         
         logger.info(f"Filtered {len(filtered_rows)} rows for name: {name}")
         return filtered_rows
@@ -307,7 +312,54 @@ class TableProcessor:
                 persons.add(row[name_index])
         
         logger.info(f"Found {len(persons)} unique persons with filters")
-        return sorted(list(persons))
+        # 集合可能混入 datetime/str 等不同类型（错位行会把日期带进姓名列），按字符串安全排序避免崩溃
+        return sorted(persons, key=str)
+
+    def detect_anomalous_name_rows(self, name_column):
+        """检测人名列（如账号列）中与主体类型不一致的异常行，仅用于日志提示，不拦截。
+
+        典型场景：账号列主体为数字手机号，但个别行混入文字（如"无分值"），
+        属于表格结构错位。返回 [(excel行号, 该列原始值), ...]，按出现顺序。
+        """
+        name_index = self.get_header_index(name_column)
+        if name_index < 0:
+            return []
+
+        # 统计人名列非空值的类型分布，取主体类型作为基准
+        type_counts = {}
+        for row in self.rows:
+            v = row[name_index] if len(row) > name_index else None
+            if v is None or (isinstance(v, str) and not v.strip()):
+                continue
+            t = self._value_type(v)
+            type_counts[t] = type_counts.get(t, 0) + 1
+        if not type_counts:
+            return []
+
+        dominant = max(type_counts, key=type_counts.get)
+
+        anomalies = []
+        # rows 从表头所在行之后的下一行开始，行号 = self.header_row + 1
+        base = self.header_row + 1
+        for i, row in enumerate(self.rows):
+            v = row[name_index] if len(row) > name_index else None
+            if v is None or (isinstance(v, str) and not v.strip()):
+                continue
+            if self._value_type(v) != dominant:
+                anomalies.append((base + i, v))
+        return anomalies
+
+    @staticmethod
+    def _value_type(v):
+        """把单元格值归为三类：num(number) / dt(日期时间) / text(文本)。
+
+        datetime/Timestamp 单列一类，避免错位行把日期带进姓名列时与文本混同而漏报。
+        """
+        if isinstance(v, (int, float)):
+            return 'num'
+        if isinstance(v, (_dt.datetime, _Timestamp, _dt.date)):
+            return 'dt'
+        return 'text'
 
     def get_person_to_wechat_mapping(self, name_column, wechat_column):
         name_index = self.get_header_index(name_column)
