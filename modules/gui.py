@@ -7395,6 +7395,15 @@ class MonitorTab(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "信息不完整", str(exc))
             return
+        # 合并保留磁盘上已积累的运行期字段：表单重建会清空这些字段，
+        # 若直接覆盖保存会导致手动执行时智能表格去重标记丢失而重复写入
+        existing = self.store.get(tid)
+        if existing is not None:
+            task.airsync_written_keys = list(existing.airsync_written_keys or [])
+            task.baseline = dict(existing.baseline or {})
+            task.seen_files = dict(existing.seen_files or {})
+            task.fail_streak = int(getattr(existing, "fail_streak", 0) or 0)
+            task.fail_file = getattr(existing, "fail_file", "") or ""
         # 回写并保存，让 worker 读到最新配置
         self.store.save(task)
         self.tasks[tid] = self.store.get(tid)
