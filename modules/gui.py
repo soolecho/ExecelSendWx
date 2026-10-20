@@ -592,47 +592,48 @@ def acquire_instance_lock(lock_path=None):
     return None
 
 
-def _activate_existing_instance(title_part):
-    """单实例锁被占用时，找到已运行实例的主窗口并带到前台。
+def _show_request_flag_path():
+    """重复启动唤醒标志文件路径：第二个实例写入，运行中的实例轮询检测后自行动作。"""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        local_app_data = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.AppLocalDataLocation
+        )
+    base = local_app_data or os.getcwd()
+    return os.path.join(base, "ExcelSendWx", "show_request.flag")
 
-    返回是否成功激活；找不到窗口时返回 False，由调用方兜底弹提示框。
-    通过 ctypes 调用 user32（不依赖 pywin32），仅在本机会话内查找。
+
+def _request_existing_instance_show():
+    """向已运行实例发出「把主窗口带到前台」请求，返回是否写入成功。
+
+    不能在本进程跨进程 ShowWindow/SetForegroundWindow：对托盘隐藏的 Qt 窗口
+    外部显示会让 Qt 内部可见性状态失同步，窗口白屏且无法响应（v1.7.4 实测
+    「弹出界面但白色卡死」）。改为写一个唤醒标志文件，由已运行实例自己的
+    定时器在主线程内 show/raise，避免跨进程 SendMessage 阻塞与可见性失同步。
     """
-    import ctypes
-    from ctypes import wintypes
-
-    def _find(require_visible):
-        found = [0]
-
-        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-        def _enum_callback(hwnd, lparam):
-            if require_visible and not ctypes.windll.user32.IsWindowVisible(hwnd):
-                return True
-            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
-            if length > 0:
-                buf = ctypes.create_unicode_buffer(length + 1)
-                ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
-                if title_part in buf.value:
-                    found[0] = hwnd
-                    return False  # 停止枚举
-            return True
-
-        ctypes.windll.user32.EnumWindows(_enum_callback, 0)
-        return found[0]
-
-    # 优先找可见窗口（跳过托盘图标等隐藏窗口），找不到再找隐藏的主窗口
-    hwnd = _find(True) or _find(False)
-    if not hwnd:
+    flag = _show_request_flag_path()
+    try:
+        os.makedirs(os.path.dirname(flag), exist_ok=True)
+        with open(flag, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+        return True
+    except OSError:
+        logger.warning("写入实例唤醒标志失败: %s", flag, exc_info=True)
         return False
 
-    # 最小化则还原；隐藏（托盘）则重新显示；然后置前
-    if ctypes.windll.user32.IsIconic(hwnd):
-        ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-    elif not ctypes.windll.user32.IsWindowVisible(hwnd):
-        ctypes.windll.user32.ShowWindow(hwnd, 5)  # SW_SHOW
-    ctypes.windll.user32.SetForegroundWindow(hwnd)
-    ctypes.windll.user32.BringWindowToTop(hwnd)
-    return True
+
+def _consume_show_request():
+    """读取并清除唤醒标志；返回 (内容, 是否存在)。内容为空视为不存在。"""
+    flag = _show_request_flag_path()
+    try:
+        if not os.path.exists(flag):
+            return None, False
+        with open(flag, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read().strip()
+        os.unlink(flag)
+        return content, bool(content)
+    except OSError:
+        return None, False
 
 
 
@@ -8105,6 +8106,17 @@ class MainWindow(QMainWindow):
         self.init_ui()
         self.init_tray()
 
+        # ---- 重复启动唤醒：第二个实例写标志文件，本实例在主线程内自行恢复显示 ----
+        # 不能用跨进程 ShowWindow 直接显示（会让 Qt 窗口白屏卡死），
+        # 只能在主线程事件循环里 show/raise；启动前先清掉陈旧标志，
+        # 避免启动瞬间对自家窗口抢焦点。
+        init_req, _ = _consume_show_request()
+        self._last_show_req = init_req
+        self._show_req_timer = QTimer(self)
+        self._show_req_timer.setInterval(1000)
+        self._show_req_timer.timeout.connect(self._check_show_request)
+        self._show_req_timer.start()
+
         # ---- 在线更新状态 ----
         # 首次运行检查一次 + 长运行每满 24 小时检查一次；
         # 同一新版本自动提醒只弹一次，用户可跳过；手动检查不受限制
@@ -8123,6 +8135,15 @@ class MainWindow(QMainWindow):
         else:
             self.schedule_dispatcher.start()
             self.schedule_tab.dispatcher_status_label.setText("调度器状态: 运行中")
+
+    def _check_show_request(self):
+        """检测重复启动唤醒标志：出现新请求则把主窗口带回前台（主线程内操作）。"""
+        content, exists = _consume_show_request()
+        if not exists or content == self._last_show_req:
+            return
+        self._last_show_req = content
+        self.show_main_window()
+        logger.info("已收到重复启动请求，主窗口已带到前台")
 
     def init_ui(self):
         self.table_filter_tab = TableFilterTab()
@@ -9381,8 +9402,10 @@ def run_gui():
 
     instance_lock = acquire_instance_lock()
     if instance_lock is None:
-        # 已有实例在运行：将其主窗口带到前台（最小化/隐藏则先恢复显示）
-        if _activate_existing_instance("表格自动发送"):
+        # 已有实例在运行：写唤醒标志，由已运行实例自行把主窗口带到前台。
+        # 不能在本进程直接跨进程 ShowWindow（会使 Qt 窗口白屏卡死），
+        # 标志文件由运行中实例的定时器在主线程内消费。
+        if _request_existing_instance_show():
             return
         QMessageBox.information(
             None,
