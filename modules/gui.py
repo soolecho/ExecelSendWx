@@ -592,6 +592,49 @@ def acquire_instance_lock(lock_path=None):
     return None
 
 
+def _activate_existing_instance(title_part):
+    """单实例锁被占用时，找到已运行实例的主窗口并带到前台。
+
+    返回是否成功激活；找不到窗口时返回 False，由调用方兜底弹提示框。
+    通过 ctypes 调用 user32（不依赖 pywin32），仅在本机会话内查找。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    def _find(require_visible):
+        found = [0]
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _enum_callback(hwnd, lparam):
+            if require_visible and not ctypes.windll.user32.IsWindowVisible(hwnd):
+                return True
+            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+                if title_part in buf.value:
+                    found[0] = hwnd
+                    return False  # 停止枚举
+            return True
+
+        ctypes.windll.user32.EnumWindows(_enum_callback, 0)
+        return found[0]
+
+    # 优先找可见窗口（跳过托盘图标等隐藏窗口），找不到再找隐藏的主窗口
+    hwnd = _find(True) or _find(False)
+    if not hwnd:
+        return False
+
+    # 最小化则还原；隐藏（托盘）则重新显示；然后置前
+    if ctypes.windll.user32.IsIconic(hwnd):
+        ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    elif not ctypes.windll.user32.IsWindowVisible(hwnd):
+        ctypes.windll.user32.ShowWindow(hwnd, 5)  # SW_SHOW
+    ctypes.windll.user32.SetForegroundWindow(hwnd)
+    ctypes.windll.user32.BringWindowToTop(hwnd)
+    return True
+
+
 
 class WorkerSignals(QObject):
     error = pyqtSignal(str)
@@ -9338,6 +9381,9 @@ def run_gui():
 
     instance_lock = acquire_instance_lock()
     if instance_lock is None:
+        # 已有实例在运行：将其主窗口带到前台（最小化/隐藏则先恢复显示）
+        if _activate_existing_instance("表格自动发送"):
+            return
         QMessageBox.information(
             None,
             "程序正在运行",
