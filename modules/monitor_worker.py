@@ -322,52 +322,76 @@ class MonitorWorker(QThread):
                     logger.exception("写入智能表格失败 %s", task.name)
                     self.emit(f"{log_prefix} 任务「{task.name}」写入智能表格失败: {exc}")
 
-        any_failed = False  # 微信推送 或 智能表格写入 任一失败即视为本次未完成 → 保留基线重试
-
         self.emit(f"{log_prefix} 任务「{task.name}」文件「{name}」检出新增 {len(new_rows)} 条，清洗后保留 {len(clean_rows)} 条，开始推送…")
 
-        # 全局发送批次锁：与其他发送任务（手动/定时/链路）排队串行，
-        # 避免多个 worker 同时驱动同一份微信句柄导致窗口争抢发错对象。
-        # 排队无时间上限；队列期间被停止则返回 None（跳过本轮）。
-        acquired = WeChatSender.acquire_batch(
-            log_fn=lambda m: self.emit(m),
-            should_stop=lambda: self._stop,
-        )
-        if not acquired:
-            self.emit(f"{log_prefix} 任务「{task.name}」已停止，取消排队")
-            return None
+        # 企业微信 webhook 发送（v1.8.0）：纯 HTTP，不占用微信发送批次锁。
+        # 企微失败不参与 any_failed/基线推进/连败计数——否则企微失败会让下轮把同批
+        # 数据重复发给已成功的微信；企微失败只记日志并触发失败通知（有通知兜底）。
+        wxwork_failed = False
+        if task.wxwork_enabled and task.wxwork_webhook and clean_rows:
+            try:
+                ok, detail = self._send_wecom(
+                    task, texts, png_path, out_file, fp, log_prefix)
+                if not ok:
+                    wxwork_failed = True
+                    self.emit(f"{log_prefix} 任务「{task.name}」企业微信发送失败: {detail}")
+            except Exception as exc:
+                wxwork_failed = True
+                logger.exception("企业微信发送失败 %s", task.name)
+                self.emit(f"{log_prefix} 任务「{task.name}」企业微信发送失败: {exc}")
+        elif task.wxwork_enabled and clean_rows:
+            self.emit(f"{log_prefix} 任务「{task.name}」已勾选企业微信发送但 webhook 为空，跳过企微渠道")
+
+        any_failed = False  # 微信推送 或 智能表格写入 任一失败即视为本次未完成 → 保留基线重试
+
         msg_delivered = 0
         msg_failed = 0
-        # v1.5.0 批处理合并：文字/图片/附件合并为一次粘贴 + 一次 Enter 发送（text+files 混合
-        # 走两步粘贴、一次 Enter），绝不逐条发送；与本轮内容同批推送，保持消息完整。
-        # 粘贴顺序按任务配置 send_order（文字/图片/文件）联动：文字在前 → 先粘文字再粘文件。
-        text = "\n".join(texts) if texts else None
-        files, text_first = self._resolve_send_order(task, png_path, out_file)
-        try:
-            for person in task.recipients:
-                if self._stop or not person or not clean_rows:
-                    continue
-                try:
-                    self._send_merged(person, text, files, task, log_prefix, text_first)
-                    msg_delivered += 1
-                except Exception as exc:
-                    msg_failed += 1
-                    logger.exception("推送失败 %s", person)
-                    self.emit(f"{log_prefix} → 「{person}」推送失败: {exc}")
-        finally:
-            # 释放全局发送批次锁（推送结束/异常都必须放锁，避免后续任务死等）
+        if task.wx_enabled and task.recipients and clean_rows:
+            # 全局发送批次锁：与其他发送任务（手动/定时/链路）排队串行，
+            # 避免多个 worker 同时驱动同一份微信句柄导致窗口争抢发错对象。
+            # 排队无时间上限；队列期间被停止则返回 None（跳过本轮）。
+            acquired = WeChatSender.acquire_batch(
+                log_fn=lambda m: self.emit(m),
+                should_stop=lambda: self._stop,
+            )
+            if not acquired:
+                self.emit(f"{log_prefix} 任务「{task.name}」已停止，取消排队")
+                return None
+            # v1.5.0 批处理合并：文字/图片/附件合并为一次粘贴 + 一次 Enter 发送（text+files 混合
+            # 走两步粘贴、一次 Enter），绝不逐条发送；与本轮内容同批推送，保持消息完整。
+            # 粘贴顺序按任务配置 send_order（文字/图片/文件）联动：文字在前 → 先粘文字再粘文件。
+            # v1.8.0 源文件发送：勾选后把本轮检出的最新源 Excel 随附件一并发给各接收人。
+            text = "\n".join(texts) if texts else None
+            files, text_first = self._resolve_send_order(task, png_path, out_file)
+            if task.send_source_file and fp and os.path.exists(fp):
+                files = list(files) + [fp]
             try:
-                WeChatSender.release_batch()
-            except Exception:
-                pass
-            # 发送完成后按配置最小化微信（隐私保护），避免窗口长时间停留前台/全屏
-            if task.minimize_after and (msg_delivered or msg_failed):
+                for person in task.recipients:
+                    if self._stop or not person or not clean_rows:
+                        continue
+                    try:
+                        self._send_merged(person, text, files, task, log_prefix, text_first)
+                        msg_delivered += 1
+                    except Exception as exc:
+                        msg_failed += 1
+                        logger.exception("推送失败 %s", person)
+                        self.emit(f"{log_prefix} → 「{person}」推送失败: {exc}")
+            finally:
+                # 释放全局发送批次锁（推送结束/异常都必须放锁，避免后续任务死等）
                 try:
-                    WeChatSender.shared_instance().minimize_window()
+                    WeChatSender.release_batch()
                 except Exception:
                     pass
+                # 发送完成后按配置最小化微信（隐私保护），避免窗口长时间停留前台/全屏
+                if task.minimize_after and (msg_delivered or msg_failed):
+                    try:
+                        WeChatSender.shared_instance().minimize_window()
+                    except Exception:
+                        pass
         # 微信推送 或 智能表格写入 任一失败即视为本次未完成 → 保留基线重试
         any_failed = bool(msg_failed or airsync_failed)
+        # v1.8.0：企微失败不推进基线/连败，仅参与失败通知判定（有独立 webhook 兜底）
+        notify_failed = any_failed or wxwork_failed
 
         # 连续失败计数：发送/写入全部成功则清零；任一失败则累加并记录当前失败文件。
         # 从「未暂停」刚达到阈值（fail_streak 从 <N 升到 >=N）的边沿只发一次暂停信号，
@@ -402,6 +426,30 @@ class MonitorWorker(QThread):
                 self.emit(f"{log_prefix} 任务「{task.name}」存在失败（微信/写入智能表格），不标记已见文件，下次轮询将重试推送")
         self.store.save(task)
 
+        # v1.8.0：任一渠道发送失败（微信/智能表格/企微）时，按配置向独立 webhook 推送失败摘要。
+        # 纯 HTTP，不占用批次锁；失败只记日志，不影响本轮基线推进结果。
+        if notify_failed and task.wxwork_fail_enabled and task.wxwork_fail_webhook:
+            try:
+                from . import wecom_sender
+                lines = [
+                    "监控发送失败通知",
+                    f"任务: {task.name}",
+                    f"源文件: {name}",
+                    f"微信失败接收人: {msg_failed}",
+                    f"企业微信失败: {'是' if wxwork_failed else '否'}",
+                    f"智能表格写入失败: {'是' if airsync_failed else '否'}",
+                    f"时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                ]
+                ok, detail = wecom_sender.send_failure_notice(
+                    task.wxwork_fail_webhook, lines)
+                if ok:
+                    self.emit(f"{log_prefix} 任务「{task.name}」已发送失败通知到企微 webhook")
+                else:
+                    self.emit(f"{log_prefix} 任务「{task.name}」发送失败通知到企微 webhook 失败: {detail}")
+            except Exception as exc:
+                logger.exception("发送企微失败通知失败 %s", task.name)
+                self.emit(f"{log_prefix} 任务「{task.name}」发送失败通知到企微 webhook 失败: {exc}")
+
         # 清理临时图/表：延迟 15s 再删。wxauto 的 SendFiles 返回时微信只是开始异步上传，
         # 立即删除会导致上传读到一半文件消失而发送失败。
         # 注意：threading.Timer 不接受 daemon 直接关键字（daemon 只支持经 kwargs 传入，
@@ -433,6 +481,10 @@ class MonitorWorker(QThread):
             self.emit(f"{log_prefix} 任务「{task.name}」推送完成，接收人 {msg_delivered} 个")
         elif msg_failed:
             self.emit(f"{log_prefix} 任务「{task.name}」所有接收人推送均失败")
+        elif not task.wx_enabled:
+            self.emit(f"{log_prefix} 任务「{task.name}」微信渠道未启用，跳过微信发送")
+        elif not task.recipients:
+            self.emit(f"{log_prefix} 任务「{task.name}」未配置微信接收人，跳过微信发送")
         else:
             self.emit(f"{log_prefix} 任务「{task.name}」无可用接收人，跳过发送；已记录处理进度")
         return (msg_delivered, msg_failed)
@@ -519,6 +571,41 @@ class MonitorWorker(QThread):
             self.emit(f"{prefix} → 「{person}」已发送{len(names)}个文件")
         else:
             self.emit(f"{prefix} → 「{person}」已发送文字")
+
+    def _send_wecom(self, task: MonitorTask, texts, png_path, out_file,
+                    source_fp: str, prefix: str):
+        """企业微信群机器人 webhook 发送（v1.8.0）：纯 HTTP，不占用微信批次锁。
+
+        内容复用本轮生成的文字/图片/表格文件；勾选「发送源文件」时把最新源 Excel 一并发送。
+        任一子项失败即返回 (False, 失败详情)，由调用方记录日志并触发失败通知。
+        """
+        from . import wecom_sender
+
+        items = []  # (标签, 发送函数)
+        if task.send_text and texts:
+            items.append(("文字", lambda: wecom_sender.send_text(
+                task.wxwork_webhook, "\n".join(texts))))
+        if task.send_image and png_path and os.path.exists(png_path):
+            items.append(("图片", lambda: wecom_sender.send_image(
+                task.wxwork_webhook, png_path)))
+        if task.send_file and out_file and os.path.exists(out_file):
+            items.append(("表格文件", lambda: wecom_sender.send_file(
+                task.wxwork_webhook, out_file)))
+        if task.send_source_file and source_fp and os.path.exists(source_fp):
+            items.append(("源文件", lambda: wecom_sender.send_file(
+                task.wxwork_webhook, source_fp)))
+        if not items:
+            return True, "无内容可发"
+        for label, send in items:
+            try:
+                ok, detail = send()
+            except Exception as exc:
+                logger.exception("企微发送%s失败 %s", label, task.name)
+                return False, f"{label}: {exc}"
+            if not ok:
+                return False, f"{label}: {detail}"
+            self.emit(f"{prefix} 任务「{task.name}」企业微信已发送{label}")
+        return True, "ok"
 
     def emit(self, msg: str) -> None:
         self.log.emit(msg)

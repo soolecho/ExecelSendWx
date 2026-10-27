@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
-MONITOR_VERSION = 8
+MONITOR_VERSION = 9
 
 
 def _default_send_order() -> List[str]:
@@ -214,6 +214,14 @@ class MonitorTask:
     # 同一批因微信发送失败保留基线重试时，若行键与已写标记一致则跳过 airsync 重复写入；
     # 微信发送全部成功后随基线推进一并清空。旧配置默认空 = 正常写入。
     airsync_written_keys: List[str] = field(default_factory=list)
+    # 发送渠道（v1.8.0）：微信发送开关（默认开，兼容旧配置）；企业微信 webhook 群机器人发送。
+    # 两渠道各自独立开关，可单用可同用；企微发送为纯 HTTP，不占用微信发送批次锁。
+    wx_enabled: bool = True
+    wxwork_enabled: bool = False
+    wxwork_webhook: str = ""          # 企微群机器人 webhook（含 key）
+    wxwork_fail_enabled: bool = False # 发送失败时向另一个 webhook 推送失败摘要的开关
+    wxwork_fail_webhook: str = ""     # 失败通知 webhook
+    send_source_file: bool = False    # 源文件发送：把本轮检出的最新源 Excel 随渠道一起发
     # 连续发送失败暂停重试：fail_streak 记录连续失败次数，达到阈值后暂停自动重试
     # 「该批次旧内容」；fail_file 记录最近一次失败处理的文件名，用于判定下轮是否仍是
     # 同一批旧内容（新文件到来自动清零恢复）。旧配置默认 0/空，不影响既有行为。
@@ -321,6 +329,12 @@ class MonitorTask:
             ],
             fail_streak=max(0, _i("fail_streak", 0)),
             fail_file=_s("fail_file"),
+            wx_enabled=_b("wx_enabled", True),
+            wxwork_enabled=_b("wxwork_enabled", False),
+            wxwork_webhook=_s("wxwork_webhook"),
+            wxwork_fail_enabled=_b("wxwork_fail_enabled", False),
+            wxwork_fail_webhook=_s("wxwork_fail_webhook"),
+            send_source_file=_b("send_source_file", False),
             created_at=_s("created_at"),
             updated_at=_s("updated_at"),
         )

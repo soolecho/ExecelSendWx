@@ -6491,6 +6491,53 @@ class MonitorTab(QWidget):
         order_row.addWidget(self.send_order_combo, 1)
         send_layout.addLayout(order_row)
 
+        # 发送渠道（v1.8.0）：微信 / 企业微信 webhook 各自独立开关，可单用可同用。
+        self.wx_enabled_check = QCheckBox("微信发送")
+        self.wx_enabled_check.setChecked(True)
+        self.wx_enabled_check.setToolTip("通过个人微信发送（原发送方式）；取消勾选则本任务只走企业微信")
+        send_layout.addWidget(self.wx_enabled_check)
+
+        self.wxwork_check = QCheckBox("企业微信Webhook发送")
+        self.wxwork_check.setToolTip(
+            "通过企业微信群机器人 webhook 发送（纯 HTTP，无需微信客户端）。\n"
+            "内容复用上方勾选：推送文字/图片/表格文件均会发到企微群。")
+        send_layout.addWidget(self.wxwork_check)
+
+        self.wxwork_detail = QWidget()
+        wdl = QVBoxLayout(self.wxwork_detail)
+        wdl.setContentsMargins(0, 0, 0, 0)
+
+        row_web = QHBoxLayout()
+        row_web.addWidget(QLabel("Webhook:"))
+        self.wxwork_webhook_edit = QLineEdit()
+        self.wxwork_webhook_edit.setPlaceholderText("企微群机器人 webhook 地址（含 key）")
+        row_web.addWidget(self.wxwork_webhook_edit, 1)
+        wdl.addLayout(row_web)
+
+        fail_row = QHBoxLayout()
+        self.wxwork_fail_check = QCheckBox("失败时企微通知")
+        self.wxwork_fail_check.setToolTip("任一发送渠道（微信/企微）发送失败时，向下方通知 webhook 推送失败摘要")
+        fail_row.addWidget(self.wxwork_fail_check)
+        self.wxwork_fail_webhook_edit = QLineEdit()
+        self.wxwork_fail_webhook_edit.setPlaceholderText("失败通知 webhook（可换一个群）")
+        self.wxwork_fail_webhook_edit.setEnabled(False)
+        fail_row.addWidget(self.wxwork_fail_webhook_edit, 1)
+        wdl.addLayout(fail_row)
+
+        self.wxwork_hint = QLabel("企微发送不占用微信发送批次锁；发送失败只记日志并触发失败通知，不影响微信基线重试语义。")
+        self.wxwork_hint.setWordWrap(True)
+        self.wxwork_hint.setStyleSheet("color: #808080;")
+        wdl.addWidget(self.wxwork_hint)
+
+        self.wxwork_detail.setVisible(False)
+        send_layout.addWidget(self.wxwork_detail)
+        self.wxwork_check.toggled.connect(self._on_wxwork_toggled)
+        self.wxwork_fail_check.toggled.connect(self._on_wxwork_fail_toggled)
+
+        self.send_source_check = QCheckBox("发送源文件")
+        self.send_source_check.setToolTip("把本轮监控检出的最新源文件（Excel）作为附件，随已开启渠道一起发送（微信/企微均发）")
+        send_layout.addWidget(self.send_source_check)
+
         # 写入智能表格（AirScript webhook，独立可选出口）：勾选后显示配置。
         self.airsync_check = QCheckBox("写入智能表格(AirScript)")
         self.airsync_check.setToolTip(
@@ -6811,6 +6858,12 @@ class MonitorTab(QWidget):
         self.airsync_sheet_edit.textChanged.connect(mark)
         self.airsync_start_col_spin.valueChanged.connect(mark)
         self.airsync_col_count_spin.valueChanged.connect(mark)
+        self.wx_enabled_check.stateChanged.connect(mark)
+        self.wxwork_check.stateChanged.connect(mark)
+        self.wxwork_webhook_edit.textChanged.connect(mark)
+        self.wxwork_fail_check.stateChanged.connect(mark)
+        self.wxwork_fail_webhook_edit.textChanged.connect(mark)
+        self.send_source_check.stateChanged.connect(mark)
         self.text_title_edit.textChanged.connect(mark)
         self.text_detail_check.stateChanged.connect(mark)
         self.remark_edit.textChanged.connect(mark)
@@ -6910,6 +6963,14 @@ class MonitorTab(QWidget):
     def _on_airsync_toggled(self, _checked=None):
         # 勾选「写入智能表格」才显示其配置区（程序填充阶段无需额外处理）
         self.airsync_detail.setVisible(self.airsync_check.isChecked())
+
+    def _on_wxwork_toggled(self, _checked=None):
+        # 勾选「企业微信Webhook发送」才显示其配置区（程序填充阶段无需额外处理）
+        self.wxwork_detail.setVisible(self.wxwork_check.isChecked())
+
+    def _on_wxwork_fail_toggled(self, _checked=None):
+        # 勾选「失败时企微通知」才启用通知 webhook 输入框
+        self.wxwork_fail_webhook_edit.setEnabled(self.wxwork_fail_check.isChecked())
 
     def _refresh_snapshot_hint(self):
         # 开启对比时提示该功能不生效（与关闭对比模式并存，用户自由选择）
@@ -7151,6 +7212,14 @@ class MonitorTab(QWidget):
             self.airsync_start_col_spin.setValue(task.airsync_start_col)
             self.airsync_col_count_spin.setValue(task.airsync_col_count)
             self.airsync_detail.setVisible(task.airsync_enabled)
+            self.wx_enabled_check.setChecked(getattr(task, "wx_enabled", True))
+            self.wxwork_check.setChecked(task.wxwork_enabled)
+            self.wxwork_webhook_edit.setText(task.wxwork_webhook)
+            self.wxwork_fail_check.setChecked(task.wxwork_fail_enabled)
+            self.wxwork_fail_webhook_edit.setText(task.wxwork_fail_webhook)
+            self.wxwork_fail_webhook_edit.setEnabled(task.wxwork_fail_enabled)
+            self.wxwork_detail.setVisible(task.wxwork_enabled)
+            self.send_source_check.setChecked(task.send_source_file)
             self.include_subdir_check.setChecked(task.include_subdir)
             # 列设置：勾选清洗/保留/对比列，并应用统一清洗方式
             self.strip_space_check.setChecked(True)
@@ -7236,6 +7305,12 @@ class MonitorTab(QWidget):
         task.airsync_sheet = self.airsync_sheet_edit.text().strip()
         task.airsync_start_col = self.airsync_start_col_spin.value()
         task.airsync_col_count = self.airsync_col_count_spin.value()
+        task.wx_enabled = self.wx_enabled_check.isChecked()
+        task.wxwork_enabled = self.wxwork_check.isChecked()
+        task.wxwork_webhook = self.wxwork_webhook_edit.text().strip()
+        task.wxwork_fail_enabled = self.wxwork_fail_check.isChecked()
+        task.wxwork_fail_webhook = self.wxwork_fail_webhook_edit.text().strip()
+        task.send_source_file = self.send_source_check.isChecked()
         task.include_subdir = self.include_subdir_check.isChecked()
         task.compare_columns = self._selected_cols(self.compare_cols_list)
         task.extract_columns = self._selected_cols(self.extract_cols_list)
@@ -7375,6 +7450,14 @@ class MonitorTab(QWidget):
             self.airsync_start_col_spin.setValue(1)
             self.airsync_col_count_spin.setValue(0)
             self.airsync_detail.setVisible(False)
+            self.wx_enabled_check.setChecked(True)
+            self.wxwork_check.setChecked(False)
+            self.wxwork_webhook_edit.clear()
+            self.wxwork_fail_check.setChecked(False)
+            self.wxwork_fail_webhook_edit.clear()
+            self.wxwork_fail_webhook_edit.setEnabled(False)
+            self.wxwork_detail.setVisible(False)
+            self.send_source_check.setChecked(False)
             self.include_subdir_check.setChecked(False)
             self.strip_space_check.setChecked(True)
             self.digits_check.setChecked(False)
