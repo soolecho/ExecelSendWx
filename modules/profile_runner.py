@@ -132,7 +132,7 @@ def _resolve_send_order(send):
         order = [
             str(k).strip()
             for k in raw_order
-            if str(k).strip() in ("text", "image", "custom", "attachment")
+            if str(k).strip() in ("text", "image", "region", "custom", "attachment")
         ]
         if custom_enabled and custom_msg and "custom" not in order:
             order.append("custom")
@@ -222,6 +222,43 @@ def prepare_profile(profile, log_fn=None):
         log(f"工作表“{sheet_name}”解析完成（{time.time() - t0:.0f}秒）")
         if not rows:
             raise ProfilePrepareError(f"工作表 {sheet_name} 为空")
+
+        # 1.5) 指定区域截图：源表整表网格 → 图片数据（每个接收人同一张区域图）。
+        #      云文档在上方已下载解析，本地/云端两条路径完全一致。
+        #      region_sheet 可指定另一个工作表（如数据表是汇总、截图发明细），
+        #      与提取数据所用的 sheet 无关；留空 = 用当前数据表。
+        region_range = str(send.get("region_range", "") or "").strip()
+        region_sheet = str(send.get("region_sheet", "") or "").strip()
+        region_data = None
+        if "region" in (send.get("send_order") or []):
+            try:
+                from modules.monitor_engine import region_table_data
+                region_grid = rows
+                if region_sheet and region_sheet != sheet_name:
+                    try:
+                        alt = read_one_sheet(
+                            workbook_path, region_sheet, log_fn=log
+                        )
+                        if alt:
+                            region_grid = alt
+                            log(f"指定区域截图使用工作表: {region_sheet}")
+                        else:
+                            log(f"⚠ 区域工作表 {region_sheet} 为空，改用 {sheet_name}")
+                    except Exception as exc:
+                        log(f"⚠ 读取区域工作表 {region_sheet} 失败，改用 {sheet_name}: {exc}")
+                region_data = region_table_data(region_grid, region_range)
+                if region_data:
+                    log(
+                        f"指定区域截图: {region_sheet or sheet_name}"
+                        f" / {region_range or '整表已用区域'}，"
+                        f"共 {len(region_data['rows'])} 行 / "
+                        f"{len(region_data['headers'])} 列"
+                    )
+                else:
+                    log("⚠ 指定区域截图无有效内容，本次不发送区域图")
+            except Exception as exc:
+                log(f"⚠ 指定区域截图解析失败: {exc}")
+                region_data = None
 
         # 2) 表头行 + 处理器
         header_row = max(1, int(excel.get("header_row", 1) or 1))
@@ -383,6 +420,7 @@ def prepare_profile(profile, log_fn=None):
                     "table_data": table_data,
                     "recipient": recipient,    # 实际微信接收人
                     "custom_msg": custom_msg,
+                    "region_data": region_data,
                 })
 
         if not tasks:
@@ -392,11 +430,16 @@ def prepare_profile(profile, log_fn=None):
         if attachment and not os.path.exists(attachment):
             log(f"附加文件不存在，将不带附件发送: {attachment}")
 
+        send_order = _resolve_send_order(send)
+        if not region_data:
+            # 区域图无有效内容：从顺序中剔除，避免生成空步骤
+            send_order = [k for k in send_order if k != "region"]
+
         return {
             "title": title,
             "sheet": sheet_name,
             "tasks": tasks,
-            "send_order": _resolve_send_order(send),
+            "send_order": send_order,
             "attachment": attachment,
             "send_interval": max(0.0, min(30.0, float(send.get("interval", 0.5)))),
             "chat_delay": max(0.0, min(10.0, float(send.get("chat_delay", 0.3)))),

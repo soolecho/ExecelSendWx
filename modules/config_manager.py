@@ -162,6 +162,10 @@ class ConfigManager:
                 "custom_message": str(send.get("custom_message", "")),
                 "send_order": cls._normalize_send_order(send.get("send_order")),
                 "attachment": str(send.get("attachment", "")).strip(),
+                # 指定区域截图范围（如 A1:F20；留空=整表已用区域）
+                "region_range": str(send.get("region_range", "") or "").strip(),
+                # 指定区域截图所用工作表（留空=当前数据表；可与提取数据的工作表不同）
+                "region_sheet": str(send.get("region_sheet", "") or "").strip(),
                 # 加载该配置后自动全选筛选人员并直接发送（无需手动点发送）
                 "auto_send": bool(send.get("auto_send", False)),
             },
@@ -172,7 +176,7 @@ class ConfigManager:
     @staticmethod
     def _normalize_send_order(raw_order):
         """规范化发送顺序：只保留合法 key，去重保序。"""
-        valid = {"text", "image", "custom", "attachment"}
+        valid = {"text", "image", "region", "custom", "attachment"}
         if not isinstance(raw_order, list):
             return None
         seen = set()

@@ -244,7 +244,30 @@ class MonitorWorker(QThread):
         snapshot_rows: Optional[List[List[str]]] = None
         if getattr(task, "snapshot_enabled", False):
             if not task.compare_enabled:
-                grid = [list(headers)] + [list(r) for r in all_rows]  # 整表已用区域（含表头行）
+                # 截图可指定另一个工作表：留空/与数据表相同 → 用当前读入的整表
+                snap_sheet = (getattr(task, "snapshot_sheet", "") or "").strip()
+                snap_headers, snap_rows = headers, all_rows
+                if snap_sheet and snap_sheet != (task.sheet_name or "").strip():
+                    try:
+                        names = monitor_engine.wps_cloud.read_sheet_names(
+                            fp, log_fn=lambda m: logger.info("monitor: %s", m))
+                        if names and snap_sheet not in names:
+                            self.emit(
+                                f"{log_prefix} ⚠ 任务「{task.name}」截图工作表「{snap_sheet}」不存在，"
+                                f"改用数据表「{task.sheet_name or '第一个 sheet'}」")
+                        else:
+                            snap_headers, snap_rows = monitor_engine.read_sheet_rows(
+                                fp, sheet_name=snap_sheet,
+                                log_fn=lambda m: logger.info("monitor: %s", m),
+                            )
+                            self.emit(
+                                f"{log_prefix} 任务「{task.name}」区域截图使用工作表: {snap_sheet}")
+                    except Exception as exc:
+                        snap_headers, snap_rows = headers, all_rows
+                        self.emit(
+                            f"{log_prefix} ⚠ 任务「{task.name}」读取截图工作表「{snap_sheet}」失败，"
+                            f"改用数据表: {exc}")
+                grid = [list(snap_headers)] + [list(r) for r in snap_rows]  # 整表已用区域（含表头行）
                 region = monitor_engine.parse_region(getattr(task, "snapshot_range", ""))
                 if region:
                     region_rows = monitor_engine.slice_region(grid, *region)

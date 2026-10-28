@@ -884,7 +884,7 @@ class SendWorker(QThread):
         # 去重保序，只保留合法类型
         self.send_order = []
         for k in order:
-            if k in ("text", "image", "custom", "attachment") and k not in self.send_order:
+            if k in ("text", "image", "region", "custom", "attachment") and k not in self.send_order:
                 self.send_order.append(k)
         self.signals = WorkerSignals()
         self.paused_event = threading.Event()
@@ -893,7 +893,9 @@ class SendWorker(QThread):
     def _normalize_task(self, task):
         if isinstance(task, dict):
             if "pending_steps" not in task:
-                task["pending_steps"] = self._create_steps(task.get("custom_msg", ""))
+                task["pending_steps"] = self._create_steps(
+                    task.get("custom_msg", ""), task.get("region_data")
+                )
             return task
 
         name, person_data, table_data, recipient, custom_msg = task
@@ -906,12 +908,14 @@ class SendWorker(QThread):
             "pending_steps": self._create_steps(custom_msg)
         }
 
-    def _create_steps(self, custom_msg):
+    def _create_steps(self, custom_msg, region_data=None):
         """按用户配置的发送顺序生成步骤；内容为空的步骤跳过。"""
         steps = []
         for kind in self.send_order:
             if kind == "image":
                 steps.append({"type": "image", "index": 0})
+            elif kind == "region" and region_data:
+                steps.append({"type": "region", "index": 0})
             elif kind == "text":
                 steps.append({"type": "text", "index": 0})
             elif kind == "custom" and custom_msg:
@@ -1773,6 +1777,8 @@ class TableFilterTab(QWidget):
         self.cloud_file_name = ""
         # 在线表格一次下载全部 sheet 后缓存在内存，切 sheet 不重复下载
         self._cloud_sheets_cache = {}
+        # 指定区域截图可选用「另一个工作表」：本地文件按需读取后缓存，避免重复解析
+        self._region_sheet_cache = {}
         self.cloud_worker = None
         self._cloud_list_worker = None
         self.excel_worker = None
@@ -2061,11 +2067,12 @@ class TableFilterTab(QWidget):
         send_layout.addLayout(send_mode_layout)
         order_row = QHBoxLayout()
         self.send_order_list = QListWidget()
-        self.send_order_list.setMaximumHeight(92)
+        self.send_order_list.setMaximumHeight(120)
         # 顺序即发送先后：每项带勾选框表示是否发送该内容
         self._ORDER_ITEMS = [
             ("text", "表格文字（提取的数据）"),
             ("image", "表格图片（数据截图）"),
+            ("region", "指定区域截图（Excel 区域）"),
             ("custom", "自定义消息"),
             ("attachment", "附加文件"),
         ]
@@ -2086,6 +2093,26 @@ class TableFilterTab(QWidget):
         order_btns.addStretch()
         order_row.addLayout(order_btns)
         send_layout.addLayout(order_row)
+        # 指定区域截图：勾选后把源表指定区域原样渲染成图片发送（在线文档同样适用，
+        # 因为数据已下载到本地并解析成表格矩阵）。留空 = 整表已用区域。
+        region_row = QHBoxLayout()
+        region_row.addWidget(QLabel("指定区域(如 A1:F20):"))
+        self.region_range_edit = QLineEdit()
+        self.region_range_edit.setPlaceholderText(
+            "留空=整表已用区域；区域第一行作为图片表头；每个接收人发送同一张区域图"
+        )
+        self.region_range_edit.setEnabled(False)
+        region_row.addWidget(self.region_range_edit, 1)
+        # 区域截图可选另一个工作表（如数据表是「汇总」、截图要发「明细」）
+        region_row.addWidget(QLabel("工作表:"))
+        self.region_sheet_combo = QComboBox()
+        self.region_sheet_combo.addItem("（当前数据表）", "")
+        self.region_sheet_combo.setEnabled(False)
+        self.region_sheet_combo.setToolTip(
+            "留空/（当前数据表）= 用当前加载数据的工作表；也可选择其他工作表作为截图来源"
+        )
+        region_row.addWidget(self.region_sheet_combo, 0)
+        send_layout.addLayout(region_row)
         # 保留一个隐藏兼容属性：部分旧逻辑读取 send_mode_combo 时不再报错
         self.send_mode_combo = None
 
@@ -2549,6 +2576,10 @@ class TableFilterTab(QWidget):
                 ),
                 "custom_message": self.custom_msg_edit.toPlainText(),
                 "attachment": self.attachment_edit.text().strip(),
+                # 指定区域截图范围（如 A1:F20；留空=整表已用区域）
+                "region_range": self.region_range_edit.text().strip(),
+                # 区域截图所用工作表（留空=当前数据表；可与提取数据的工作表不同）
+                "region_sheet": str(self.region_sheet_combo.currentData() or ""),
                 "auto_send": self.auto_send_check.isChecked(),
             },
             "filter_conditions": filter_conditions,
@@ -2856,6 +2887,15 @@ class TableFilterTab(QWidget):
         self.attachment_edit.setText(
             send_settings.get("attachment", "") or ""
         )
+        self.region_range_edit.setText(
+            str(send_settings.get("region_range", "") or "").strip()
+        )
+        # 区域截图工作表：配置里的 sheet 不在当前工作簿时回退「（当前数据表）」
+        want_region_sheet = str(
+            send_settings.get("region_sheet", "") or ""
+        ).strip()
+        idx = self.region_sheet_combo.findData(want_region_sheet) if want_region_sheet else 0
+        self.region_sheet_combo.setCurrentIndex(idx if idx is not None and idx >= 0 else 0)
         self.auto_send_check.setChecked(
             bool(send_settings.get("auto_send", False))
         )
@@ -3551,6 +3591,9 @@ class TableFilterTab(QWidget):
                 self.send_order_list.blockSignals(False)
         if key == "custom":
             self.custom_msg_edit.setEnabled(checked)
+        elif key == "region":
+            self.region_range_edit.setEnabled(checked)
+            self.region_sheet_combo.setEnabled(checked)
 
     def _set_send_order(self, order_keys):
         """按给定顺序重建列表行并设置勾选状态。"""
@@ -3575,6 +3618,8 @@ class TableFilterTab(QWidget):
         finally:
             self.send_order_list.blockSignals(False)
         self.custom_msg_edit.setEnabled("custom" in enabled)
+        self.region_range_edit.setEnabled("region" in enabled)
+        self.region_sheet_combo.setEnabled("region" in enabled)
 
     def _move_order_item(self, delta):
         row = self.send_order_list.currentRow()
@@ -3589,14 +3634,18 @@ class TableFilterTab(QWidget):
 
     def _on_send_order_item_changed(self, item):
         # 自定义消息勾选状态联动编辑框可用性 + 顶部复选框
-        if item.data(Qt.ItemDataRole.UserRole) == "custom":
-            checked = item.checkState() == Qt.CheckState.Checked
+        key = item.data(Qt.ItemDataRole.UserRole)
+        checked = item.checkState() == Qt.CheckState.Checked
+        if key == "custom":
             self.custom_msg_edit.setEnabled(checked)
             self.custom_msg_checkbox.blockSignals(True)
             try:
                 self.custom_msg_checkbox.setChecked(checked)
             finally:
                 self.custom_msg_checkbox.blockSignals(False)
+        elif key == "region":
+            self.region_range_edit.setEnabled(checked)
+            self.region_sheet_combo.setEnabled(checked)
 
     def open_extract_columns_dialog(self):
         if not hasattr(self, 'headers') or not self.headers:
@@ -4056,6 +4105,21 @@ class TableFilterTab(QWidget):
         finally:
             self.sheet_combo.blockSignals(False)
 
+        # 区域截图工作表候选：默认「（当前数据表）」，其余为本工作簿的 sheet
+        prev_region_sheet = self.region_sheet_combo.currentData() or ""
+        self.region_sheet_combo.blockSignals(True)
+        try:
+            self.region_sheet_combo.clear()
+            self.region_sheet_combo.addItem("（当前数据表）", "")
+            for name in self.sheet_names:
+                self.region_sheet_combo.addItem(name, name)
+            idx = self.region_sheet_combo.findData(prev_region_sheet)
+            self.region_sheet_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            self.region_sheet_combo.blockSignals(False)
+        # 新文件加载：清空区域工作表缓存（本地文件按需读取）
+        self._region_sheet_cache = {}
+
         self._update_column_combos()
         if not self._apply_pending_config(worker):
             if self.data_source == "wps_cloud":
@@ -4239,6 +4303,49 @@ class TableFilterTab(QWidget):
             self.log_text.document().setMaximumBlockCount(1200)
             self._log_max_lines_applied = True
 
+    def _get_region_grid(self, sheet_name):
+        """取「指定区域截图」所用的整表网格。
+
+        sheet_name 为空（或等于当前数据表）→ 直接用已加载的 table_data；
+        指定其他工作表时：云文档走内存里的全部 sheet 缓存，本地文件从源文件
+        按需读取一次并缓存（同一文件同一 sheet 不重复解析）。
+        """
+        if not sheet_name or sheet_name == (self.current_sheet or ""):
+            return self.table_data or []
+
+        if self.data_source == "wps_cloud":
+            values = (self._cloud_sheets_cache or {}).get(sheet_name)
+            if not values:
+                self.log(f"⚠ 云文档缓存中没有工作表 {sheet_name}，区域截图改用当前数据表")
+                return self.table_data or []
+            self.log(f"区域截图工作表: {sheet_name}（云文档内存缓存）")
+            return values
+
+        cache_key = (self.current_excel_path, sheet_name)
+        cache = getattr(self, "_region_sheet_cache", None)
+        if cache is None:
+            cache = {}
+            self._region_sheet_cache = cache
+        if cache_key in cache:
+            return cache[cache_key]
+
+        path = self.current_excel_path
+        if not path or not os.path.isfile(path):
+            self.log(f"⚠ 源文件不存在，区域截图改用当前数据表: {path}")
+            return self.table_data or []
+        try:
+            from modules.wps_cloud import read_one_sheet
+            t0 = time.time()
+            values = read_one_sheet(path, sheet_name, log_fn=self.log) or []
+            cache[cache_key] = values
+            self.log(
+                f"区域截图工作表: {sheet_name}（本地文件读取，{time.time() - t0:.1f}秒）"
+            )
+            return values
+        except Exception as exc:
+            self.log(f"⚠ 读取区域截图工作表 {sheet_name} 失败，改用当前数据表: {exc}")
+            return self.table_data or []
+
     def send_data(self, auto=False):
         # 并发守卫：手动发送/重试/auto_send 共用同一个微信单例，
         # 两个 worker 同时跑会争抢微信窗口、把消息发错对象。
@@ -4273,14 +4380,39 @@ class TableFilterTab(QWidget):
             custom_msg = self.custom_msg_edit.toPlainText().strip()
         send_order = self._get_send_order()
         attachment_path = self.attachment_edit.text().strip()
+        region_range = self.region_range_edit.text().strip()
+        region_sheet = str(self.region_sheet_combo.currentData() or "").strip()
+
+        # 指定区域截图：把源表指定区域原样渲染成图片（在线文档加载时已下载解析成
+        # 表格矩阵，同样适用）。同一张区域图发给每个接收人（与监控语义一致）。
+        # 区域图可指定另一个工作表（region_sheet），与提取数据的工作表无关。
+        region_data = None
+        if "region" in send_order:
+            try:
+                from modules.monitor_engine import region_table_data
+                grid = self._get_region_grid(region_sheet)
+                region_data = region_table_data(grid, region_range)
+            except Exception as exc:
+                self.log(f"⚠ 指定区域截图解析失败: {exc}")
+                region_data = None
+            if region_data:
+                self.log(
+                    f"指定区域截图: {region_sheet or self.current_sheet or '当前数据表'}"
+                    f" / {region_range or '整表已用区域'}，"
+                    f"共 {len(region_data['rows'])} 行 / "
+                    f"{len(region_data['headers'])} 列"
+                )
+            else:
+                self.log("⚠ 指定区域截图无有效内容，本次不发送区域图")
 
         # 至少要勾选一种实际会发送的内容
         effective_order = [k for k in send_order if not (
             (k == "custom" and not custom_msg)
             or (k == "attachment" and not attachment_path)
+            or (k == "region" and not region_data)
         )]
         if not effective_order:
-            QMessageBox.warning(self, "警告", "请至少勾选一种要发送的内容（表格文字/表格图片/自定义消息/附加文件）")
+            QMessageBox.warning(self, "警告", "请至少勾选一种要发送的内容（表格文字/表格图片/指定区域截图/自定义消息/附加文件）")
             return
         
         tasks = []
@@ -4361,6 +4493,8 @@ class TableFilterTab(QWidget):
                     "table_data": table_data,
                     "recipient": recipient,
                     "custom_msg": custom_msg,
+                    # 指定区域截图的图片数据（{headers, rows}，对每人相同；未勾选为 None）
+                    "region_data": region_data,
                 })
         
         if missing_wechat:
@@ -4378,7 +4512,8 @@ class TableFilterTab(QWidget):
                 break
             confirm_text += f"  • {task['name']} → {task['recipient']}\n"
         confirm_text += f"\n发送间隔: {self.send_interval_spin.value()}秒"
-        _order_label = {"text": "表格文字", "image": "表格图片", "custom": "自定义消息", "attachment": "附加文件"}
+        _order_label = {"text": "表格文字", "image": "表格图片", "region": "指定区域截图",
+                        "custom": "自定义消息", "attachment": "附加文件"}
         confirm_text += "\n发送顺序: " + " → ".join(_order_label.get(k, k) for k in effective_order)
         if custom_msg:
             confirm_text += f"\n包含自定义消息: {custom_msg[:30]}..." if len(custom_msg) > 30 else f"\n包含自定义消息: {custom_msg}"
@@ -6632,6 +6767,15 @@ class MonitorTab(QWidget):
         self.snapshot_range_edit = QLineEdit()
         self.snapshot_range_edit.setPlaceholderText("如 A1:F20；留空 = 整表已用区域")
         row.addWidget(self.snapshot_range_edit, 1)
+        # 截图来源工作表：可与数据表不同（如数据表是汇总、区域图要发明细）
+        row.addWidget(QLabel("工作表:"))
+        self.snapshot_sheet_edit = QLineEdit()
+        self.snapshot_sheet_edit.setPlaceholderText("留空 = 与上方 Sheet 相同")
+        self.snapshot_sheet_edit.setToolTip(
+            "留空 = 用上方「Sheet名称」的数据表；填其他 sheet 名则区域图从该表截取"
+        )
+        self.snapshot_sheet_edit.setMaximumWidth(160)
+        row.addWidget(self.snapshot_sheet_edit, 0)
         self.snapshot_hint = QLabel("⚠ 指定区域截图仅在「关闭对比」模式下生效")
         self.snapshot_hint.setStyleSheet("color:#e08a00; font-size:11px;")
         self.snapshot_hint.setVisible(False)
@@ -6852,6 +6996,7 @@ class MonitorTab(QWidget):
         self.send_order_combo.currentIndexChanged.connect(mark)
         self.snapshot_check.stateChanged.connect(mark)
         self.snapshot_range_edit.textChanged.connect(mark)
+        self.snapshot_sheet_edit.textChanged.connect(mark)
         self.airsync_check.stateChanged.connect(mark)
         self.airsync_webhook_edit.textChanged.connect(mark)
         self.airsync_token_edit.textChanged.connect(mark)
@@ -7199,6 +7344,8 @@ class MonitorTab(QWidget):
             self.limit_count_spin.setValue(task.limit_count)
             self.snapshot_check.setChecked(task.snapshot_enabled)
             self.snapshot_range_edit.setText(task.snapshot_range)
+            self.snapshot_sheet_edit.setText(
+                getattr(task, "snapshot_sheet", "") or "")
             self.text_title_edit.setPlainText(task.text_title)
             self.text_detail_check.setChecked(task.text_detail)
             self.remark_edit.setText(task.remark_text)
@@ -7294,6 +7441,7 @@ class MonitorTab(QWidget):
         task.limit_count = self.limit_count_spin.value()
         task.snapshot_enabled = self.snapshot_check.isChecked()
         task.snapshot_range = self.snapshot_range_edit.text().strip()
+        task.snapshot_sheet = self.snapshot_sheet_edit.text().strip()
         task.text_title = self.text_title_edit.toPlainText().strip()
         task.text_detail = self.text_detail_check.isChecked()
         task.remark_text = self.remark_edit.text().strip()
@@ -7439,6 +7587,7 @@ class MonitorTab(QWidget):
             self.limit_count_spin.setEnabled(False)
             self.snapshot_check.setChecked(False)
             self.snapshot_range_edit.clear()
+            self.snapshot_sheet_edit.clear()
             self.text_title_edit.clear()
             self.text_detail_check.setChecked(True)
             self.remark_edit.clear()

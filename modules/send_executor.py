@@ -12,15 +12,17 @@
 
 import os
 
-VALID_KINDS = ("text", "image", "custom", "attachment")
+VALID_KINDS = ("text", "image", "region", "custom", "attachment")
 
 
-def _create_steps(send_order, custom_msg, attachment):
+def _create_steps(send_order, custom_msg, attachment, region_data=None):
     """按配置的发送顺序生成步骤；内容为空的步骤跳过。"""
     steps = []
     for kind in send_order or []:
         if kind == "image":
             steps.append({"type": "image", "index": 0})
+        elif kind == "region" and region_data:
+            steps.append({"type": "region", "index": 0})
         elif kind == "text":
             steps.append({"type": "text", "index": 0})
         elif kind == "custom" and custom_msg:
@@ -92,7 +94,8 @@ def run_send_tasks(
         # 已带 pending_steps 说明是失败后续发：保留剩余步骤及断点 index
         if not task.get("pending_steps"):
             task["pending_steps"] = _create_steps(
-                order, task.get("custom_msg", ""), attach_path
+                order, task.get("custom_msg", ""), attach_path,
+                task.get("region_data")
             )
         # 每次进入新的发送循环都要重新打开聊天窗口
         task["_chat_opened"] = False
@@ -164,52 +167,66 @@ def run_send_tasks(
                 step_types = [s["type"] for s in steps]
                 has_text = "text" in step_types
                 has_custom = "custom" in step_types
-                has_files = ("image" in step_types) or (
-                    "attachment" in step_types and bool(attach_path)
+                has_files = (
+                    ("image" in step_types)
+                    or ("region" in step_types)
+                    or ("attachment" in step_types and bool(attach_path))
                 )
 
                 if has_files:
-                    # ---------- v1.5.0 批处理合并：文字/自定义文字 + 图片 + 附件 ----------
+                    # ---------- v1.5.0 批处理合并：文字/自定义文字 + 图片/区域图 + 附件 ----------
                     # 合并为一次 send_text_and_files（一次粘贴 + 一次 Enter），绝不逐条发；
                     # 仅当同一内容同时含 text 与 custom 两种文字时才拆两次：
-                    # text+图片+附件一批，custom 单独一批。
-                    images = []
+                    # text+文件批，custom 单独一批。
+                    # region（指定区域截图）与 image 同为图片类内容，按 send_order
+                    # 决定两者及附件卡片在消息里的先后。
+                    files_by_kind = {}
+                    temp_images = []
                     try:
                         if "image" in step_types:
-                            images = list(
+                            imgs = list(
                                 sender._create_table_images(task["table_data"]) or []
                             )
-                            for _p in images:
+                            files_by_kind["image"] = imgs
+                            temp_images.extend(imgs)
+                            for _p in imgs:
                                 _log(
                                     f"{prefix}[{i+1}/{total_count}] 已生成表格图片: {os.path.basename(_p)}"
                                 )
+                        if "region" in step_types:
+                            rimgs = list(
+                                sender._create_table_images(task["region_data"]) or []
+                            )
+                            files_by_kind["region"] = rimgs
+                            temp_images.extend(rimgs)
+                            for _p in rimgs:
+                                _log(
+                                    f"{prefix}[{i+1}/{total_count}] 已生成指定区域截图: {os.path.basename(_p)}"
+                                )
                     except Exception as exc:
                         _log(
-                            f"{prefix}[{i+1}/{total_count}] ❌ 生成表格图片失败: {exc}"
+                            f"{prefix}[{i+1}/{total_count}] ❌ 生成发送图片失败: {exc}"
                         )
-                        for _p in images:
+                        for _p in temp_images:
                             try:
                                 sender._remove_temp_image(_p)
                             except Exception:
                                 pass
                         break
-                    file_paths = images + (
-                        [attach_path]
-                        if "attachment" in step_types and attach_path
-                        else []
-                    )
+                    if "attachment" in step_types and attach_path:
+                        files_by_kind["attachment"] = [attach_path]
+
                     # 发送顺序联动粘贴顺序：按 send_order 中「文字类（text/custom）」
-                    # 与「文件类（image/attachment）」的相对先后，决定两步粘贴谁先谁后
-                    # （文字在前 → 先粘文字再粘文件；文件在前 → 先粘文件再追加文字），
-                    # 以及图片/附件卡片之间谁在前（一次 CF_HDROP 粘贴，卡片顺序=列表顺序）。
+                    # 与「文件类（image/region/attachment）」的相对先后，决定两步粘贴
+                    # 谁先谁后，以及图片/区域图/附件卡片之间的先后（一次粘贴的卡片顺序=列表顺序）。
                     order_kinds = [
                         k for k in (send_order or [])
-                        if k in ("text", "custom", "image", "attachment")
+                        if k in ("text", "custom", "image", "region", "attachment")
                     ]
                     text_first = bool(order_kinds) and order_kinds[0] in ("text", "custom")
-                    if ("attachment" in order_kinds and "image" in order_kinds
-                            and order_kinds.index("attachment") < order_kinds.index("image")):
-                        file_paths = file_paths[len(images):] + file_paths[:len(images)]
+                    file_paths = []
+                    for kind in (order_kinds or ("image", "region", "attachment")):
+                        file_paths.extend(files_by_kind.get(kind, []))
                     # 合并文字：text 形式优先（与 custom 并存时先发 text 批次）；
                     # 仅 custom 时用自定义文字；都没有则纯文件批。
                     if has_text:
@@ -243,8 +260,8 @@ def run_send_tasks(
                             fast_mode=True,
                             stop_event=stop_event,
                         )
-                    # 清理表格图片临时文件（附件是用户文件，不删）
-                    for _p in images:
+                    # 清理生成的表格图片/区域截图临时文件（附件是用户文件，不删）
+                    for _p in temp_images:
                         try:
                             sender._remove_temp_image(_p)
                         except Exception:

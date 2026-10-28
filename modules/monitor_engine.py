@@ -177,6 +177,32 @@ def slice_region(grid: List[List[str]], r0: int, r1: int, c0: int, c1: int) -> L
     return out
 
 
+def region_table_data(grid: List[List[object]], spec: str = "") -> Optional[Dict]:
+    """整表网格 → 「指定区域截图」渲染数据 {headers, rows}。
+
+    与监控「指定区域截图」语义一致：spec 为 "A1:F20" 这样的区域（留空/非法 =
+    整表已用区域），区域第一行作为图片表头，其余为数据行。
+    保留单元格原始值（不预先转字符串），交给图片渲染器统一格式化日期时间。
+    末尾整行为空的行会被裁掉；无有效内容返回 None。
+    """
+    if not grid:
+        return None
+    region = parse_region(spec)
+    if region:
+        r0, r1, c0, c1 = region
+        rows = [list(r[c0:c1]) for r in grid[r0:r1]]
+    else:
+        rows = [list(r) for r in grid]
+    # 裁掉末尾全空行（Excel 已用区域常带空尾行，直接渲染会出现大片空白）
+    while rows and not any(str(c).strip() for c in rows[-1] if c is not None):
+        rows.pop()
+    if not rows:
+        return None
+    width = max(len(r) for r in rows)
+    normalized = [list(r) + [""] * (width - len(r)) for r in rows]
+    return {"headers": normalized[0], "rows": normalized[1:]}
+
+
 # ---------------------------------------------------------------- 内容生成
 def render_rows_text(
     headers: List[str],
