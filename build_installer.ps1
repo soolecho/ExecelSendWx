@@ -119,7 +119,7 @@ $sig = Get-AuthenticodeSignature $installer.FullName
 
 # 生成 GitHub Release 校验清单（供客户端自动更新时校验 SHA256）。
 # 注意：文件名必须与 GitHub 发布资产名（ASCII）一致，哈希取签名后的最终安装包。
-$verMatch = [regex]::Match($installer.Name, '_v(\d+\.\d+\.\d+)\.exe$')
+$verMatch = [regex]::Match($installer.Name, '_v(\d+\.\d+\.\d+)(?:_setup)?\.exe$')
 if ($verMatch.Success) {
     $pubVersion = $verMatch.Groups[1].Value
     $sumsPath = Join-Path $outputDir "SHA256SUMS.txt"
@@ -127,12 +127,16 @@ if ($verMatch.Success) {
     [IO.File]::WriteAllText($sumsPath, $sumsLine + "`n", [Text.Encoding]::ASCII)
     Write-Tee ("SHA256SUMS: {0}" -f $sumsLine)
 
-    # 同时复制一份 ASCII 文件名的安装包（GitHub 发布资产名），
-    # 自动更新按此名称下载；中文名只保留在本地输出。
+    # 发布资产名（ASCII，自动更新按此名称下载）。
+    # installer.iss 已直接以该名字输出，避免签名后再复制/改名；
+    # 若历史脚本输出的是中文名，则仅在名字不同时才复制。
     $asciiName = "ExcelSendWx_v{0}_setup.exe" -f $pubVersion
     $asciiPath = Join-Path $outputDir $asciiName
-    Copy-Item $installer.FullName $asciiPath -Force
-    Write-Tee ("Publish asset (ASCII copy): {0}" -f $asciiPath)
+    if (-not [string]::Equals($installer.Name, $asciiName,
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        Copy-Item $installer.FullName $asciiPath -Force
+    }
+    Write-Tee ("Publish asset: {0}" -f $asciiPath)
 } else {
     Write-Tee "WARN: cannot parse version from installer name, SHA256SUMS not generated"
 }

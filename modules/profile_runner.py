@@ -121,6 +121,30 @@ def _render_weather(custom_msg, log):
         return custom_msg
 
 
+def _render_region_png(workbook_path, sheet_name, region_range, log,
+                       cache_key=""):
+    """按原表样式渲染指定区域 → 稳定的临时 PNG 路径（失败返回 None）。"""
+    try:
+        import hashlib
+        import tempfile
+
+        from modules.region_snapshot import render_region_image
+
+        key = "|".join([cache_key or os.path.abspath(workbook_path),
+                        sheet_name or "", region_range or ""])
+        out_dir = os.path.join(tempfile.gettempdir(), "excel_send_wx_region")
+        os.makedirs(out_dir, exist_ok=True)
+        out_png = os.path.join(
+            out_dir,
+            "region_%s.png" % hashlib.md5(key.encode("utf-8")).hexdigest()[:16],
+        )
+        return render_region_image(workbook_path, sheet_name, region_range,
+                                   out_png, log_fn=log)
+    except Exception as exc:
+        log(f"⚠ 区域截图按原表样式渲染失败: {exc}")
+        return None
+
+
 def _resolve_send_order(send):
     """与 GUI _apply_pending_config 同一套 send_order 兜底/裁剪规则。"""
     custom_enabled = bool(send.get("custom_message_enabled", False))
@@ -248,11 +272,43 @@ def prepare_profile(profile, log_fn=None):
                         log(f"⚠ 读取区域工作表 {region_sheet} 失败，改用 {sheet_name}: {exc}")
                 region_data = region_table_data(region_grid, region_range)
                 if region_data:
+                    # 按源表原始样式（合并单元格/底色/数字格式）渲染成图片；
+                    # 云文档的临时 xlsx 在本函数结束时即删除，所以这里必须
+                    # 提前同步渲染好。渲染只做一次，本批所有接收人共用这张图，
+                    # 整批发完（无论成功/失败）后统一删除。
+                    png = _render_region_png(
+                        workbook_path,
+                        region_sheet or sheet_name,
+                        region_range,
+                        log,
+                        cache_key=(excel.get("cloud_file_id") or "").strip(),
+                    )
+                    if png:
+                        region_data["image_path"] = png
+                    # 记录重渲染规格：源图按批删除后，点「重试」会重新渲染
+                    if source == "wps_cloud":
+                        region_data["render"] = {
+                            "cloud_file_id": (excel.get("cloud_file_id") or "").strip(),
+                            "sheet": region_sheet or sheet_name,
+                            "range": region_range,
+                        }
+                    else:
+                        try:
+                            mtime = int(os.path.getmtime(workbook_path))
+                        except OSError:
+                            mtime = 0
+                        region_data["render"] = {
+                            "source_path": os.path.abspath(workbook_path),
+                            "sheet": region_sheet or sheet_name,
+                            "range": region_range,
+                            "mtime": mtime,
+                        }
                     log(
                         f"指定区域截图: {region_sheet or sheet_name}"
                         f" / {region_range or '整表已用区域'}，"
                         f"共 {len(region_data['rows'])} 行 / "
                         f"{len(region_data['headers'])} 列"
+                        f"{'（按原表样式渲染）' if png else '（样式渲染不可用，改用重绘）'}"
                     )
                 else:
                     log("⚠ 指定区域截图无有效内容，本次不发送区域图")

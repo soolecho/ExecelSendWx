@@ -1,6 +1,7 @@
 from modules.uia_bridge import UiaBridge
 import logging
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -1538,17 +1539,35 @@ class WeChatSender:
         self.log(f"⚠ 临时图片正在被占用，暂时无法删除: {image_path}")
         return False
 
-    def cleanup_temp_images(self):
-        temp_dir = self.get_temp_image_dir()
-        if not os.path.isdir(temp_dir):
-            return
+    def cleanup_temp_images(self, include_region_cache=True):
+        """清理发送临时图片。
 
+        include_region_cache=False 用于「一批发送收尾」：本批的区域截图源图
+        已由 send_executor 按批删除，这里不再全量清缓存，避免误删其他任务
+        （监控轮询复用图 / 配置链已预渲染图）正在用的源图。
+        """
+        temp_dir = self.get_temp_image_dir()
         removed_count = 0
-        for file_name in os.listdir(temp_dir):
-            if not file_name.startswith("wxauto_table_") or not file_name.endswith(".png"):
-                continue
-            if self._remove_temp_image(os.path.join(temp_dir, file_name)):
-                removed_count += 1
+
+        # 表格图 / 区域图发送用的临时副本（正常每批发完就删，这里兜底清理残留）
+        if os.path.isdir(temp_dir):
+            for file_name in os.listdir(temp_dir):
+                if not file_name.endswith(".png"):
+                    continue
+                if not (file_name.startswith("wxauto_table_")
+                        or file_name.startswith("wxauto_region_")):
+                    continue
+                if self._remove_temp_image(os.path.join(temp_dir, file_name)):
+                    removed_count += 1
+
+        # 区域截图「按原表样式渲染」的源图缓存（启动/准备阶段兜底清理；
+        # 发送收尾不清，跨轮复用的缓存由使用方自己按批/按轮删除）
+        if include_region_cache:
+            try:
+                from modules.region_snapshot import cleanup_cache
+                removed_count += cleanup_cache()
+            except Exception as exc:
+                self.log(f"⚠ 区域截图缓存清理失败: {exc}")
 
         if removed_count:
             self.log(f"已清理 {removed_count} 张临时图片")
@@ -1573,7 +1592,73 @@ class WeChatSender:
             wrapped_lines.append(current_line)
         return wrapped_lines or [""]
 
+    def _region_image_path(self, table_data):
+        """「指定区域截图」→ 原表样式 PNG（整批共用同一张）。
+
+        image_path 为调用方已渲染好的图片；render 为懒渲染规格（本地路径或
+        云文档 ID + sheet + 区域），在发送线程里按需渲染并缓存。
+        只渲染一次，整批接收人共用同一路径，本批结束后由 send_executor 统一删除；
+        失败重试时源图已删，会按 render 规格重新渲染。
+        返回 None 表示未命中，调用方回退到旧的“重绘表格”逻辑。
+        """
+        if not isinstance(table_data, dict):
+            return None
+        source = str(table_data.get("image_path") or "").strip()
+        if not source or not os.path.exists(source):
+            spec = table_data.get("render")
+            if not spec:
+                return None
+            try:
+                from modules.region_snapshot import ensure_region_png
+                source = ensure_region_png(spec, log_fn=self.log) or ""
+            except Exception as exc:
+                self.log(f"⚠ 区域截图渲染失败: {exc}")
+                source = ""
+        if not source or not os.path.exists(source):
+            return None
+
+        try:
+            from modules.region_snapshot import is_cached_image
+            shared = is_cached_image(source)
+        except Exception:
+            shared = False
+        if shared:
+            # 渲染缓存图：整批共用，不再按接收人复制；批次结束统一删除
+            self.log(
+                f"指定区域截图（按原表样式，本轮共用一张）: {os.path.basename(source)}"
+            )
+            return source
+
+        # 外部图片（非本模块缓存）：复制一份临时副本，按接收人发送后删除
+        try:
+            temp_dir = self.get_temp_image_dir()
+            os.makedirs(temp_dir, exist_ok=True)
+            fd, dst = tempfile.mkstemp(
+                prefix="wxauto_region_", suffix=".png", dir=temp_dir
+            )
+            os.close(fd)
+            shutil.copyfile(source, dst)
+            self.log(f"指定区域截图（按原表样式）: {os.path.basename(dst)}")
+            return dst
+        except Exception as exc:
+            self.log(f"⚠ 区域截图复制失败，改用重绘表格: {exc}")
+            return None
+
+    @staticmethod
+    def _is_shared_region_image(image_path):
+        """该图片是否为「整批共用」的区域截图源图（不应按人删除）。"""
+        try:
+            from modules.region_snapshot import is_cached_image
+            return is_cached_image(image_path)
+        except Exception:
+            return False
+
     def _create_table_images(self, table_data):
+        # 指定区域截图：优先使用按原表样式渲染的图片（含合并单元格/底色/数字格式）
+        styled_path = self._region_image_path(table_data)
+        if styled_path:
+            return [styled_path]
+
         headers = [
             "" if value is None else format_cell_value(value)
             for value in table_data.get("headers", [])

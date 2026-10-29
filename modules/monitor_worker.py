@@ -12,6 +12,7 @@
 import glob
 import logging
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -25,6 +26,45 @@ from .monitor_config import MonitorManager, MonitorTask, _now_in_window
 from .wechat_sender import WeChatSender
 
 logger = logging.getLogger("ExcelSendWx.monitor")
+
+
+def _render_placeholders(text: str) -> str:
+    """渲染自定义文案里的占位符（{{date}}/{{time:HH点mm分}}/{{weather}} 等）。
+
+    按本轮发送时刻取值；渲染失败保留原文，不影响推送。
+    """
+    if not text or "{{" not in text:
+        return text
+    try:
+        from .weather_fetcher import render_message_safe
+        return render_message_safe(text)
+    except Exception as exc:
+        logger.warning("监控文案占位符渲染失败（保留原文）: %s", exc)
+        return text
+
+
+def _render_snapshot_image(snapshot_headers, snapshot_rows, snapshot_spec, tmp):
+    """监控「指定区域截图」→ PNG。
+
+    优先按源表原始样式渲染（合并单元格/底色/数字格式，与 Excel 中看到的一致）；
+    源文件不可用或渲染失败时回退到旧的表格重绘。返回 (png_path, styled)。
+    """
+    if snapshot_spec:
+        try:
+            # ensure_region_png 按（文件/修改时间/sheet/区域）缓存，轮询多轮
+            # 只有文件变化时才重新解析工作簿（大表解析较慢）
+            from .region_snapshot import ensure_region_png
+            cached = ensure_region_png(
+                snapshot_spec, log_fn=lambda m: logger.info("monitor img: %s", m))
+            if cached and os.path.isfile(cached):
+                shutil.copyfile(cached, tmp)  # 本轮图片会被删除，缓存图另存
+                return tmp, True
+        except Exception as exc:
+            logger.warning("monitor region render failed: %s", exc)
+    png = monitor_engine.render_rows_image(
+        snapshot_headers, snapshot_rows, tmp,
+        log_fn=lambda m: logger.info("monitor img: %s", m))
+    return png, False
 
 
 class MonitorWorker(QThread):
@@ -232,7 +272,7 @@ class MonitorWorker(QThread):
         # 自定义备注列：非空时在提取列每行末尾追加一列固定文案（所有行相同，紧随提取列之后），
         # 作用于文字/图片/文件/智能表格四个共享 view_rows 的输出。
         remark = getattr(task, "remark_text", "") or ""
-        remark = remark.strip()
+        remark = _render_placeholders(remark).strip()  # 支持 {{date}}/{{time:HH点}} 等
         if remark:
             view_headers = [*view_headers, "备注"]
             view_rows = [list(r) + [remark] for r in view_rows]
@@ -242,12 +282,15 @@ class MonitorWorker(QThread):
         # 开启对比时忽略本功能并给出提示，图片仍按筛选数据渲染。
         snapshot_headers: Optional[List[str]] = None
         snapshot_rows: Optional[List[List[str]]] = None
+        snapshot_spec: Optional[dict] = None
         if getattr(task, "snapshot_enabled", False):
             if not task.compare_enabled:
                 # 截图可指定另一个工作表：留空/与数据表相同 → 用当前读入的整表
                 snap_sheet = (getattr(task, "snapshot_sheet", "") or "").strip()
+                data_sheet = (task.sheet_name or "").strip()
+                effective_sheet = data_sheet
                 snap_headers, snap_rows = headers, all_rows
-                if snap_sheet and snap_sheet != (task.sheet_name or "").strip():
+                if snap_sheet and snap_sheet != data_sheet:
                     try:
                         names = monitor_engine.wps_cloud.read_sheet_names(
                             fp, log_fn=lambda m: logger.info("monitor: %s", m))
@@ -260,6 +303,7 @@ class MonitorWorker(QThread):
                                 fp, sheet_name=snap_sheet,
                                 log_fn=lambda m: logger.info("monitor: %s", m),
                             )
+                            effective_sheet = snap_sheet
                             self.emit(
                                 f"{log_prefix} 任务「{task.name}」区域截图使用工作表: {snap_sheet}")
                     except Exception as exc:
@@ -267,6 +311,17 @@ class MonitorWorker(QThread):
                         self.emit(
                             f"{log_prefix} ⚠ 任务「{task.name}」读取截图工作表「{snap_sheet}」失败，"
                             f"改用数据表: {exc}")
+                # 按源表原始样式渲染（合并单元格/底色/数字格式），失败再回退重绘
+                try:
+                    mtime = os.path.getmtime(fp)
+                except OSError:
+                    mtime = 0
+                snapshot_spec = {
+                    "source_path": fp,
+                    "sheet": effective_sheet,
+                    "range": getattr(task, "snapshot_range", "") or "",
+                    "mtime": mtime,
+                }
                 grid = [list(snap_headers)] + [list(r) for r in snap_rows]  # 整表已用区域（含表头行）
                 region = monitor_engine.parse_region(getattr(task, "snapshot_range", ""))
                 if region:
@@ -286,17 +341,20 @@ class MonitorWorker(QThread):
         if task.send_text:
             texts.append(monitor_engine.render_rows_text(
                 view_headers, view_rows,
-                title=task.text_title,
+                title=_render_placeholders(task.text_title),
                 show_detail=task.text_detail,
             ))
         if task.send_image:
             tmp = os.path.join(tempfile.gettempdir(),
                                f"monitor_{datetime.now().strftime('%H%M%S%f')}.png")
             if snapshot_headers is not None:
-                # 指定区域截图优先：图片 = 用户勾选的区域原样截取
-                png_path = monitor_engine.render_rows_image(
-                    snapshot_headers, snapshot_rows, tmp,
-                    log_fn=lambda m: logger.info("monitor img: %s", m))
+                # 指定区域截图优先：按源表原始样式（合并单元格/底色/数字格式）
+                # 渲染，尽量还原用户在 Excel 里看到的样子；失败才回退重绘。
+                png_path, styled = _render_snapshot_image(
+                    snapshot_headers, snapshot_rows, snapshot_spec, tmp)
+                if styled:
+                    self.emit(
+                        f"{log_prefix} 任务「{task.name}」区域截图已按原表样式渲染")
             else:
                 png_path = monitor_engine.render_rows_image(view_headers, view_rows, tmp,
                                                             log_fn=lambda m: logger.info("monitor img: %s", m))

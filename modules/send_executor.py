@@ -15,6 +15,58 @@ import os
 VALID_KINDS = ("text", "image", "region", "custom", "attachment")
 
 
+def _remove_images(sender, paths):
+    """删除本轮生成的临时图片（文件类附件是用户文件，不在这里）。
+
+    「指定区域截图」整批共用同一张渲染源图，只在批次结束时删除
+    （见 _cleanup_region_cache），不能按接收人删。
+    """
+    is_shared = getattr(sender, "_is_shared_region_image", None)
+    for path in paths or []:
+        try:
+            if is_shared and is_shared(path):
+                continue
+            sender._remove_temp_image(path)
+        except Exception:
+            pass
+
+
+def _cleanup_region_cache(tasks):
+    """一批发送结束后删除该批用过的「原表样式」区域截图源图缓存。
+
+    区域截图整批只渲染一张、所有接收人共用；本批全部结束（成功/失败/停止）
+    后立即删除。若之后点「重试」，源图已删，会按 render 规格重新渲染。
+    删除失败不影响发送结果。
+    """
+    specs, paths = [], []
+    for task in tasks or []:
+        region_data = task.get("region_data") if isinstance(task, dict) else None
+        if not isinstance(region_data, dict):
+            continue
+        spec = region_data.get("render")
+        if isinstance(spec, dict):
+            specs.append(spec)
+        path = str(region_data.get("image_path") or "").strip()
+        if path:
+            paths.append(path)
+    if not specs and not paths:
+        return
+    try:
+        from modules.region_snapshot import drop_cache_for, drop_cached_file
+    except Exception:
+        return
+    for path in paths:
+        try:
+            drop_cached_file(path)
+        except Exception:
+            pass
+    for spec in specs:
+        try:
+            drop_cache_for(spec)
+        except Exception:
+            pass
+
+
 def _create_steps(send_order, custom_msg, attachment, region_data=None):
     """按配置的发送顺序生成步骤；内容为空的步骤跳过。"""
     steps = []
@@ -200,18 +252,20 @@ def run_send_tasks(
                             files_by_kind["region"] = rimgs
                             temp_images.extend(rimgs)
                             for _p in rimgs:
+                                _shared = bool(
+                                    getattr(sender, "_is_shared_region_image", None)
+                                    and sender._is_shared_region_image(_p)
+                                )
                                 _log(
-                                    f"{prefix}[{i+1}/{total_count}] 已生成指定区域截图: {os.path.basename(_p)}"
+                                    f"{prefix}[{i+1}/{total_count}] "
+                                    f"{'本轮共用区域截图' if _shared else '已生成指定区域截图'}"
+                                    f": {os.path.basename(_p)}"
                                 )
                     except Exception as exc:
                         _log(
                             f"{prefix}[{i+1}/{total_count}] ❌ 生成发送图片失败: {exc}"
                         )
-                        for _p in temp_images:
-                            try:
-                                sender._remove_temp_image(_p)
-                            except Exception:
-                                pass
+                        _remove_images(sender, temp_images)
                         break
                     if "attachment" in step_types and attach_path:
                         files_by_kind["attachment"] = [attach_path]
@@ -261,11 +315,7 @@ def run_send_tasks(
                             stop_event=stop_event,
                         )
                     # 清理生成的表格图片/区域截图临时文件（附件是用户文件，不删）
-                    for _p in temp_images:
-                        try:
-                            sender._remove_temp_image(_p)
-                        except Exception:
-                            pass
+                    _remove_images(sender, temp_images)
                     if not success:
                         _log(
                             f"{prefix}[{i+1}/{total_count}] ❌ 合并发送失败，整批保留待重发"
@@ -363,5 +413,8 @@ def run_send_tasks(
                 failed_tasks.extend(tasks[i + 1:])
                 _log("⏹ 发送已停止，剩余任务已保留")
                 break
+
+    # 整批结束（成功/停止/异常）后删除本批区域截图源图缓存
+    _cleanup_region_cache(tasks)
 
     return success_count, failed_tasks

@@ -985,6 +985,19 @@ class SendWorker(QThread):
             except Exception:
                 pass
 
+            # 自定义消息占位符：{{date}}/{{time:HH点mm分}}/{{weather}} 等按发送时刻渲染
+            try:
+                from modules.weather_fetcher import render_message_safe
+                for _task in self.tasks:
+                    _msg = _task.get("custom_msg")
+                    if _msg and "{{" in _msg:
+                        _rendered = render_message_safe(_msg)
+                        if _rendered != _msg:
+                            self.signals.log.emit("已渲染自定义消息占位符")
+                            _task["custom_msg"] = _rendered
+            except Exception as _exc:
+                self.signals.log.emit(f"⚠ 自定义消息占位符渲染失败: {_exc}")
+
             success_count, failed_tasks = run_send_tasks(
                 self.tasks,
                 sender,
@@ -1039,7 +1052,9 @@ class SendWorker(QThread):
                     except Exception:
                         pass
                 try:
-                    sender.cleanup_temp_images()
+                    # 本批区域截图源图已在 run_send_tasks 收尾时按批删除；
+                    # 这里只兜底清发送副本，不整体清缓存（避免删掉监控/配置链在用图）
+                    sender.cleanup_temp_images(include_region_cache=False)
                 except Exception:
                     pass
             # 释放全局发送批次锁（排在最后，保证窗口/清理完成后才轮到下一批次）
@@ -2140,7 +2155,11 @@ class TableFilterTab(QWidget):
         
         send_layout.addWidget(QLabel("自定义消息内容:"))
         self.custom_msg_edit = QTextEdit()
-        self.custom_msg_edit.setPlaceholderText("发送完表格数据后，会额外发送这条消息...")
+        self.custom_msg_edit.setPlaceholderText(
+            "发送完表格数据后，会额外发送这条消息...\n"
+            "支持时间占位符：{{date}} {{weekday}} {{time}} {{time:H点}} "
+            "{{time:HH点mm分}} {{date:yyyy年M月d日}}"
+        )
         self.custom_msg_edit.setMaximumHeight(60)
         self.custom_msg_edit.setEnabled(False)
         send_layout.addWidget(self.custom_msg_edit)
@@ -4346,6 +4365,36 @@ class TableFilterTab(QWidget):
             self.log(f"⚠ 读取区域截图工作表 {sheet_name} 失败，改用当前数据表: {exc}")
             return self.table_data or []
 
+    def _region_render_spec(self, sheet_name, region_range):
+        """「指定区域截图」的原表样式渲染规格（供发送线程懒渲染）。
+
+        本地文件给路径 + 修改时间（缓存失效用）；云文档给文件 ID，由发送线程
+        下载临时 xlsx 后渲染（此时传 sheet + 区域）。不可用时返回 None，
+        发送侧回退到旧的重绘表格逻辑。
+        """
+        sheet = (sheet_name or self.current_sheet or "").strip()
+        if self.data_source == "wps_cloud":
+            if not self.cloud_file_id:
+                return None
+            return {
+                "cloud_file_id": self.cloud_file_id,
+                "sheet": sheet,
+                "range": region_range or "",
+            }
+        path = getattr(self, "current_excel_path", None)
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0
+        return {
+            "source_path": path,
+            "sheet": sheet,
+            "range": region_range or "",
+            "mtime": mtime,
+        }
+
     def send_data(self, auto=False):
         # 并发守卫：手动发送/重试/auto_send 共用同一个微信单例，
         # 两个 worker 同时跑会争抢微信窗口、把消息发错对象。
@@ -4383,8 +4432,9 @@ class TableFilterTab(QWidget):
         region_range = self.region_range_edit.text().strip()
         region_sheet = str(self.region_sheet_combo.currentData() or "").strip()
 
-        # 指定区域截图：把源表指定区域原样渲染成图片（在线文档加载时已下载解析成
-        # 表格矩阵，同样适用）。同一张区域图发给每个接收人（与监控语义一致）。
+        # 指定区域截图：按源表「原始样式」（合并单元格/底色/字体/数字格式）渲染，
+        # 而不是把数据重新排一遍版。本地文件直接给路径，云文档给文件 ID（发送线程
+        # 里下载临时文件再渲染，避免卡界面）；渲染失败自动回退旧的重绘逻辑。
         # 区域图可指定另一个工作表（region_sheet），与提取数据的工作表无关。
         region_data = None
         if "region" in send_order:
@@ -4396,11 +4446,15 @@ class TableFilterTab(QWidget):
                 self.log(f"⚠ 指定区域截图解析失败: {exc}")
                 region_data = None
             if region_data:
+                spec = self._region_render_spec(region_sheet, region_range)
+                if spec:
+                    region_data["render"] = spec
                 self.log(
                     f"指定区域截图: {region_sheet or self.current_sheet or '当前数据表'}"
                     f" / {region_range or '整表已用区域'}，"
                     f"共 {len(region_data['rows'])} 行 / "
                     f"{len(region_data['headers'])} 列"
+                    f"{'（按原表样式渲染）' if spec else '（样式渲染不可用，改用重绘）'}"
                 )
             else:
                 self.log("⚠ 指定区域截图无有效内容，本次不发送区域图")
@@ -5298,7 +5352,13 @@ class ScheduleTab(QWidget):
             "    {{weather_day}} {{weather_night}} 白天/夜间天气\n"
             "    {{weather_wind}} {{weather_advice}} 风力/生活建议\n"
             "  热搜(无 key)：{{news}} {{news:zhihu}} {{news:toutiao}} {{news:bilibili}} {{news:5}}\n"
-            "  时间：{{date}} {{weekday}} {{time}}"
+            "  时间(无需 key，支持格式)：\n"
+            "    {{date}}          2026-10-29\n"
+            "    {{date:yyyy年M月d日}}  2026年10月29日\n"
+            "    {{time}}          14:05\n"
+            "    {{time:H点}}       14点\n"
+            "    {{time:HH点mm分}}  14点05分\n"
+            "    {{datetime}} {{weekday}} {{hour}} {{minute}} {{ampm}}"
         )
         msg_layout.addWidget(self.message_edit)
 
@@ -6585,7 +6645,10 @@ class MonitorTab(QWidget):
         title_row = QHBoxLayout()
         title_row.addWidget(QLabel("文字标题:"))
         self.text_title_edit = QPlainTextEdit()
-        self.text_title_edit.setPlaceholderText("留空 = 默认「监控新增提醒」 （支持回车多行）")
+        self.text_title_edit.setPlaceholderText(
+            "留空 = 默认「监控新增提醒」 （支持回车多行）\n"
+            "支持占位符：{{date}} {{weekday}} {{time:H点}} {{time:HH点mm分}} 等"
+        )
         self.text_title_edit.setFixedHeight(54)
         title_row.addWidget(self.text_title_edit, 1)
         send_layout.addLayout(title_row)
@@ -6608,7 +6671,10 @@ class MonitorTab(QWidget):
         remark_row = QHBoxLayout()
         remark_row.addWidget(QLabel("备注列:"))
         self.remark_edit = QLineEdit()
-        self.remark_edit.setPlaceholderText("留空 = 不追加备注列（在提取列后加一列固定备注，作用于图片/文件/智能表格/文字）")
+        self.remark_edit.setPlaceholderText(
+            "留空 = 不追加备注列（在提取列后加一列固定备注，作用于图片/文件/智能表格/文字）；"
+            "支持 {{date}} {{time:HH点mm分}} 等时间占位符"
+        )
         remark_row.addWidget(self.remark_edit, 1)
         send_layout.addLayout(remark_row)
 

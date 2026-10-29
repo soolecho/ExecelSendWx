@@ -450,6 +450,184 @@ def _resolve_city(arg: Optional[str], task_default_city: str,
     return ""
 
 
+# ----------------------------- 日期 / 时间占位符 -----------------------------
+
+# Excel 风格日期时间格式：yyyy / yy / MM / M / dd / d / ddd / dddd / HH / H /
+# hh / h / mm / m / ss / s / AM/PM / A/P（区分大小写：M=月、m=分钟、H=24时、h=12时）
+_DATE_TOKEN_RE = re.compile(
+    r"AM/PM|A/P"
+    r"|yyyy|YYYY|yy|YY"
+    r"|MMMM|MMM|MM|M"
+    r"|dddd|DDDD|ddd|DDD|dd|DD|d|D"
+    r"|aaaa|aaa"
+    r"|HH|H|hh|h"
+    r"|mm|m|ss|s"
+)
+
+_MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+_MONTH_FULL = ["January", "February", "March", "April", "May", "June", "July",
+               "August", "September", "October", "November", "December"]
+_WEEK_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+_WEEK_CN_FULL = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+_WEEK_EN = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+            "Saturday", "Sunday"]
+
+# 这些占位符不依赖天气 API key，任何自定义消息里都能直接用
+TIME_PLACEHOLDER_KEYS = {
+    "date", "time", "datetime", "now",
+    "year", "month", "day", "hour", "minute", "second",
+    "weekday", "weekday_en", "ampm",
+}
+
+
+def _time_token_value(token: str, now: datetime, seen_hour: bool) -> str:
+    """单个格式 token → 文本。"""
+    if token == "AM/PM":
+        return "上午" if now.hour < 12 else "下午"
+    if token == "A/P":
+        return "上" if now.hour < 12 else "下"
+    low = token.lower()
+    if low == "yyyy":
+        return "%04d" % now.year
+    if low == "yy":
+        return "%02d" % (now.year % 100)
+    if token == "MMMM":
+        return _MONTH_FULL[now.month - 1]
+    if token == "MMM":
+        return _MONTH_ABBR[now.month - 1]
+    if token == "MM":
+        return "%02d" % now.month
+    if token == "M":
+        return str(now.month)
+    if low == "dddd" or low == "aaaa":
+        return _WEEK_CN_FULL[now.isoweekday() - 1]
+    if low == "ddd" or low == "aaa":
+        return _WEEK_CN[now.isoweekday() - 1]
+    if low == "dd":
+        return "%02d" % now.day
+    if low == "d":
+        return str(now.day)
+    if token == "HH":
+        return "%02d" % now.hour
+    if token == "H":
+        return str(now.hour)
+    hour12 = now.hour % 12 or 12
+    if token == "hh":
+        return "%02d" % hour12
+    if token == "h":
+        return str(hour12)
+    # mm / m：跟随时/分符（H、h）之后是「分钟」，否则按「月」处理（与 Excel 一致）
+    if token in ("mm", "m"):
+        if seen_hour:
+            return ("%02d" % now.minute) if token == "mm" else str(now.minute)
+        return ("%02d" % now.month) if token == "mm" else str(now.month)
+    if token == "ss":
+        return "%02d" % now.second
+    if token == "s":
+        return str(now.second)
+    return token
+
+
+def format_datetime(fmt: str, now: Optional[datetime] = None) -> str:
+    """按 Excel 风格格式（yyyy年M月d日 HH:mm）或 Python 风格（%H点%M分）格式化当前时间。
+
+    示例：
+      "yyyy-MM-dd"      → 2026-10-29
+      "HH:mm"           → 14:05
+      "H点"             → 14点
+      "M月d日 HH点mm分"  → 10月29日 14点05分
+      "%H点%M分"        → 14点05分（含 % 时按 strftime 处理）
+    """
+    now = now or datetime.now()
+    text = (fmt or "").strip()
+    if not text:
+        return now.strftime("%Y-%m-%d %H:%M")
+    if "%" in text:
+        try:
+            return now.strftime(text)
+        except ValueError:
+            return text
+
+    out = []
+    i, n = 0, len(text)
+    seen_hour = False
+    while i < n:
+        ch = text[i]
+        if ch == '"':  # 引号内原样输出
+            j = text.find('"', i + 1)
+            if j < 0:
+                out.append(text[i + 1:])
+                break
+            out.append(text[i + 1:j])
+            i = j + 1
+            continue
+        if ch == "\\" and i + 1 < n:  # 反斜杠转义
+            out.append(text[i + 1])
+            i += 2
+            continue
+        m = _DATE_TOKEN_RE.match(text, i)
+        if m:
+            token = m.group(0)
+            out.append(_time_token_value(token, now, seen_hour))
+            if token in ("H", "HH", "h", "hh"):
+                seen_hour = True
+            i = m.end()
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _render_time_placeholder(key: str, arg: Optional[str],
+                             now: Optional[datetime] = None) -> str:
+    """时间/日期占位符 → 文本（不联网、不需要 API key）。"""
+    now = now or datetime.now()
+    arg = (arg or "").strip()
+    if key == "date":
+        return format_datetime(arg or "yyyy-MM-dd", now)
+    if key == "time":
+        return format_datetime(arg or "HH:mm", now)
+    if key in ("datetime", "now"):
+        return format_datetime(arg or "yyyy-MM-dd HH:mm:ss", now)
+    if key == "year":
+        return "%04d" % now.year
+    if key == "month":
+        return "%02d" % now.month
+    if key == "day":
+        return "%02d" % now.day
+    if key == "hour":
+        return "%02d" % now.hour
+    if key == "minute":
+        return "%02d" % now.minute
+    if key == "second":
+        return "%02d" % now.second
+    if key == "weekday":
+        if arg.lower() in ("en", "english", "en_full"):
+            return _WEEK_EN[now.isoweekday() - 1]
+        return _WEEK_CN[now.isoweekday() - 1]
+    if key == "weekday_en":
+        return _WEEK_EN[now.isoweekday() - 1]
+    if key == "ampm":
+        return "上午" if now.hour < 12 else "下午"
+    return ""
+
+
+def render_time_placeholders(text: str, now: Optional[datetime] = None) -> str:
+    """只渲染日期/时间类占位符（不联网、不需要天气配置）。"""
+    if not text or "{{" not in text:
+        return text
+    now = now or datetime.now()  # 同一段文案用同一时刻，避免跨秒/跨天不一致
+
+    def replacer(match: re.Match) -> str:
+        key = match.group(1).lower()
+        if key not in TIME_PLACEHOLDER_KEYS:
+            return match.group(0)
+        return _render_time_placeholder(key, match.group(2), now)
+
+    return _PATTERN.sub(replacer, text)
+
+
 def render_message(text: str, task_default_city: str = "",
                    api_key: str = "", base_url: str = "",
                    global_default_city: str = "") -> str:
@@ -462,6 +640,7 @@ def render_message(text: str, task_default_city: str = "",
         return text
 
     cache_for_render: Dict[str, Optional[Dict]] = {}
+    now = datetime.now()  # 同一段文案用同一时刻
 
     def get_weather(city: str) -> Optional[Dict]:
         if not city:
@@ -536,18 +715,34 @@ def render_message(text: str, task_default_city: str = "",
             except Exception as exc:
                 logger.warning("新闻占位符渲染失败: %s", exc)
                 return match.group(0)
-        if key == "date":
-            return datetime.now().strftime("%Y-%m-%d")
-        if key == "weekday":
-            from datetime import date as _date
-            names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-            return names[_date.today().isoweekday() - 1]
-        if key == "time":
-            return datetime.now().strftime("%H:%M")
+        if key in TIME_PLACEHOLDER_KEYS:
+            # 日期/时间：不联网、不需要天气 key，支持 {{time:HH点mm分}} 这类格式
+            return _render_time_placeholder(key, arg, now)
         # 未知占位符保留
         return match.group(0)
 
     return _PATTERN.sub(replacer, text)
+
+
+def render_message_safe(text: str, task_default_city: str = "") -> str:
+    """读取已保存的天气配置后渲染全部占位符（时间/日期/天气/热搜）。
+
+    时间类占位符不需要 API key；天气类缺 key/城市时保留原文，不会误发。
+    """
+    if not text or "{{" not in text:
+        return text
+    try:
+        cfg = load_weather_config()
+        return render_message(
+            text,
+            task_default_city=task_default_city,
+            api_key=cfg.get("api_key", ""),
+            base_url=cfg.get("base_url", ""),
+            global_default_city=cfg.get("default_city", ""),
+        )
+    except Exception as exc:
+        logger.warning("占位符渲染失败（保留原文）: %s", exc)
+        return text
 
 
 def find_placeholders(text: str) -> list:

@@ -1,5 +1,5 @@
 #define MyAppName "表格自动发送By春风予Lu"
-#define MyAppVersion "1.9.0"
+#define MyAppVersion "1.9.1"
 #define MyAppPublisher "春风予Lu"
 #define MyAppURL "https://github.com/soolecho/ExecelSendWx"
 #define MyAppExeName "表格自动发送By春风予Lu.exe"
@@ -29,7 +29,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 MinVersion=10.0
 OutputDir=installer_output
-OutputBaseFilename=表格自动发送安装包_v{#MyAppVersion}
+OutputBaseFilename=ExcelSendWx_v{#MyAppVersion}_setup
 SetupIconFile={#MyAppIconFile}
 InfoBeforeFile=installer_info.txt
 Uninstallable=yes
