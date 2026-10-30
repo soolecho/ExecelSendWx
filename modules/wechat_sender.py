@@ -1,4 +1,5 @@
 from modules.uia_bridge import UiaBridge
+from modules.table_processor import normalize_cell_value
 import logging
 import os
 import shutil
@@ -30,6 +31,8 @@ def format_cell_value(value):
         return ""
     if isinstance(value, bool):
         return str(value)
+    # 整数型浮点统一转 int：手机号/编号不显示成「13800138000.0」
+    value = normalize_cell_value(value)
     if isinstance(value, _dt.time):
         if value.second == 0 and value.microsecond == 0:
             return value.strftime("%H:%M")

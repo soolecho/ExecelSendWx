@@ -1,7 +1,42 @@
 import logging
+import math
+import numbers
 import datetime as _dt
 
 logger = logging.getLogger(__name__)
+
+# Excel 数值本质是 double：在此精度内、数学上为整数的浮点都应显示为整数
+_MAX_EXACT_INT = 1e16
+
+
+def normalize_cell_value(value):
+    """规范化单元格数值：整数型浮点 → Python int，避免显示成「13800138000.0」。
+
+    calamine 会把 Excel 的所有数字都解析成 float（手机号 13800138000 →
+    13800138000.0），pandas 在混合列里也可能得到 numpy.float64；
+    展示、筛选、收件人映射都按字符串处理时就会多出「.0」。
+    在读取入口统一转成原生 int 后，下游无需各自判断。
+    非整数浮点、日期时间、文本、布尔原样返回。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        try:
+            if math.isfinite(value) and value.is_integer() and abs(value) < _MAX_EXACT_INT:
+                return int(value)
+        except (OverflowError, ValueError):
+            pass
+        return value
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    return value
+
+
+def normalize_rows(rows):
+    """把二维数组里的单元格值逐格规范化（读取入口调用）。"""
+    return [[normalize_cell_value(cell) for cell in row] for row in (rows or [])]
 
 
 # pandas 读取 Excel 时可能返回 Timestamp 对象；导入失败则按 datetime 处理
@@ -24,6 +59,8 @@ def _format_cell_value(value):
     if isinstance(value, bool):
         # 布尔值在 Python 中是 int 的子类，需先于 int 判断
         return str(value)
+    # 整数型浮点统一转 int，避免手机号/编号显示成「13800138000.0」
+    value = normalize_cell_value(value)
     if isinstance(value, _dt.time):
         if value.second == 0 and value.microsecond == 0:
             return value.strftime("%H:%M")

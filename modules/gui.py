@@ -28,7 +28,7 @@ from PyQt6.QtGui import QAction, QFont, QIcon, QGuiApplication, QDesktopServices
 
 from modules.config_manager import ConfigError, ConfigManager
 from modules.wechat_sender import WeChatSender
-from modules.table_processor import TableProcessor
+from modules.table_processor import TableProcessor, normalize_rows
 from modules.schedule_manager import (
     ScheduleStore,
     ScheduleDispatcher,
@@ -708,7 +708,8 @@ class ExcelReadWorker(QThread):
             df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
             df = df.fillna("")
             
-            values = df.values.tolist()
+            # 整数型浮点（如手机号 13800138000.0）统一转 int，避免后续显示带“.0”
+            values = normalize_rows(df.values.tolist())
             
             if len(values) == 0:
                 raise Exception("Sheet为空")
@@ -734,14 +735,10 @@ class ExcelReadWorker(QThread):
                 wb = load_workbook(file_path, read_only=True, data_only=True)
                 try:
                     ws = wb[sheet_name]
-                    data = []
-                    for row in ws.iter_rows(values_only=True):
-                        # 保留原始 cell 类型（datetime.time/datetime 等），
-                        # 由 TableProcessor._format_cell_value 统一规范化显示
-                        data.append([
-                            cell if cell is not None else ""
-                            for cell in row
-                        ])
+                    data = normalize_rows([
+                        [cell if cell is not None else "" for cell in row]
+                        for row in ws.iter_rows(values_only=True)
+                    ])
                 finally:
                     wb.close()
 

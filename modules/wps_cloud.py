@@ -20,6 +20,8 @@ import time
 
 import requests
 
+from modules.table_processor import normalize_rows
+
 logger = logging.getLogger(__name__)
 
 WEB_HOST = "https://www.kdocs.cn"
@@ -387,11 +389,12 @@ def _calamine_workbook(file_path):
 
 
 def _rows_from_calamine(sheet):
-    # calamine 的 None 统一转空串，与 pandas/openpyxl 分支口径一致
-    return [
+    # calamine 的 None 统一转空串，与 pandas/openpyxl 分支口径一致；
+    # 同时把整数型浮点（13800138000.0）规范成 int，避免手机号/编号带“.0”
+    return normalize_rows([
         [cell if cell is not None else "" for cell in row]
         for row in sheet.to_python()
-    ]
+    ])
 
 
 def read_sheet_names(file_path, log_fn=None):
@@ -439,7 +442,7 @@ def read_one_sheet(file_path, sheet_name, log_fn=None):
         import pandas as pd
         df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
         df = df.fillna("")
-        return df.values.tolist()
+        return normalize_rows(df.values.tolist())
     except Exception as exc:
         log(f"pandas 读取 sheet 失败: {exc}，尝试 openpyxl…")
         try:
@@ -449,10 +452,10 @@ def read_one_sheet(file_path, sheet_name, log_fn=None):
                 if sheet_name not in wb2.sheetnames:
                     return None
                 ws = wb2[sheet_name]
-                return [
+                return normalize_rows([
                     [cell if cell is not None else "" for cell in row]
                     for row in ws.iter_rows(values_only=True)
-                ]
+                ])
             finally:
                 wb2.close()
         except Exception as exc2:
@@ -488,10 +491,10 @@ def read_all_sheets(file_path, log_fn=None):
         try:
             out = {}
             for ws in wb.worksheets:
-                out[ws.title] = [
+                out[ws.title] = normalize_rows([
                     [cell if cell is not None else "" for cell in row]
                     for row in ws.iter_rows(values_only=True)
-                ]
+                ])
         finally:
             wb.close()
         return out
@@ -504,7 +507,7 @@ def read_all_sheets(file_path, log_fn=None):
             for sheet_name in xls.sheet_names:
                 df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
                 df = df.fillna("")
-                result[sheet_name] = df.values.tolist()
+                result[sheet_name] = normalize_rows(df.values.tolist())
         finally:
             xls.close()
         if result:
