@@ -976,7 +976,8 @@ class WeChatSender:
             return True
         return False
 
-    def _open_chat_cached(self, recipient: str, retries: int = 2) -> bool:
+    def _open_chat_cached(self, recipient: str, retries: int = 2,
+                          force: bool = False) -> bool:
         """确保已切换到收件人聊天窗口（bridge.open_chat），带存在性缓存。
 
         bridge.open_chat 内部即「搜索 + 过滤网页结果 + 校验输入框」，天然充当
@@ -985,6 +986,9 @@ class WeChatSender:
           窗口正是该收件人则直接放行（免搜索）；否则仍真正搜索切换一次，
           避免缓存成功却"当前窗口不正确"的误判。
         - 命中"已知不存在"（120 秒内）：直接返回 False，不再浪费搜索。
+          force=True（用户手动重试）时忽略并清除该负缓存，强制重新搜索——
+          上次失败可能只是微信窗口最小化/被遮挡/搜索浮层卡住，不能当成
+          "联系人不存在"让重试连搜索框都不激活。
         搜索期间挂起弹窗守护线程（_watchdog_suspend），避免把微信搜索浮层
         （Qt 工具窗，标题 'Weixin'）误判为"发送失败"弹窗关掉。
         成功结果按用户 TTL 持久化到 precheck_cache.json；失败只内存缓存
@@ -1002,6 +1006,14 @@ class WeChatSender:
                 try:
                     if self._is_target_chat(self.bridge.current_chat(), key):
                         return True
+                except Exception:
+                    pass
+            elif force:
+                # 手动重试：上次"找不到"可能只是窗口被遮挡/最小化/搜索浮层卡住，
+                # 不能让它阻止本次真实搜索。删除负缓存后继续走下面的搜索流程。
+                self._precheck_cache.pop(key, None)
+                try:
+                    self.log(f"🔄 手动重试：忽略「{key}」的负预检缓存，重新搜索")
                 except Exception:
                     pass
             else:
@@ -1095,9 +1107,15 @@ class WeChatSender:
             import os
             path = self._precheck_cache_path()
             tmp = path + ".tmp"
+            # 只持久化"已验证存在"的成功结果：负结果（找不到）只留在内存 120 秒。
+            # 否则某个联系人成功时会把同一批里的失败条目一起写盘，重启后仍被
+            # 当成"找不到"，导致重试直接跳过搜索（连搜索框都不激活）。
             data = {
                 "ttl_seconds": self._precheck_ttl,
-                "entries": {k: list(v) for k, v in self._precheck_cache.items()},
+                "entries": {
+                    k: list(v) for k, v in self._precheck_cache.items()
+                    if v and v[0]
+                },
             }
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
@@ -1124,7 +1142,8 @@ class WeChatSender:
         self._load_precheck_cache()
         return len(self._precheck_cache), self._precheck_ttl
 
-    def _safe_chatwith(self, recipient: str, exact: bool = False) -> bool:
+    def _safe_chatwith(self, recipient: str, exact: bool = False,
+                       force: bool = False) -> bool:
         """搜索并切换到收件人聊天窗口（bridge.open_chat 自带存在性校验）。
 
         exact 参数保留旧签名（调用方仍传 exact=False）；bridge 内部为半模糊
@@ -1134,7 +1153,7 @@ class WeChatSender:
         if not self._initialized:
             return False
         try:
-            ok = self._open_chat_cached(recipient)
+            ok = self._open_chat_cached(recipient, force=force)
             if ok:
                 # 切换了聊天窗口，清除 ChatInfo 缓存
                 self._invalidate_chatinfo_cache()
@@ -1149,17 +1168,29 @@ class WeChatSender:
             return False
 
     def open_chat(self, recipient: str, chat_delay: float = 0.3,
-                  stop_event=None) -> bool:
+                  stop_event=None, force: bool = False) -> bool:
         """切换到收件人聊天窗口并等待就绪（含重试）。
 
         供多内容发送时调用一次：之后的 text/image/attachment/custom 步骤
         直接用 fast_mode 在当前窗口发送，不再重复搜索-切换-确认。
         bridge.open_chat 内部自带"搜索+过滤网页结果+校验输入框"，
         搜索不到即返回 False，天然充当联系人存在性预检（含缓存）。
+
+        force=True 用于用户手动"重试发送"：忽略最近 120 秒"找不到"的负缓存，
+        先关掉上次失败残留的搜索浮层，再强制真实搜索一次。普通发送保持缓存
+        语义（避免对确实不存在的联系人在同一批里反复搜索）。
         """
         if not self._initialized:
             if not self.initialize():
                 return False
+        if force:
+            # 上次失败可能把搜索下拉浮层留在屏幕上，且主窗可能仍开着别的会话；
+            # 先按 Esc 回到主界面 + 纠偏窗口位置，否则重试可能连搜索框都点不到
+            try:
+                self._press_esc_on_wechat()
+                self._ensure_window_on_screen(self.log)
+            except Exception:
+                pass
         # 批次级一次：窗口过小时先放大以恢复顶部搜索框（acquire_batch 已重置标志）
         if not WeChatSender._WX_SIZE_CHECKED:
             try:
@@ -1171,8 +1202,14 @@ class WeChatSender:
         for attempt in range(max_retries):
             if self._stop_requested(stop_event):
                 return False
-            switched = self._safe_chatwith(recipient, exact=False)
+            switched = self._safe_chatwith(recipient, exact=False, force=force)
             if not switched:
+                try:
+                    self.log(
+                        f"⚠ 第{attempt + 1}/{max_retries}次搜索切换未成功: {recipient}"
+                    )
+                except Exception:
+                    pass
                 if attempt < max_retries - 1:
                     self._ensure_window_on_screen(self.log)
                     if self._wait_or_stopped(0.2, stop_event):
@@ -1183,7 +1220,7 @@ class WeChatSender:
             ok, chatinfo = self._safe_chatinfo()
             if not ok:
                 if self.reconnect(self.log):
-                    if self._safe_chatwith(recipient, exact=False):
+                    if self._safe_chatwith(recipient, exact=False, force=force):
                         self._wait_or_stopped(chat_delay, stop_event)
                         ok, chatinfo = self._safe_chatinfo()
             current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
@@ -1194,6 +1231,10 @@ class WeChatSender:
                 self._ensure_window_on_screen(self.log)
                 if self._wait_or_stopped(0.2, stop_event):
                     return False
+        try:
+            self.log(f"❌ 多次搜索仍未切换到聊天窗口: {recipient}")
+        except Exception:
+            pass
         return False
 
     @staticmethod

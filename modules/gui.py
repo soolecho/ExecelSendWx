@@ -864,7 +864,8 @@ class SendWorker(QThread):
         send_order=None,
         send_mode=None,
         minimize_after=True,
-        attachment=""
+        attachment="",
+        retry_mode=False
     ):
         super().__init__()
         self.tasks = tasks
@@ -872,6 +873,8 @@ class SendWorker(QThread):
         self.chat_delay = chat_delay
         self.minimize_after = bool(minimize_after)
         self.attachment = str(attachment or "").strip()
+        # 用户手动"重试发送"：忽略收件人负预检缓存，强制重新搜索切换
+        self.retry_mode = bool(retry_mode)
         # 发送顺序：显式 send_order 优先；兼容旧 send_mode 参数
         if send_order:
             order = list(send_order)
@@ -1009,6 +1012,7 @@ class SendWorker(QThread):
                 progress=lambda c, t: self.signals.progress.emit(c, t),
                 stop_event=self.stopped_event,
                 pause_event=self.paused_event,
+                retry_mode=self.retry_mode,
             )
 
             failed_count = len(failed_tasks)
@@ -4666,7 +4670,10 @@ class TableFilterTab(QWidget):
             chat_delay=self.chat_delay_spin.value(),
             send_order=list(getattr(self, 'last_send_order', ['text'])),
             minimize_after=self.minimize_check.isChecked(),
-            attachment=self.attachment_edit.text().strip()
+            attachment=self.attachment_edit.text().strip(),
+            # 手动重试必须重新搜索：上次失败可能是窗口被遮挡/最小化/搜索浮层
+            # 卡住，不能沿用"最近 120 秒找不到"的负缓存（否则连搜索框都不激活）
+            retry_mode=True
         )
         self.worker = worker
         # 重试均为用户手动操作，完成后正常弹确认框

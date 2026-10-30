@@ -84,6 +84,21 @@ def _create_steps(send_order, custom_msg, attachment, region_data=None):
     return steps
 
 
+def _open_chat(sender, recipient, chat_delay, stop_event, force=False):
+    """调用 sender.open_chat；force=True 时强制重新搜索（忽略"找不到"缓存）。
+
+    兼容只实现旧签名（无 force 参数）的 sender / 测试替身：TypeError 时退回
+    普通调用，不让重试流程因签名差异直接崩掉。
+    """
+    kwargs = {"chat_delay": chat_delay, "stop_event": stop_event}
+    if force:
+        try:
+            return sender.open_chat(recipient, force=True, **kwargs)
+        except TypeError:
+            pass
+    return sender.open_chat(recipient, **kwargs)
+
+
 def run_send_tasks(
     tasks,
     sender,
@@ -97,13 +112,21 @@ def run_send_tasks(
     pause_event=None,
     progress=None,
     label="",
+    retry_mode=False,
+    force_open_chat=False,
 ):
     """执行发送任务列表。
+
+    retry_mode=True 表示这是用户手动触发的失败重发：忽略"最近 120 秒找不到
+    该收件人"的预检缓存，强制重新搜索，避免上次临时失败（窗口最小化/被其他
+    窗口遮挡/微信卡顿）被缓存成"联系人不存在"后，重试连搜索框都不激活。
 
     返回 (success_count, failed_tasks)。failed_tasks 为未完成的 task dict。
     线程安全前提：本函数在 worker 线程内执行，log/progress 回调必须自身
     线程安全（Qt 信号或调度器转发），不能直接操作 GUI。
     """
+    force_open = bool(retry_mode or force_open_chat)
+
     def _log(msg):
         try:
             log(msg)
@@ -157,6 +180,8 @@ def run_send_tasks(
     success_count = 0
     failed_tasks = []
     total_count = len(tasks)
+    if force_open:
+        _log('🔄 重试模式：忽略"最近找不到该联系人"的预检缓存，逐个重新搜索')
 
     for i, task in enumerate(tasks):
         if stop_event is not None and stop_event.is_set():
@@ -204,10 +229,8 @@ def run_send_tasks(
             ):
                 # 每个收件人只在第一个 step 前切换一次聊天窗口
                 if not task.get("_chat_opened"):
-                    if not sender.open_chat(
-                        recipient,
-                        chat_delay=chat_delay,
-                        stop_event=stop_event,
+                    if not _open_chat(
+                        sender, recipient, chat_delay, stop_event, force=force_open
                     ):
                         _log(
                             f"{prefix}[{i+1}/{total_count}] ❌ 打开聊天窗口失败: {recipient}"
