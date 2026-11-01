@@ -28,6 +28,14 @@ from .wechat_sender import WeChatSender
 logger = logging.getLogger("ExcelSendWx.monitor")
 
 
+def _safe_mtime(path: str) -> float:
+    """文件修改时间；文件在扫描与读取之间被删除/占用时返回 0，不抛异常。"""
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
 def _render_placeholders(text: str) -> str:
     """渲染自定义文案里的占位符（{{date}}/{{time:HH点mm分}}/{{weather}} 等）。
 
@@ -155,8 +163,25 @@ class MonitorWorker(QThread):
             self.emit(f"{log_prefix} 任务「{task.name}」目录不存在: {task.watch_path}")
             return
         files = self._match_files(task)
+        # 首次启动基线：自动轮询第一次处理该任务时，把目录里已有文件视为历史遗留，
+        # 不推送，只处理基线之后新增的文件。基线持久化在 task.file_baseline_ts，
+        # 程序重启后不重设（关机期间新到的文件不会漏掉）；手动执行（one_shot）
+        # 是用户显式操作，不受基线限制。
+        baseline_ts = float(getattr(task, "file_baseline_ts", 0.0) or 0.0)
+        if not self.one_shot and baseline_ts <= 0:
+            task.file_baseline_ts = time.time()
+            self.store.save(task)
+            self.emit(
+                f"{log_prefix} 任务「{task.name}」首次启动：已建立监控基线，"
+                f"忽略目录中 {len(files)} 个历史文件，只处理之后新增的文件"
+            )
+            return
         if not files:
             return
+        if not self.one_shot:
+            files = [p for p in files if _safe_mtime(p) > baseline_ts]
+            if not files:
+                return
         # 监控目录可能堆积大量历史文件：每个轮询周期只处理「时间最新」的那一个。
         # 开启对比时，基于已记录的 baseline 做行增量（等同与上一个时间点的内容对比），
         # 避免首次/每次轮询把目录里的历史表全部读一遍并重复推送。

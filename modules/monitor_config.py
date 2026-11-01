@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
-MONITOR_VERSION = 10
+MONITOR_VERSION = 11
 
 
 def _default_send_order() -> List[str]:
@@ -200,6 +200,10 @@ class MonitorTask:
     limit_count: int = 0
     # 是否递归扫描监控目录的子文件夹（默认仅当前层，避免大目录过慢）
     include_subdir: bool = False
+    # 首次开始自动监控的时间基线（time.time()）：首次轮询时把目录里已有文件
+    # 视为历史遗留，不推送，只处理基线之后新增的文件；0 = 尚未建立基线。
+    # 手动执行（一键执行一次）不受该基线限制。修改监控目录/匹配规则/前缀时重置。
+    file_baseline_ts: float = 0.0
     # 每天运行时间段（HH:MM，起:止）。空=全天；支持跨夜如 22:00-07:00。
     active_start: str = ""
     active_end: str = ""
@@ -318,6 +322,7 @@ class MonitorTask:
             limit_op=_s("limit_op", ""),
             limit_count=max(0, _i("limit_count", 0)),
             include_subdir=_b("include_subdir", False),
+            file_baseline_ts=max(0.0, _f("file_baseline_ts", 0.0)),
             active_start=_s("active_start"),
             active_end=_s("active_end"),
             airsync_enabled=_b("airsync_enabled", False),
@@ -342,6 +347,25 @@ class MonitorTask:
             updated_at=_s("updated_at"),
         )
         return task
+
+
+def carry_file_baseline_ts(task: MonitorTask, source: Optional[MonitorTask]) -> None:
+    """编辑已有监控任务时沿用首次启动基线；监控来源变更则清空，让下次轮询重建。
+
+    来源 = 监控目录 / 文件匹配 / 文件名前缀 / 是否递归子目录。任一变化后旧基线
+    不再代表"该目录的历史文件"，必须重新建立，否则会把新目录里的历史文件当新增。
+    """
+    if source is None:
+        return
+    task.file_baseline_ts = max(
+        0.0, float(getattr(source, "file_baseline_ts", 0.0) or 0.0))
+    if (
+        source.watch_path != task.watch_path
+        or source.file_pattern != task.file_pattern
+        or source.file_prefix != task.file_prefix
+        or bool(source.include_subdir) != bool(task.include_subdir)
+    ):
+        task.file_baseline_ts = 0.0
 
 
 def _now_in_window(task: MonitorTask, now: datetime) -> bool:

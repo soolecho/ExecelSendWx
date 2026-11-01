@@ -41,7 +41,11 @@ from modules.workstation_guard import (
     WorkstationGuard,
     is_workstation_locked,
 )
-from modules.monitor_config import MonitorManager, MonitorTask
+from modules.monitor_config import (
+    MonitorManager,
+    MonitorTask,
+    carry_file_baseline_ts,
+)
 from modules.monitor_worker import MonitorWorker
 from modules import wps_cloud
 from modules.wps_cloud import (
@@ -7551,18 +7555,14 @@ class MonitorTab(QWidget):
         # 是加载时的旧快照——若用内存旧值覆盖保存，会冲掉 worker 刚推进的新基线，
         # 下一轮轮询把已推送过的行当"新增"重复推送（实测 07:20/07:25 同批数据重复发 3 次）。
         if existing_id:
-            disk = self.store.get(existing_id)  # load_all 从磁盘读最新配置
-            if disk is not None:
-                task.baseline = dict(disk.baseline)
-                task.seen_files = dict(disk.seen_files)
-                task.created_at = disk.created_at
-                task.enabled = disk.enabled
-            elif existing_id in self.tasks:
-                old = self.tasks[existing_id]
-                task.baseline = dict(old.baseline)
-                task.seen_files = dict(old.seen_files)
-                task.created_at = old.created_at
-                task.enabled = old.enabled
+            source = self.store.get(existing_id) or self.tasks.get(existing_id)
+            if source is not None:
+                task.baseline = dict(source.baseline)
+                task.seen_files = dict(source.seen_files)
+                task.created_at = source.created_at
+                task.enabled = source.enabled
+                # 保留首次启动基线；改动监控目录/规则/前缀时清空，下次轮询重建
+                carry_file_baseline_ts(task, source)
         return task
 
     def _parse_filter_values(self, text: str) -> List[str]:
