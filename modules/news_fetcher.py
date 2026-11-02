@@ -20,10 +20,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import threading
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
@@ -329,6 +332,65 @@ _PLATFORM_LABEL = {
     "bilibili": "B站热门",
     "weibo": "微博热搜",
 }
+
+
+def platform_label(platform: str) -> str:
+    """平台 key -> 中文显示名（供待机画面等 UI 直接调用）。"""
+    return _PLATFORM_LABEL.get(str(platform or "").lower(), str(platform or ""))
+
+
+def _state_path() -> Path:
+    """待机画面新闻来源的独立状态文件（不影响天气/主题配置）。"""
+    local = os.environ.get("LOCALAPPDATA")
+    base = Path(local) / "ExcelSendWx" if local else \
+        Path(tempfile.gettempdir()) / "ExcelSendWx"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "news.json"
+
+
+def load_standby_platform(default: str = "weibo") -> str:
+    """读取待机画面上次选择的新闻来源；非法/缺失时回退 default。"""
+    try:
+        with _state_path().open("r", encoding="utf-8") as fp:
+            data = json.load(fp)
+        platform = str((data or {}).get("standby_platform") or "").lower()
+        if platform in _PLATFORMS:
+            return platform
+    except (OSError, ValueError):
+        pass
+    return default if default in _PLATFORMS else "weibo"
+
+
+def save_standby_platform(platform: str) -> str:
+    """保存待机画面新闻来源，返回实际生效的平台 key。"""
+    platform = str(platform or "").lower()
+    if platform not in _PLATFORMS:
+        platform = "weibo"
+    data: Dict = {}
+    path = _state_path()
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as fp:
+                raw = json.load(fp)
+            if isinstance(raw, dict):
+                data = raw
+    except (OSError, ValueError):
+        data = {}
+    data["standby_platform"] = platform
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp",
+                               dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2)
+            fp.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return platform
 
 
 def fetch_top(platform: str = "zhihu", limit: int = 10,

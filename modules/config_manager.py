@@ -331,6 +331,16 @@ class ConfigManager:
             raw.get("default_mapping")
         )
 
+        # 空闲自动待机：本软件内无鼠标/键盘操作超过指定分钟数时自动切待机画面
+        standby = raw.get("standby") or {}
+        if not isinstance(standby, dict):
+            standby = {}
+        try:
+            idle_minutes = int(standby.get("idle_minutes", 10))
+        except (TypeError, ValueError):
+            idle_minutes = 10
+        idle_minutes = max(1, min(120, idle_minutes))
+
         return {
             "_version": 1,
             "rhythm": {
@@ -340,6 +350,10 @@ class ConfigManager:
                 "max_delay": max_delay,
             },
             "default_mapping": default_mapping,
+            "standby": {
+                "idle_enabled": bool(standby.get("idle_enabled", True)),
+                "idle_minutes": idle_minutes,
+            },
         }
 
     def load_global_settings(self):

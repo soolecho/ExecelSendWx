@@ -16,8 +16,10 @@ from PyQt6.QtWidgets import (
     QMenu, QStyle, QSystemTrayIcon, QSpinBox, QTimeEdit, QDateEdit,
     QStackedWidget,
     QLayout, QRadioButton, QButtonGroup, QFrame,
+    QScrollArea,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
     QPlainTextEdit,
+    QSizePolicy,
 )
 from PyQt6.QtCore import (
     Qt, pyqtSignal, QObject, QThread, QTimer, QLockFile, QStandardPaths,
@@ -65,6 +67,8 @@ from modules.updater import (
     UpdateDialog,
     UpdateState,
 )
+from modules import ui_theme
+from modules import ui_shell
 
 
 # gui 模块自己的日志（Toast、定时触发/完成、跨线程信号等关键路径均需可追溯）
@@ -119,41 +123,61 @@ def _app_is_dark() -> bool:
         return False
 
 
+# 视为「软件内有人操作」的事件：鼠标/键盘/触摸/拖放，以及窗口激活与焦点进入。
+# 装在 QApplication 上，所有窗口（含弹窗、菜单、托盘菜单）里的操作都会刷新计时。
+_APP_ACTIVITY_EVENTS = frozenset({
+    QEvent.Type.MouseButtonPress,
+    QEvent.Type.MouseButtonRelease,
+    QEvent.Type.MouseButtonDblClick,
+    QEvent.Type.MouseMove,
+    QEvent.Type.Wheel,
+    QEvent.Type.KeyPress,
+    QEvent.Type.KeyRelease,
+    QEvent.Type.TouchBegin,
+    QEvent.Type.TouchUpdate,
+    QEvent.Type.TouchEnd,
+    QEvent.Type.DragEnter,
+    QEvent.Type.DragMove,
+    QEvent.Type.Drop,
+    QEvent.Type.WindowActivate,
+    QEvent.Type.FocusIn,
+})
+
+
 def _chip_css() -> str:
-    """芯片按钮样式：胶囊形，选中态高亮；明/暗主题均清晰可读。"""
-    if _app_is_dark():
-        return (
-            "QPushButton{text-align:center;background:#33363b;color:#d8dae0;"
-            "border:1px solid #4a4d55;padding:4px 14px;font-size:12px;"
-            "border-radius:13px}"
-            "QPushButton:hover{background:#3d4148;border-color:#5d636e}"
-            "QPushButton:checked{background:#3a6ea5;border-color:#5a9bd6;"
-            "color:#ffffff;font-weight:bold}"
-            "QPushButton:checked:hover{background:#467bb8}"
-        )
+    """芯片按钮样式：玻璃胶囊，选中态高亮；明/暗主题均清晰可读。"""
+    c = ui_theme.colors_for(ui_theme.DARK if _app_is_dark() else ui_theme.LIGHT)
     return (
-        "QPushButton{text-align:center;background:#ffffff;color:#333333;"
-        "border:1px solid #c9ccd4;padding:4px 14px;font-size:12px;"
-        "border-radius:13px}"
-        "QPushButton:hover{background:#eef1f6;border-color:#aeb4c0}"
-        "QPushButton:checked{background:#2f78c4;border-color:#2f78c4;"
-        "color:#ffffff;font-weight:bold}"
-        "QPushButton:checked:hover{background:#3b85d1}"
+        "QPushButton{text-align:center;padding:4px 14px;font-size:12px;"
+        "border-radius:13px;"
+        f"background:{c['glass']};color:{c['text']};"
+        f"border:1px solid {c['glass_border']};"
+        "}"
+        "QPushButton:hover{"
+        f"background:{c['glass_strong']};border-color:{c['accent']};"
+        "}"
+        "QPushButton:checked{"
+        f"background:{c['accent']};border-color:{c['accent']};"
+        "color:#ffffff;font-weight:bold;"
+        "}"
+        "QPushButton:checked:hover{"
+        f"background:{c['accent']};border-color:{c['accent']};"
+        "color:#ffffff;"
+        "}"
     )
 
 
 def _compact_btn_css() -> str:
-    """全局精简/详细按钮样式：明暗主题适配。"""
-    if _app_is_dark():
-        return (
-            "QPushButton{padding:3px 10px;font-size:12px;color:#f2f2f2;"
-            "border:1px solid #4a4d55;border-radius:3px;background:#3a3d44}"
-            "QPushButton:hover{background:#494d55}"
-        )
+    """全局精简/详细按钮样式：玻璃质感，明暗主题适配。"""
+    c = ui_theme.colors_for(ui_theme.DARK if _app_is_dark() else ui_theme.LIGHT)
     return (
-        "QPushButton{padding:3px 10px;font-size:12px;color:#1f1f1f;"
-        "border:1px solid #bbb;border-radius:3px;background:#f5f5f5}"
-        "QPushButton:hover{background:#e8e8e8}"
+        "QPushButton{padding:3px 10px;font-size:12px;"
+        f"color:{c['text']};border:1px solid {c['glass_border']};"
+        f"border-radius:9px;background:{c['glass']};"
+        "}"
+        "QPushButton:hover{"
+        f"background:{c['glass_strong']};border-color:{c['accent']};"
+        "}"
     )
 
 
@@ -186,12 +210,17 @@ class ElasticPage(QWidget):
         return super().minimumSizeHint()
 
     def content_widget(self) -> QWidget:
-        """返回容器内承载的真实 tab 页面（ElasticPage 只是弹性包装层）。"""
+        """返回容器内承载的真实内容（优先返回滚动区，其次第一个子控件）。"""
         lay = self.layout()
-        if lay is not None and lay.count():
-            w = lay.itemAt(0).widget()
-            if w is not None:
-                return w
+        if lay is not None:
+            for index in range(lay.count()):
+                w = lay.itemAt(index).widget()
+                if isinstance(w, QScrollArea):
+                    return w
+            if lay.count():
+                w = lay.itemAt(0).widget()
+                if w is not None:
+                    return w
         return self
 
 
@@ -228,6 +257,12 @@ class ChipSection(QWidget):
         self._content_layout = QVBoxLayout(self._content)
         self._content_layout.setContentsMargins(8, 6, 8, 8)
         self._content_layout.setSpacing(5)
+        # 面板内小节标题：顶部小节按钮负责切换，这里只作为内容块的小标题，
+        # 让单列长页面里每块内容都能被一眼认出（多块同时展开时尤其明显）
+        self._header = QLabel(self._content)
+        self._header.setObjectName("SectionHeader")
+        self._header.setVisible(False)
+        self._content_layout.addWidget(self._header)
         outer.addWidget(self._content)
 
         # 单一持久动画对象：反复折叠/展开时只 stop + 重设参数重启，
@@ -246,8 +281,28 @@ class ChipSection(QWidget):
 
     def set_title(self, title: str) -> None:
         self._title_text = title
-        if self._chip is not None:
-            self._chip.setText(title)
+        if self._header is not None:
+            self._header.setText(str(title))
+            self._header.setVisible(bool(title))
+        chip = self._live_chip()
+        if chip is not None:
+            chip.setText(title)
+
+    def _live_chip(self) -> Optional["QPushButton"]:
+        """返回仍然存活的芯片按钮。
+
+        单列化后旧分栏芯片条只是隐藏，但若容器被回收，芯片会随之销毁；
+        这里做一次存活探测，避免访问已销毁的 C++ 对象（会直接崩溃）。
+        """
+        chip = self._chip
+        if chip is None:
+            return None
+        try:
+            chip.isChecked()
+        except RuntimeError:
+            self._chip = None
+            return None
+        return chip
 
     def is_collapsed(self) -> bool:
         return self._collapsed
@@ -277,7 +332,7 @@ class ChipSection(QWidget):
         if animate:
             self._animated_set_collapsed(collapsed)
             return
-        # 即时切换：若动画仍在跑（如精简模式/自动展开与点击动画并发），
+        # 即时切换：若动画仍在跑（如自动展开与点击动画并发），
         # 必须先终止旧动画，否则旧动画结束回调会把内容显示状态写反
         self._kill_anim()
         self._collapsed = collapsed
@@ -475,7 +530,7 @@ class ChipBar(QWidget):
         """创建芯片按钮+面板并登记；面板需由调用方 addWidget 到同列布局。"""
         section = ChipSection(collapsed=collapsed)
         section._chip_bar = self
-        section._title_text = title
+        section.set_title(title)
 
         btn = QPushButton(title)
         btn.setCheckable(True)
@@ -496,8 +551,9 @@ class ChipBar(QWidget):
 
     def _on_section_changed(self, section: ChipSection, collapsed: bool) -> None:
         # 同步芯片选中态（用户点击 / 程序自动折叠都一致）
-        if section._chip is not None:
-            section._chip.setChecked(not collapsed)
+        chip = section._live_chip()
+        if chip is not None:
+            chip.setChecked(not collapsed)
         # 程序自动展开且声明不挤掉其他面板（如打字中脏检测弹操作区）：跳过手风琴
         no_close = getattr(section, "_no_accordion_close", False)
         section._no_accordion_close = False
@@ -1391,6 +1447,34 @@ class ScheduleSendWorker(QThread):
             )
 
 
+def _failed_label(task: dict) -> str:
+    """失败任务的可读标识：优先“姓名（接收人）”，便于回查具体是谁失败。"""
+    try:
+        name = str(task.get("name") or "").strip()
+        recipient = str(task.get("recipient") or "").strip()
+        if name and recipient and name != recipient:
+            return f"{name}（{recipient}）"
+        return recipient or name
+    except Exception:
+        return ""
+
+
+def _failed_name_lines(names, tag: str = "[定时]", per_line: int = 20) -> List[str]:
+    """把失败名单整理成日志行：完整列出（每行最多 per_line 个），不截断。
+
+    返回空列表表示没有失败名单。
+    """
+    cleaned = [str(n).strip() for n in (names or []) if str(n).strip()]
+    if not cleaned:
+        return []
+    lines = []
+    header = f"{tag} ⚠ 失败名单（{len(cleaned)}）："
+    for index in range(0, len(cleaned), per_line):
+        chunk = "、".join(cleaned[index:index + per_line])
+        lines.append(header + chunk if index == 0 else f"{tag}   {chunk}")
+    return lines
+
+
 class ProfileChainWorker(QThread):
     """按顺序执行多个配置文件。
 
@@ -1520,6 +1604,9 @@ class ProfileChainWorker(QThread):
                         f"{prep['sheet']} 共 {len(tasks)} 人，"
                         f"顺序 {'/'.join(prep['send_order']) or '(空)'}"
                     )
+                    # 先发一次 0/该链路人数：进度条在开始发送前就切到本条链路的
+                    # 总人数并显示“发送中配置链 N”，不会残留上一条链路的进度。
+                    self.send_progress.emit(idx + 1, total, 0, len(tasks))
                     ok, failed = run_send_tasks(
                         tasks,
                         sender,
@@ -1534,7 +1621,7 @@ class ProfileChainWorker(QThread):
                         label=f"{idx + 1}/{total}",
                     )
                     success_total += ok
-                    failed_names.extend(t["name"] for t in failed)
+                    failed_names.extend(_failed_label(t) for t in failed)
                     self.log(
                         f"[配置链] 「{name}」完成：成功 {ok}，失败 {len(failed)}"
                     )
@@ -1592,7 +1679,7 @@ class WpsCredentialDialog(QDialog):
             "Cookie 失效后（读取报登录失效），重新复制一次即可。"
         )
         tip.setWordWrap(True)
-        tip.setStyleSheet("color: #555; font-size: 12px;")
+        ui_theme.apply_tone(tip, "muted")
         layout.addWidget(tip)
 
         row = QHBoxLayout()
@@ -1684,7 +1771,7 @@ class WpsCredentialDialog(QDialog):
             pass
         self.verify_btn.setEnabled(False)
         self.status_label.setText("⏳ 正在验证登录态…")
-        self.status_label.setStyleSheet("color: #EF6C00; font-size: 12px;")
+        ui_theme.apply_tone(self.status_label, "warn")
         self._log("调用金山文档接口验证 wps_sid…")
         worker = WpsFileListWorker(self.store)
         self.verify_worker = worker
@@ -1699,13 +1786,13 @@ class WpsCredentialDialog(QDialog):
         self.status_label.setText(
             f"✅ 登录态有效，识别到 {len(files)} 个在线表格"
         )
-        self.status_label.setStyleSheet("color: #2E7D32; font-size: 12px;")
+        ui_theme.apply_tone(self.status_label, "ok")
         self.credentials_changed.emit()
 
     def _on_verify_error(self, error):
         self.verify_btn.setEnabled(True)
         self.status_label.setText(f"❌ 验证失败：{error}")
-        self.status_label.setStyleSheet("color: #C62828; font-size: 12px;")
+        ui_theme.apply_tone(self.status_label, "err")
         self._log(f"验证失败：{error}")
 
     def _clear_tokens(self):
@@ -1718,10 +1805,10 @@ class WpsCredentialDialog(QDialog):
     def _refresh_status(self):
         if not self.store.is_configured():
             self.status_label.setText("状态：未配置（请粘贴浏览器里的 wps_sid）")
-            self.status_label.setStyleSheet("color: #C62828; font-size: 12px;")
+            ui_theme.apply_tone(self.status_label, "err")
         else:
             self.status_label.setText("状态：已保存 wps_sid（失效时重新复制即可）")
-            self.status_label.setStyleSheet("color: #2E7D32; font-size: 12px;")
+            ui_theme.apply_tone(self.status_label, "ok")
 
     def reject(self):
         # 若验证请求仍在进行，等线程收尾，避免 QThread 运行中被销毁
@@ -1811,6 +1898,11 @@ class TableFilterTab(QWidget):
         self.config_manager = ConfigManager()
         self.current_config_path = None
         self.pending_config = None
+        # 程序化回填配置期间为 True：避免触发「有修改自动弹出保存面板」
+        self._loading_profile = False
+        self._config_dirty_bound = False
+        # 由 MainWindow 注入：日志统一写到底部全局日志坞
+        self._log_sink = None
         
         self.init_ui()
         self.connect_signals()
@@ -1833,9 +1925,7 @@ class TableFilterTab(QWidget):
 
         self.current_config_label = QLabel("当前配置: 未加载")
         self.current_config_label.setWordWrap(True)
-        self.current_config_label.setStyleSheet(
-            "color: #666; font-size: 11px;"
-        )
+        ui_theme.apply_tone(self.current_config_label, "muted", small=True)
         config_layout.addWidget(self.current_config_label)
 
         config_btn_layout = QHBoxLayout()
@@ -1934,13 +2024,13 @@ class TableFilterTab(QWidget):
 
         self.cloud_status_label = QLabel("")
         self.cloud_status_label.setWordWrap(True)
-        self.cloud_status_label.setStyleSheet("color: #666; font-size: 11px;")
+        ui_theme.apply_tone(self.cloud_status_label, "muted", small=True)
         self.cloud_status_label.setVisible(False)
         url_layout.addWidget(self.cloud_status_label)
 
         self.current_file_label = QLabel("当前文件: 未选择")
         self.current_file_label.setWordWrap(True)
-        self.current_file_label.setStyleSheet("color: #666; font-size: 12px;")
+        ui_theme.apply_tone(self.current_file_label, "muted")
         url_layout.addWidget(self.current_file_label)
 
         url_layout.addWidget(QLabel("Sheet名称:"))
@@ -1969,12 +2059,11 @@ class TableFilterTab(QWidget):
         
         url_layout.addWidget(QLabel("要提取的列(多选):"))
         self.extract_columns_btn = QPushButton("点击选择要提取的列")
-        self.extract_columns_btn.setStyleSheet("background-color: #f0f0f0; color: #333; padding: 5px 8px; font-size: 12px;")
         self.extract_columns_btn.setEnabled(False)
         url_layout.addWidget(self.extract_columns_btn)
         
         self.selected_columns_label = QLabel("已选择: 0列")
-        self.selected_columns_label.setStyleSheet("color: #666; font-size: 11px;")
+        ui_theme.apply_tone(self.selected_columns_label, "muted", small=True)
         url_layout.addWidget(self.selected_columns_label)
         
         self.selected_columns = []
@@ -2281,52 +2370,61 @@ class TableFilterTab(QWidget):
 
         right_layout.addWidget(precheck_group)
 
-        progress_group = right_bar.add_section("📊 发送进度", collapsed=True)
-        progress_layout = progress_group.contentLayout()
-        
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        progress_layout.addWidget(self.progress_bar)
-        
-        self.progress_label = QLabel("等待发送...")
-        self.progress_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        progress_layout.addWidget(self.progress_label)
-        
-        right_layout.addWidget(progress_group)
-        
-        log_group = right_bar.add_section("📝 日志", collapsed=True)
-        log_layout = log_group.contentLayout()
-        
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setFont(QFont("Consolas", 9))
-        log_layout.addWidget(self.log_text)
-        
-        right_layout.addWidget(log_group)
-        
+        # 发送进度 / 日志：已上移到主窗口底部常驻坞（BottomDock），
+        # 这里只保留逻辑分组占位（仍注册进 _collapsible_groups），
+        # 由 MainWindow 把底部坞的进度条/日志控件注入本页引用。
+        progress_group = ChipSection()
+        log_group = ChipSection(collapsed=True)
+        self.progress_bar = None
+        self.progress_label = None
+        self.log_text = None
+        # 由 MainWindow 注入：日志统一写底部全局日志坞（单一入口，天然不重复）
+        self._log_sink = None
+
         control_group = right_bar.add_section("🎛 发送控制", collapsed=True)
-        control_layout = QHBoxLayout()
+        control_layout = QVBoxLayout()
+        control_layout.setContentsMargins(0, 0, 0, 0)
+        control_layout.setSpacing(6)
         control_group.contentLayout().addLayout(control_layout)
-        
-        self.start_send_btn = QPushButton("▶ 开始发送")
-        self.start_send_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px; font-size: 14px;")
+
+        # 四个动作按钮：单列窄页面里不要用一排大按钮（原来 14px 字号 + 左右各
+        # 补白会把面板撑到 ~470px，还挤占纵向空间），改成紧凑圆角按钮 + 左对齐。
+        btn_row = QHBoxLayout()
+        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(8)
+        control_layout.addLayout(btn_row)
+
+        def _action_btn(text: str, color: str) -> QPushButton:
+            btn = QPushButton(text)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setMinimumHeight(32)
+            btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            btn.setStyleSheet(
+                "QPushButton{padding:6px 14px;font-size:13px;border-radius:8px;"
+                f"background-color:{color};color:#ffffff;font-weight:bold;"
+                "border:1px solid rgba(255,255,255,60);}"
+                "QPushButton:hover{border-color:rgba(255,255,255,190);}"
+                "QPushButton:disabled{background-color:#aab2bc;color:#f4f6f8;"
+                "border-color:transparent;}"
+            )
+            return btn
+
+        self.start_send_btn = _action_btn("▶ 开始发送", "#4CAF50")
         self.start_send_btn.setEnabled(False)
-        control_layout.addWidget(self.start_send_btn)
-        
-        self.pause_send_btn = QPushButton("⏸ 暂停")
-        self.pause_send_btn.setStyleSheet("background-color: #FF9800; color: white; padding: 8px; font-size: 14px;")
+        btn_row.addWidget(self.start_send_btn)
+
+        self.pause_send_btn = _action_btn("⏸ 暂停", "#FF9800")
         self.pause_send_btn.setEnabled(False)
-        control_layout.addWidget(self.pause_send_btn)
-        
-        self.stop_send_btn = QPushButton("⏹ 停止")
-        self.stop_send_btn.setStyleSheet("background-color: #f44336; color: white; padding: 8px; font-size: 14px;")
+        btn_row.addWidget(self.pause_send_btn)
+
+        self.stop_send_btn = _action_btn("⏹ 停止", "#f44336")
         self.stop_send_btn.setEnabled(False)
-        control_layout.addWidget(self.stop_send_btn)
-        
-        self.retry_send_btn = QPushButton("🔄 重试发送")
-        self.retry_send_btn.setStyleSheet("background-color: #00BCD4; color: white; padding: 8px; font-size: 14px;")
+        btn_row.addWidget(self.stop_send_btn)
+
+        self.retry_send_btn = _action_btn("🔄 重试发送", "#00BCD4")
         self.retry_send_btn.setEnabled(False)
-        control_layout.addWidget(self.retry_send_btn)
+        btn_row.addWidget(self.retry_send_btn)
+        btn_row.addStretch(1)
 
         self.minimize_check = QCheckBox("发送后最小化微信")
         self.minimize_check.setToolTip(
@@ -2334,9 +2432,8 @@ class TableFilterTab(QWidget):
             "关闭后微信窗口保持原样，不会被最小化。"
         )
         self.minimize_check.setChecked(True)
-        control_layout.addWidget(self.minimize_check)
-
-        control_layout.addStretch()
+        control_layout.addWidget(self.minimize_check, 0,
+                                 Qt.AlignmentFlag.AlignLeft)
         
         right_layout.addWidget(control_group)
         
@@ -2345,21 +2442,30 @@ class TableFilterTab(QWidget):
         
         splitter.setSizes([285, 280, 285])
 
-        main_layout.addWidget(splitter)
+        # ---- 单列风琴布局（不再分栏：分栏会把每栏挤得过窄）----
+        # 所有面板按「数据来源 → 筛选 → 人员预览 → 发送配置 → 发送控制」排成一列，
+        # 顶部由 SectionTabs 分组小按钮切换；原来的三栏芯片条隐藏（仍负责选中态同步）。
+        self.body = QWidget()
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(0, 0, 0, 0)
+        self.body_layout.setSpacing(8)
+        for _group in (config_group, url_group, filter_group,
+                       persons_group, preview_group, send_group,
+                       recipient_group, precheck_group, control_group):
+            self.body_layout.addWidget(_group)
+        self.body_layout.addStretch(1)
+
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
+        main_layout.addWidget(self.body, 1)
         self.setLayout(main_layout)
 
-        # 三栏引用：某栏所有面板都收起时，该栏平滑收缩为窄"芯片导轨"，
-        # 腾出的宽度自动分给仍有面板展开的栏，避免大块空背板
-        self.data_splitter = splitter
-        self._rail_columns = [
-            (left_panel, left_bar),
-            (middle_panel, middle_bar),
-            (right_panel, right_bar),
-        ]
-        self._rail_anim: Optional[QVariantAnimation] = None
-        for _panel, bar in self._rail_columns:
-            for sec in bar.sections:
-                sec.collapsedChanged.connect(self._schedule_rail_relayout)
+        for _bar in (left_bar, middle_bar, right_bar):
+            _bar.setVisible(False)
+        # 旧三栏结构不再参与布局，仅保留引用以维持芯片按钮存活（选中态同步用）
+        self._legacy_columns = (splitter, left_panel, middle_panel, right_panel)
+        self.data_splitter = None
+        self._rail_columns = []
 
         # 注册所有可折叠面板，供全局精简开关遍历
         self._collapsible_groups = [
@@ -2378,18 +2484,91 @@ class TableFilterTab(QWidget):
         self.progress_group = progress_group
         self.log_group = log_group
         self.control_group = control_group
+        self.recipient_group = recipient_group
+        self.precheck_group = precheck_group
+        # 左侧导航子菜单映射：点某个子菜单 → 展开本页对应的折叠面板（其余收起）
+        self.nav_sections = [
+            ("source", "数据来源", [config_group, url_group]),
+            ("filter", "筛选条件", [filter_group]),
+            ("persons", "人员预览", [persons_group, preview_group]),
+            ("send", "发送设置", [send_group]),
+            ("mapping", "联系人映射", [recipient_group]),
+            ("precheck", "发送预检", [precheck_group]),
+            ("control", "发送控制", [control_group]),
+        ]
+        # 右侧顶部小节按钮的分组展示（组标题 + 小节按钮）
+        self.section_spec = [
+            ("📄 数据与筛选", [("source", "数据来源"), ("filter", "筛选条件"),
+                              ("persons", "人员预览")]),
+            ("⚙ 发送配置", [("send", "发送设置"), ("mapping", "联系人映射"),
+                            ("precheck", "发送预检")]),
+            ("🎛 发送执行", [("control", "发送控制")]),
+        ]
         # 加载配置后自动展开：人员列表/数据预览/发送进度/发送控制
         self._load_expand_groups = [
             persons_group, preview_group, progress_group, control_group,
         ]
         # 启动时同步一次预检缓存状态（TTL 下拉与磁盘持久化保持一致）
         self._refresh_precheck_cache_info()
+        # 有修改时自动弹出「配置管理（保存）」面板
+        self._bind_config_dirty()
 
     def _collapse_groups(self, *groups):
         """批量折叠指定面板（忽略 None）。"""
         for g in groups:
             if g is not None:
                 g.set_collapsed(True)
+
+    def _bind_config_dirty(self):
+        """把「有修改 → 自动弹出保存面板」绑定到会改动配置的控件上。"""
+        if self._config_dirty_bound:
+            return
+        self._config_dirty_bound = True
+        bindings = [
+            ("valueChanged", getattr(self, "send_interval_spin", None)),
+            ("valueChanged", getattr(self, "chat_delay_spin", None)),
+            ("valueChanged", getattr(self, "header_row_spin", None)),
+            ("textChanged", getattr(self, "wechat_edit", None)),
+            ("textChanged", getattr(self, "custom_msg_edit", None)),
+            ("textChanged", getattr(self, "region_range_edit", None)),
+            ("textChanged", getattr(self, "recipient_mapping_default_edit", None)),
+            ("toggled", getattr(self, "auto_send_check", None)),
+            ("toggled", getattr(self, "custom_msg_checkbox", None)),
+            ("toggled", getattr(self, "recipient_mapping_enabled_check", None)),
+            ("currentIndexChanged", getattr(self, "sheet_combo", None)),
+            ("currentIndexChanged", getattr(self, "name_column_combo", None)),
+            ("currentIndexChanged", getattr(self, "wechat_column_combo", None)),
+            ("currentIndexChanged", getattr(self, "region_sheet_combo", None)),
+            ("itemChanged", getattr(self, "send_order_list", None)),
+            ("clicked", getattr(self, "add_filter_btn", None)),
+            ("clicked", getattr(self, "clear_filter_btn", None)),
+            ("clicked", getattr(self, "apply_filter_btn", None)),
+        ]
+        for signal_name, widget in bindings:
+            if widget is None:
+                continue
+            signal = getattr(widget, signal_name, None)
+            if signal is None:
+                continue
+            try:
+                signal.connect(self._mark_config_dirty)
+            except Exception:
+                pass
+
+    def _mark_config_dirty(self, *_args):
+        """检测到用户改动配置时自动展开「配置管理」面板（不挤掉正在编辑的面板）。"""
+        if self._loading_profile:
+            return
+        group = getattr(self, "config_group", None)
+        if group is None or not group.is_collapsed():
+            return
+        save_btn = getattr(self, "save_config_btn", None)
+        if save_btn is not None and not save_btn.isEnabled():
+            return
+        try:
+            group.set_collapsed(False, animate=True, accordion_close=False)
+        except Exception:
+            pass
 
     def _enter_sending_view(self):
         """点发送后自动切换视图：只保留发送控制+发送进度，其他面板果冻收起。"""
@@ -2400,81 +2579,6 @@ class TableFilterTab(QWidget):
                 g.set_collapsed(False, animate=True)
             elif not should_open and not g.is_collapsed():
                 g.set_collapsed(True, animate=True)
-
-    # --------------------- 空栏芯片导轨（自动收缩/恢复） ---------------------
-    _RAIL_WIDTH = 126
-
-    def _schedule_rail_relayout(self, *_args):
-        """面板折叠/展开后，延迟到布局事件处理完再重算栏宽（动画起始态已确定）。"""
-        QTimer.singleShot(0, self._relayout_rails)
-
-    def _relayout_rails(self):
-        """全收起的栏平滑收缩为窄芯片导轨，腾出的宽度按比例分给展开的栏。"""
-        sp = self.data_splitter
-        if sp is None:
-            return
-        start = sp.sizes()
-        if len(start) != 3 or sum(start) <= 0:
-            return
-        total = sum(start)
-        closed = [
-            all(s.is_collapsed() for s in bar.sections)
-            for _p, bar in self._rail_columns
-        ]
-        # 每栏导轨宽度按该栏最宽芯片动态计算（FlowLayout 会自动换行）
-        rails = [
-            max(112, bar.sizeHint().width() + 12)
-            for _p, bar in self._rail_columns
-        ]
-        if not hasattr(self, "_rail_weights"):
-            self._rail_weights = [285.0, 280.0, 285.0]
-        n_closed = sum(closed)
-        avail = total - sum(rails[i] for i, c in enumerate(closed) if c)
-        open_weight = sum(
-            self._rail_weights[i] for i, c in enumerate(closed) if not c
-        )
-        target = []
-        for i, is_closed in enumerate(closed):
-            if is_closed or open_weight <= 0:
-                target.append(rails[i])
-            else:
-                target.append(max(rails[i], int(avail * self._rail_weights[i] / open_weight)))
-        # 修正取整误差到最后一个展开栏
-        diff = total - sum(target)
-        if diff != 0:
-            for i in range(2, -1, -1):
-                if not closed[i]:
-                    target[i] += diff
-                    break
-        if target == start:
-            return
-        if self._rail_anim is not None:
-            try:
-                self._rail_anim.stop()
-            except Exception:
-                pass
-        anim = QVariantAnimation(self)
-        anim.setStartValue(0.0)
-        anim.setEndValue(1.0)
-        anim.setDuration(300)
-        anim.setEasingCurve(QEasingCurve.Type.OutQuart)
-
-        def on_change(t, st=list(start), tg=target):
-            sp.setSizes([
-                int(s + (e - s) * t) for s, e in zip(st, tg)
-            ])
-
-        def on_finish():
-            # 记住当前展开栏宽度比例，供下次恢复时按原比例分配
-            cur = sp.sizes()
-            for i, is_closed in enumerate(closed):
-                if not is_closed and cur[i] > rails[i]:
-                    self._rail_weights[i] = float(cur[i])
-
-        anim.valueChanged.connect(on_change)
-        anim.finished.connect(on_finish)
-        self._rail_anim = anim
-        anim.start()
 
     def connect_signals(self):
         self.save_config_btn.clicked.connect(self.save_config)
@@ -3966,12 +4070,12 @@ class TableFilterTab(QWidget):
             self.cloud_status_label.setText(
                 "登录凭证已配置（wps_sid 失效时在“Cookie 凭证设置”重新粘贴）"
             )
-            self.cloud_status_label.setStyleSheet("color: #2E7D32; font-size: 11px;")
+            ui_theme.apply_tone(self.cloud_status_label, "ok", small=True)
         else:
             self.cloud_status_label.setText(
                 "未配置登录凭证 → 点击“Cookie 凭证设置”粘贴 wps_sid"
             )
-            self.cloud_status_label.setStyleSheet("color: #C62828; font-size: 11px;")
+            ui_theme.apply_tone(self.cloud_status_label, "err", small=True)
 
     def open_wps_settings(self):
         dialog = WpsCredentialDialog(self.wps_store, self)
@@ -4145,7 +4249,12 @@ class TableFilterTab(QWidget):
         self._region_sheet_cache = {}
 
         self._update_column_combos()
-        if not self._apply_pending_config(worker):
+        self._loading_profile = True
+        try:
+            applied_profile = self._apply_pending_config(worker)
+        finally:
+            self._loading_profile = False
+        if not applied_profile:
             if self.data_source == "wps_cloud":
                 self.log("云文档读取完成（临时文件已自动清理）！请选择Sheet和列，然后点击'加载数据'")
             else:
@@ -4319,6 +4428,15 @@ class TableFilterTab(QWidget):
                 g.set_collapsed(False)
 
     def log(self, message):
+        # 日志统一走 MainWindow 注入的全局日志坞（单一入口，不会重复显示）
+        if getattr(self, "_log_sink", None) is not None:
+            try:
+                self._log_sink(message)
+            except Exception:
+                pass
+            return
+        if self.log_text is None:
+            return
         _append_log_rich(self.log_text, message)
         self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
         
@@ -5204,7 +5322,7 @@ class ScheduleTab(QWidget):
         left_layout.addLayout(left_btn4)
 
         self.dispatcher_status_label = QLabel("调度器状态: 未启动")
-        self.dispatcher_status_label.setStyleSheet("color:#666; font-size:11px;")
+        ui_theme.apply_tone(self.dispatcher_status_label, "muted", small=True)
         left_layout.addWidget(self.dispatcher_status_label)
 
         left_layout.addStretch()
@@ -5331,7 +5449,7 @@ class ScheduleTab(QWidget):
             "本地表格和云文档配置都支持；接收人/筛选/发送顺序\n"
             "均以各配置自己的设置为准。"
         )
-        profile_hint.setStyleSheet("color:#888; font-size:11px;")
+        ui_theme.apply_tone(profile_hint, "muted", small=True)
         profile_panel_layout.addWidget(profile_hint)
         send_layout.addWidget(self.profile_panel)
 
@@ -5477,27 +5595,59 @@ class ScheduleTab(QWidget):
         action_group.contentLayout().addLayout(action_row)
         right_layout.addWidget(action_group)
 
-        # 日志（共享主日志的回调，这里也放只读面板，方便查看）
-        log_group = right_bar.add_section("📜 定时发送日志", collapsed=True)
-        log_layout = log_group.contentLayout()
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMinimumHeight(140)
-        log_layout.addWidget(self.log_text)
-        right_layout.addWidget(log_group)
+        # 日志已统一到底部常驻日志坞（BottomDock），这里不再放独立日志面板
         right_layout.addStretch(1)
 
-        main_layout.addWidget(right, 1)
+        # ---- 单列布局（不再左右分栏）：任务列表 + 全部编辑面板排成一列 ----
+        self.body = QWidget()
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(0, 0, 0, 0)
+        self.body_layout.setSpacing(6)
+        for _group in (list_group, save_group, base_group, repeat_group,
+                       send_group, lock_group, action_group):
+            self.body_layout.addWidget(_group)
+        self.body_layout.addStretch(1)
+
+        left_panel.setVisible(False)
+        right.setVisible(False)
+        # 旧分栏容器已退出布局，但里面的芯片/控件仍被代码引用：
+        # 必须挂回 self 并保留引用，否则会被 Python 回收连带销毁，
+        # 之后芯片选中态同步就会访问已销毁对象而崩溃
+        right.setParent(self)
+        self._legacy_columns = (left_panel, right)
+        main_layout.addWidget(self.body, 1)
 
         # 注册所有可折叠面板，供全局精简开关遍历
         self._collapsible_groups = [
             list_group, save_group, base_group, repeat_group,
-            send_group, lock_group, action_group, log_group,
+            send_group, lock_group, action_group,
         ]
         self.list_group = list_group
         self.save_group = save_group
+        self.base_group = base_group
+        self.repeat_group = repeat_group
+        self.send_group = send_group
+        self.lock_group = lock_group
         self.action_group = action_group
-        self.schedule_log_group = log_group
+        # 兼容旧逻辑：定时页没有独立日志面板了
+        self.schedule_log_group = None
+        # 左侧导航子菜单映射
+        self.nav_sections = [
+            ("list", "任务列表", [list_group]),
+            ("save", "配置保存", [save_group]),
+            ("base", "任务基础", [base_group]),
+            ("repeat", "重复规则", [repeat_group]),
+            ("content", "发送内容", [send_group]),
+            ("lock", "锁屏行为", [lock_group]),
+            ("action", "保存重置", [action_group]),
+        ]
+        # 右侧顶部小节按钮的分组展示
+        self.section_spec = [
+            ("📋 任务", [("list", "任务列表"), ("save", "配置保存")]),
+            ("⚙ 发送配置", [("base", "任务基础"), ("repeat", "重复规则"),
+                            ("content", "发送内容")]),
+            ("🔒 执行与安全", [("lock", "锁屏行为"), ("action", "保存重置")]),
+        ]
 
     def _collapse_groups(self, *groups):
         """批量折叠指定分组（忽略 None）。"""
@@ -5569,7 +5719,8 @@ class ScheduleTab(QWidget):
             return
         self._form_dirty = True
         if self.save_group.is_collapsed():
-            self.save_group.set_collapsed(False, animate=True)
+            self.save_group.set_collapsed(
+                False, animate=True, accordion_close=False)
         if self.action_group.is_collapsed():
             self.action_group.set_collapsed(
                 False, animate=True, accordion_close=False)
@@ -5591,16 +5742,7 @@ class ScheduleTab(QWidget):
         self.log(message)
 
     def log(self, message: str) -> None:
-        # 本地追加
-        if hasattr(self, "log_text") and self.log_text is not None:
-            from datetime import datetime
-            ts = datetime.now().strftime("%H:%M:%S")
-            self.log_text.append(f"[{ts}] {message}")
-            # 只设置一次即可，后续由 QTextDocument 原生自动裁剪
-            if not getattr(self, "_log_max_applied", False):
-                self.log_text.document().setMaximumBlockCount(self._MAX_LOG_LINES)
-                self._log_max_applied = True
-        # 同时推送给 MainWindow，用于主界面统一日志面板
+        # 只推送给 MainWindow 的底部全局日志坞，避免同一行在两个面板重复显示
         if self.log_callback:
             try:
                 self.log_callback(message)
@@ -6293,13 +6435,9 @@ class ScheduleTab(QWidget):
     def _on_send_finished(self, success: int, failed: int, failed_recipients: list):
         self.stop_send_btn.setEnabled(False)
         self.run_now_btn.setEnabled(True)
-        msg = f"[定时] 本轮完成，成功: {success}，失败: {failed}"
-        if failed_recipients:
-            msg += f"（{'、'.join(str(r) for r in failed_recipients[:5])}"
-            if len(failed_recipients) > 5:
-                msg += f"…等{len(failed_recipients)}人"
-            msg += "）"
-        self.log(msg)
+        self.log(f"[定时] 本轮完成，成功: {success}，失败: {failed}")
+        for line in _failed_name_lines(failed_recipients):
+            self.log(line)
         # Toast 通知（立即执行完成）
         mw = self.window()
         try:
@@ -6314,18 +6452,17 @@ class ScheduleTab(QWidget):
         mw = self.window()
         if mw is not None and hasattr(mw, "_force_finish_schedule_progress"):
             try:
-                mw._force_finish_schedule_progress(failed)
+                mw._force_finish_schedule_progress(failed, success)
             except Exception:
                 pass
-        # 有失败时展开定时页日志面板（_force_finish_schedule_progress 内已有展开逻辑，
-        # 但加在这里做双重保证，且展开自身面板时用 set_collapsed 更快）
-        if failed and hasattr(self, "schedule_log_group"):
-            try:
-                lg = self.schedule_log_group
-                if lg is not None and lg.is_collapsed():
-                    lg.set_collapsed(False, animate=True)
-            except Exception:
-                pass
+        if failed:
+            # 日志已常驻底部：有失败时让底部日志坞呼吸高亮提示
+            mw = self.window()
+            if mw is not None and hasattr(mw, "_expand_log_on_failure"):
+                try:
+                    mw._expand_log_on_failure()
+                except Exception:
+                    pass
         # 按任务配置决定是否发送后锁定
         task = getattr(self, "_current_run_task", None)
         if task and getattr(task, "relock_after", False):
@@ -6549,7 +6686,7 @@ class MonitorTab(QWidget):
         left_layout.addWidget(self.run_once_btn)
 
         self.poll_status_label = QLabel("轮询状态: 运行中")
-        self.poll_status_label.setStyleSheet("color:#666; font-size:11px;")
+        ui_theme.apply_tone(self.poll_status_label, "muted", small=True)
         left_layout.addWidget(self.poll_status_label)
 
         # 关键：把「监控配置」ChipSection 加入左侧列布局，否则面板是孤儿不可见
@@ -6735,7 +6872,7 @@ class MonitorTab(QWidget):
 
         self.wxwork_hint = QLabel("企微发送不占用微信发送批次锁；发送失败只记日志并触发失败通知，不影响微信基线重试语义。")
         self.wxwork_hint.setWordWrap(True)
-        self.wxwork_hint.setStyleSheet("color: #808080;")
+        ui_theme.apply_tone(self.wxwork_hint, "muted")
         wdl.addWidget(self.wxwork_hint)
 
         self.wxwork_detail.setVisible(False)
@@ -6801,7 +6938,7 @@ class MonitorTab(QWidget):
 
         self.airsync_hint = QLabel("写入列 = 清洗后提取列；去首行标题，从末尾非空行往下追加。")
         self.airsync_hint.setWordWrap(True)
-        self.airsync_hint.setStyleSheet("color: #808080;")
+        ui_theme.apply_tone(self.airsync_hint, "muted")
         adl.addWidget(self.airsync_hint)
 
         self.airsync_detail.setVisible(False)
@@ -6851,7 +6988,7 @@ class MonitorTab(QWidget):
         self.snapshot_sheet_edit.setMaximumWidth(160)
         row.addWidget(self.snapshot_sheet_edit, 0)
         self.snapshot_hint = QLabel("⚠ 指定区域截图仅在「关闭对比」模式下生效")
-        self.snapshot_hint.setStyleSheet("color:#e08a00; font-size:11px;")
+        ui_theme.apply_tone(self.snapshot_hint, "warn", small=True)
         self.snapshot_hint.setVisible(False)
         send_layout.addWidget(self.snapshot_check)
         send_layout.addLayout(row)
@@ -6980,48 +7117,74 @@ class MonitorTab(QWidget):
 
         right_layout.addWidget(time_group)
 
-        # 6. 保存
+        # 6. 保存 + 停止轮询
         save_group = right_bar.add_section("💾 保存", collapsed=True)
         save_layout = save_group.contentLayout()
         save_row = QHBoxLayout()
         self.save_btn = QPushButton("保存配置")
         self.clear_btn = QPushButton("清空表单")
+        self.stop_poll_btn = QPushButton("停止轮询")
+        self.stop_poll_btn.setToolTip("立即停止当前监控任务正在进行的轮询")
         save_row.addWidget(self.save_btn)
         save_row.addWidget(self.clear_btn)
+        save_row.addWidget(self.stop_poll_btn)
         save_layout.addLayout(save_row)
         right_layout.addWidget(save_group)
 
-        # 运行日志 + 停止轮询
-        log_group = right_bar.add_section("📜 运行日志")
-        log_layout = log_group.contentLayout()
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMinimumHeight(120)
-        self.log_text.setFont(QFont("Consolas", 9))
-        log_layout.addWidget(self.log_text)
-        log_btn_row = QHBoxLayout()
-        self.auto_follow_check = QCheckBox("自动跟随")
-        self.auto_follow_check.setChecked(True)
-        self.auto_follow_check.setToolTip(
-            "勾选后新日志自动滚动到底部；取消勾选可停在当前位置回看旧日志")
-        log_btn_row.addWidget(self.auto_follow_check)
-        self.stop_poll_btn = QPushButton("停止轮询")
-        log_btn_row.addWidget(self.stop_poll_btn)
-        log_btn_row.addStretch()
-        log_layout.addLayout(log_btn_row)
-        right_layout.addWidget(log_group)
-        self.log_group = log_group
+        # 运行日志已统一到底部常驻日志坞（BottomDock），不再占用页面空间
+        self.log_text = None
+        self.auto_follow_check = None
+        self.log_group = None
 
         right_layout.addStretch()
-        main_layout.addWidget(right, 1)
 
-        # 注册所有可折叠分组，供全局精简/详细模式遍历（含左侧配置列表，与定时发送一致）
+        # ---- 单列布局（不再左右分栏）：监控配置 + 全部编辑面板排成一列 ----
+        self.body = QWidget()
+        self.body_layout = QVBoxLayout(self.body)
+        self.body_layout.setContentsMargins(0, 0, 0, 0)
+        self.body_layout.setSpacing(6)
+        for _group in (list_group, base_group, filter_group, send_group,
+                       col_group, recv_group, time_group, save_group):
+            self.body_layout.addWidget(_group)
+        self.body_layout.addStretch(1)
+
+        left_panel.setVisible(False)
+        right.setVisible(False)
+        # 旧分栏容器退出布局后仍需存活（里面的芯片/控件被后续代码引用）
+        right.setParent(self)
+        self._legacy_columns = (left_panel, right)
+        main_layout.addWidget(self.body, 1)
+
+        # 注册所有可折叠分组，供手风琴与窗口弹性遍历（含左侧配置列表，与定时发送一致）
         self._collapsible_groups = [
             list_group, base_group, filter_group, send_group,
-            col_group, recv_group, time_group, save_group, log_group,
+            col_group, recv_group, time_group, save_group,
         ]
         self.list_group = list_group
+        self.base_group = base_group
+        self.filter_group = filter_group
+        self.send_group = send_group
+        self.col_group = col_group
+        self.recv_group = recv_group
+        self.time_group = time_group
         self.save_group = save_group
+        # 左侧导航子菜单映射
+        self.nav_sections = [
+            ("list", "监控配置", [list_group]),
+            ("base", "基本设置", [base_group]),
+            ("filter", "筛选对比", [filter_group, col_group]),
+            ("send", "推送内容", [send_group]),
+            ("recv", "微信接收", [recv_group]),
+            ("time", "时间窗口", [time_group]),
+            ("save", "保存配置", [save_group]),
+        ]
+        # 右侧顶部小节按钮的分组展示
+        self.section_spec = [
+            ("📡 监控", [("list", "监控配置"), ("base", "基本设置")]),
+            ("🔍 筛选与推送", [("filter", "筛选对比"), ("send", "推送内容"),
+                              ("recv", "微信接收")]),
+            ("⏱ 时间与保存", [("time", "时间窗口"), ("save", "保存配置")]),
+        ]
         # 表单脏检测：登录后 _form_ready=True 才生效（防止程序化填充误判为改动）
         self._form_dirty = False
         self._form_ready = False
@@ -7706,6 +7869,13 @@ class MonitorTab(QWidget):
 
     # ----------------------------- 轮询 / 立即执行 -----------------------------
     def _start_polling(self):
+        # 安全护栏：offscreen（自动化测试/无头环境）绝不启动真实轮询，
+        # 否则测试进程会真实读取监控文件、写入智能表格并向微信推送。
+        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+            self.poll_status_label.setText("轮询状态: 测试模式未启动")
+            self.stop_poll_btn.setText("开始轮询")
+            self.log("[监控] 测试模式：未启动真实轮询")
+            return
         if self._poll_worker is not None and self._poll_worker.isRunning():
             return
         worker = MonitorWorker(store=self.store, one_shot=False, poll_floor_sec=30.0)
@@ -7799,7 +7969,7 @@ class MonitorTab(QWidget):
         self._jump_to_failed_task(task_name)
 
     def _jump_to_failed_task(self, task_name):
-        """跳转到失败任务详情：选中任务表单 + 展开运行日志并滚动到其最近日志。"""
+        """跳转到失败任务详情：选中任务表单 + 底部日志坞定位到其最近日志。"""
         try:
             tid = next(
                 (tid for tid, t in self.tasks.items() if t.name == task_name),
@@ -7811,37 +7981,36 @@ class MonitorTab(QWidget):
         except Exception:
             logger.exception("[监控] 跳转到失败任务表单失败")
         # 主窗口切到「📡 监控」页并前置
+        log_view = None
         try:
             mw = self.window()
-            if mw is not None and hasattr(mw, "tab_widget") \
-                    and hasattr(mw, "monitor_tab"):
-                mw.tab_widget.setCurrentWidget(mw.monitor_tab)
+            if mw is not None and hasattr(mw, "focus_page"):
+                mw.focus_page("monitor")
                 mw.showNormal()
                 mw.raise_()
                 mw.activateWindow()
+            dock = getattr(mw, "bottom_dock", None) if mw is not None else None
+            if dock is not None:
+                log_view = dock.log_text
+                dock.flash_attention()
         except Exception:
             logger.exception("[监控] 切换到监控页失败")
-        # 展开运行日志面板
-        try:
-            if getattr(self, "log_group", None) is not None \
-                    and self.log_group.is_collapsed():
-                self.log_group.set_collapsed(False, animate=True)
-        except Exception:
-            pass
         # 滚动到该任务最近一条日志（找不到则到底部）
         try:
-            doc = self.log_text.document()
+            if log_view is None:
+                return
+            doc = log_view.document()
             cur = doc.find(task_name)
             last = None
             while not cur.isNull():
                 last = cur
                 cur = doc.find(task_name, cur)
             if last is not None:
-                self.log_text.setTextCursor(last)
+                log_view.setTextCursor(last)
             else:
-                sb = self.log_text.verticalScrollBar()
+                sb = log_view.verticalScrollBar()
                 sb.setValue(sb.maximum())
-            self.log_text.ensureCursorVisible()
+            log_view.ensureCursorVisible()
         except Exception:
             logger.exception("[监控] 滚动到失败日志失败")
 
@@ -7850,20 +8019,8 @@ class MonitorTab(QWidget):
 
     # ----------------------------- 日志 -----------------------------
     def log(self, message: str) -> None:
-        if hasattr(self, "log_text") and self.log_text is not None:
-            from datetime import datetime
-            ts = datetime.now().strftime("%H:%M:%S")
-            _append_log_rich(self.log_text, message, ts)
-            if not self._log_max_applied:
-                self.log_text.document().setMaximumBlockCount(1200)
-                self._log_max_applied = True
-            # 自动跟随：勾选后新日志滚动到底部（默认开，取消可回看旧日志）
-            if getattr(self, "auto_follow_check", None) is not None \
-                    and self.auto_follow_check.isChecked():
-                sb = self.log_text.verticalScrollBar()
-                sb.setValue(sb.maximum())
+        # 只推送给 MainWindow 的底部全局日志坞，避免同一行重复显示
         logger.info(message)
-        # 同时推送给 MainWindow，用于主界面统一日志面板
         if self.log_callback:
             try:
                 self.log_callback(message)
@@ -7900,9 +8057,25 @@ class GlobalSettingsTab(QWidget):
 
     # 全局设置被修改后发出，MainWindow 可据此同步应用（如重新 apply_rhythm）
     settings_changed = pyqtSignal()
+    # 外观主题切换请求（light / dark / auto）：由 MainWindow 真正应用并持久化
+    theme_mode_changed = pyqtSignal(str)
+    # 玻璃质感切换请求（standard / clear / solid）：与明暗主题独立组合
+    glass_style_changed = pyqtSignal(str)
 
     # (显示文本, 档位 key)；addItem(text, key) 存数据时以 key 为准
     _PROFILE_TEXT = [("关闭", "off"), ("快速", "fast"), ("自然", "natural"), ("保守", "calm")]
+    # (显示文本, 主题模式)
+    _THEME_TEXT = [
+        ("跟随系统", ui_theme.AUTO),
+        ("日间模式", ui_theme.LIGHT),
+        ("夜间模式", ui_theme.DARK),
+    ]
+    # (显示文本, 玻璃质感)
+    _GLASS_TEXT = [
+        ("经典磨砂（默认）", ui_theme.GLASS_STANDARD),
+        ("通透玻璃", ui_theme.GLASS_CLEAR),
+        ("实心高对比", ui_theme.GLASS_SOLID),
+    ]
 
     def __init__(self, config_manager):
         super().__init__()
@@ -7920,6 +8093,67 @@ class GlobalSettingsTab(QWidget):
         main_layout = QVBoxLayout(self)
         bar = ChipBar(exclusive=True)
         main_layout.addWidget(bar)
+        # 小节切换改由右侧顶部 SectionTabs 分组按钮承担，原芯片条只保留选中态同步
+        bar.setVisible(False)
+
+        # ---------------- 外观主题 ----------------
+        theme_group = bar.add_section("🎨 外观主题", collapsed=True)
+        main_layout.addWidget(theme_group)
+        tl = theme_group.contentLayout()
+
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel("界面主题："))
+        self._theme_radios: Dict[str, QRadioButton] = {}
+        self._theme_btn_group = QButtonGroup(self)
+        for text, mode in self._THEME_TEXT:
+            radio = QRadioButton(text)
+            radio.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._theme_btn_group.addButton(radio)
+            self._theme_radios[mode] = radio
+            theme_row.addWidget(radio)
+        theme_row.addStretch()
+        tl.addLayout(theme_row)
+
+        theme_tip = QLabel(
+            "「跟随系统」会随 Windows 的深浅色设置自动切换；日间/夜间为手动固定。\n"
+            "标题栏右上角也有一个 🌙/☀ 快捷按钮，可三态循环切换，两处效果一致。"
+        )
+        theme_tip.setWordWrap(True)
+        ui_theme.apply_tone(theme_tip, "muted", small=True)
+        tl.addWidget(theme_tip)
+
+        for mode, radio in self._theme_radios.items():
+            radio.toggled.connect(
+                lambda checked, m=mode: self._on_theme_radio_toggled(m)
+                if checked else None)
+
+        # 玻璃质感：只调玻璃底透明度 / 高光 / 描边，与日间夜间配色自由组合
+        glass_row = QHBoxLayout()
+        glass_row.addWidget(QLabel("玻璃质感："))
+        self._glass_radios: Dict[str, QRadioButton] = {}
+        self._glass_btn_group = QButtonGroup(self)
+        for text, style in self._GLASS_TEXT:
+            radio = QRadioButton(text)
+            radio.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._glass_btn_group.addButton(radio)
+            self._glass_radios[style] = radio
+            glass_row.addWidget(radio)
+        glass_row.addStretch()
+        tl.addLayout(glass_row)
+
+        glass_tip = QLabel(
+            "玻璃质感有 3 档：经典磨砂（默认，均衡）／通透玻璃（更透、层次感更强）"
+            "／实心高对比（底更实、文字最清晰）。\n"
+            "它只改变卡片、按钮、标题栏的半透明质感，不改变明暗配色，重启后保持。"
+        )
+        glass_tip.setWordWrap(True)
+        ui_theme.apply_tone(glass_tip, "muted", small=True)
+        tl.addWidget(glass_tip)
+
+        for style, radio in self._glass_radios.items():
+            radio.toggled.connect(
+                lambda checked, s=style: self._on_glass_radio_toggled(s)
+                if checked else None)
 
         # ---------------- 拟人节流 ----------------
         rhythm_group = bar.add_section("🎯 拟人节流", collapsed=True)
@@ -7957,7 +8191,7 @@ class GlobalSettingsTab(QWidget):
             "可将档位设为「快速」或手动把间隔调小，甚至直接关闭本开关。"
         )
         tip.setWordWrap(True)
-        tip.setStyleSheet("color:#888;font-size:11px;")
+        ui_theme.apply_tone(tip, "muted", small=True)
         rl.addWidget(tip)
 
         # ---------------- 全量默认映射 ----------------
@@ -7987,7 +8221,7 @@ class GlobalSettingsTab(QWidget):
         mrow.addWidget(self.map_import_btn)
         mrow.addWidget(self.map_open_btn)
         self.map_file_label = QLabel("未关联映射表文件")
-        self.map_file_label.setStyleSheet("color:#888;font-size:11px;")
+        ui_theme.apply_tone(self.map_file_label, "muted", small=True)
         self.map_file_label.setWordWrap(True)
         mrow.addWidget(self.map_file_label, 1)
         mrow.addStretch()
@@ -8005,8 +8239,38 @@ class GlobalSettingsTab(QWidget):
             "优先级：配置自身映射 > 最近配置恢复的映射 > 全量默认映射 > 按原名发送。"
         )
         tip2.setWordWrap(True)
-        tip2.setStyleSheet("color:#888;font-size:11px;")
+        ui_theme.apply_tone(tip2, "muted", small=True)
         ml.addWidget(tip2)
+
+        # ---------------- 待机与空闲 ----------------
+        standby_group = bar.add_section("🌙 待机与空闲", collapsed=True)
+        main_layout.addWidget(standby_group)
+        sl = standby_group.contentLayout()
+
+        self.idle_standby_check = QCheckBox("无操作时自动进入待机画面")
+        self.idle_standby_check.setToolTip(
+            "只统计本软件内的鼠标/键盘操作；后台发送 / 定时 / 监控任务不受影响")
+        sl.addWidget(self.idle_standby_check)
+
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("空闲判定：超过"))
+        self.idle_minutes_spin = QSpinBox()
+        self.idle_minutes_spin.setRange(1, 120)
+        self.idle_minutes_spin.setSuffix(" 分钟")
+        self.idle_minutes_spin.setToolTip(
+            "超过该时长在本软件里没有任何鼠标/键盘操作，自动切到时钟待机画面")
+        srow.addWidget(self.idle_minutes_spin)
+        srow.addWidget(QLabel("无操作自动进入待机"))
+        srow.addStretch()
+        sl.addLayout(srow)
+
+        standby_tip = QLabel(
+            "只统计本软件内的操作：在 Excel / 微信等其它程序中工作不会被误判；\n"
+            "待机只是把界面收成时钟画面，后台发送 / 定时 / 监控任务照常运行。"
+        )
+        standby_tip.setWordWrap(True)
+        ui_theme.apply_tone(standby_tip, "muted", small=True)
+        sl.addWidget(standby_tip)
 
         # 立即生效的信号连接
         self.rhythm_enable_check.toggled.connect(self._on_immediate_change)
@@ -8018,9 +8282,66 @@ class GlobalSettingsTab(QWidget):
         self.map_link_btn.clicked.connect(self._on_link_mapping_file)
         self.map_import_btn.clicked.connect(self._on_import_mapping_file)
         self.map_open_btn.clicked.connect(self._on_open_mapping_file)
+        self.idle_standby_check.toggled.connect(self._on_debounced_change)
+        self.idle_minutes_spin.valueChanged.connect(self._on_debounced_change)
 
         self._load_to_ui()
         self._loading = False
+
+        # 供手风琴 / 窗口弹性与左侧导航统一遍历
+        self._collapsible_groups = [theme_group, rhythm_group, map_group, standby_group]
+        self.theme_group = theme_group
+        self.rhythm_group = rhythm_group
+        self.map_group = map_group
+        self.standby_group = standby_group
+        self.nav_sections = [
+            ("theme", "外观主题", [theme_group]),
+            ("rhythm", "拟人节流", [rhythm_group]),
+            ("mapping", "全量映射", [map_group]),
+            ("standby", "待机与空闲", [standby_group]),
+        ]
+        # 右侧顶部小节按钮的分组展示
+        self.section_spec = [
+            ("⚙ 设置", [("theme", "外观主题"),
+                        ("rhythm", "拟人节流"),
+                        ("mapping", "全量映射"),
+                        ("standby", "待机与空闲")]),
+        ]
+
+    # ---------------- 外观主题 --------------
+    def _on_theme_radio_toggled(self, mode: str) -> None:
+        if self._loading:
+            return
+        self.theme_mode_changed.emit(mode)
+
+    def sync_theme_mode(self, mode: str) -> None:
+        """外部（标题栏快捷按钮 / 跟随系统）切换后回填单选，不触发信号。"""
+        radio = self._theme_radios.get(str(mode or "").lower())
+        if radio is None or radio.isChecked():
+            return
+        self._loading = True
+        try:
+            radio.setChecked(True)
+        finally:
+            self._loading = False
+
+    # ---------------- 玻璃质感 --------------
+    def _on_glass_radio_toggled(self, style: str) -> None:
+        if self._loading:
+            return
+        self.glass_style_changed.emit(style)
+
+    def sync_glass_style(self, style: str) -> None:
+        """外部切换玻璃质感后回填单选，不触发信号。"""
+        radio = self._glass_radios.get(str(style or "").lower())
+        if radio is None or radio.isChecked():
+            return
+        prev = self._loading
+        self._loading = True
+        try:
+            radio.setChecked(True)
+        finally:
+            self._loading = prev
 
     # ---------------- UI <-> 设置 -----------------
     def _load_to_ui(self):
@@ -8048,6 +8369,14 @@ class GlobalSettingsTab(QWidget):
                     f"{';'.join(self._fmt_mapping_name(r) for r in recips)}"
                 )
         self.map_edit.setPlainText("\n".join(lines))
+
+        st = self.settings.get("standby") or {}
+        self.idle_standby_check.setChecked(bool(st.get("idle_enabled", True)))
+        try:
+            idle_minutes = int(st.get("idle_minutes", 10))
+        except (TypeError, ValueError):
+            idle_minutes = 10
+        self.idle_minutes_spin.setValue(max(1, min(120, idle_minutes)))
 
     @staticmethod
     def _fmt_mapping_name(name):
@@ -8298,6 +8627,10 @@ class GlobalSettingsTab(QWidget):
                 "mapping_file": self._map_linked_file,
                 "mappings": mappings,
             },
+            "standby": {
+                "idle_enabled": self.idle_standby_check.isChecked(),
+                "idle_minutes": int(self.idle_minutes_spin.value()),
+            },
         }
 
     # ---------------- 落盘 + 应用 -----------------
@@ -8352,6 +8685,9 @@ class MainWindow(QMainWindow):
     _schedule_trigger_signal = pyqtSignal(object, str)
     # 发送进度开始：attach 可能发生在调度线程，用信号排队到主线程再碰 GUI/COM
     _progress_begin_signal = pyqtSignal()
+    # 定时任务（含配置链）开始：单独一路信号，确保即便手动发送的完成弹窗
+    # 还开着（门闩 busy），定时进度也能接管底部坞/标题/任务栏
+    _schedule_progress_begin_signal = pyqtSignal()
     # 定时任务执行完毕（成功/超时/异常）后强制恢复标题/任务栏，
     # 不依赖 worker 的 finished_with_result 信号是否正确到达，
     # 避免无人值守时窗口标题永久停在“发送中…”
@@ -8364,9 +8700,16 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        self.setGeometry(50, 50, 850, 580)
+        # 去掉 Windows 原生标题栏：最小化 / 最大化 / 关闭按钮改到软件自绘的
+        # 顶部玻璃标题栏里（GlassHeaderBar），整体视觉更统一。
+        self.setWindowFlags(
+            self.windowFlags() | Qt.WindowType.FramelessWindowHint)
+        self.setGeometry(50, 50, 1180, 820)
         # 弹性窗口最小地板：折叠后可缩到这个尺寸，不至于过小
-        self.setMinimumSize(520, 300)
+        # （左侧导航 + 底部日志坞常驻，地板需相应放大）
+        self.setMinimumSize(760, 470)
+        # 无边框窗口的边缘缩放热区（懒创建，见 _install_edge_handles）
+        self._edge_handles: Dict[str, ui_shell.WindowEdgeHandle] = {}
         self._closing_requested = False
         self._close_ready = False
         self._shutdown_poll_count = 0
@@ -8394,6 +8737,8 @@ class MainWindow(QMainWindow):
         # 进度开始信号始终在主线程执行（receiver=MainWindow），保证 setWindowTitle/
         # winId()/COM/托盘 全部在主线程，避免调度线程跨线程操作 GUI
         self._progress_begin_signal.connect(self._begin_send_progress)
+        # 定时任务接管进度：先清门闩再把归属切到 schedule（见 _begin_schedule_progress）
+        self._schedule_progress_begin_signal.connect(self._begin_schedule_progress)
         # 定时任务结束后强制恢复进度（兜底，不依赖 worker 结束信号），
         # 并在正常 Toast 信号意外丢失时补发完成通知
         self._schedule_done_signal.connect(self._on_schedule_done_fallback)
@@ -8450,49 +8795,191 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         self.table_filter_tab = TableFilterTab()
         self.schedule_tab = ScheduleTab(self.schedule_store, self.schedule_dispatcher)
-        # 让 ScheduleTab 日志同时写入原表格发送主界面的日志面板，保持统一查看
-        self.schedule_tab.log_callback = self._schedule_log_to_main
         self.monitor_store = MonitorManager()
         self.monitor_tab = MonitorTab(self.monitor_store)
-        # 让监控日志同时写入原表格发送主界面的日志面板，保持统一查看
+        # 定时/监控日志统一写入底部全局日志坞（同一入口，天然不会重复显示）
+        self.schedule_tab.log_callback = self._schedule_log_to_main
         self.monitor_tab.log_callback = self._schedule_log_to_main
-
-        self.tab_widget = _ElasticTabWidget()
-        # 用 ElasticPage 包装：非当前页不报告尺寸提示，窗口才能弹性收缩
-        page1 = ElasticPage()
-        pl1 = QVBoxLayout(page1)
-        pl1.setContentsMargins(0, 0, 0, 0)
-        pl1.addWidget(self.table_filter_tab)
-        page2 = ElasticPage()
-        pl2 = QVBoxLayout(page2)
-        pl2.setContentsMargins(0, 0, 0, 0)
-        pl2.addWidget(self.schedule_tab)
-        page3 = ElasticPage()
-        pl3 = QVBoxLayout(page3)
-        pl3.setContentsMargins(0, 0, 0, 0)
-        pl3.addWidget(self.monitor_tab)
         # 全量设置：应用级全局设置（拟人节流 + 全量默认映射）
         self.config_manager = ConfigManager()
         self.global_settings_tab = GlobalSettingsTab(self.config_manager)
-        page4 = ElasticPage()
-        pl4 = QVBoxLayout(page4)
-        pl4.setContentsMargins(0, 0, 0, 0)
-        pl4.addWidget(self.global_settings_tab)
-        self.tab_widget.addTab(page1, "📊 数据发送")
-        self.tab_widget.addTab(page2, "⏰ 定时发送")
-        self.tab_widget.addTab(page3, "📡 监控")
-        self.tab_widget.addTab(page4, "⚙️ 全量设置")
 
-        # 全局精简/详细开关：放 QTabWidget 右上角 corner
-        self._compact_mode = False
-        self.compact_btn = QPushButton("📑 精简模式")
-        self.compact_btn.setStyleSheet(_compact_btn_css())
-        self.compact_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.compact_btn.clicked.connect(self._on_compact_toggle)
-        self.tab_widget.setCornerWidget(self.compact_btn)
-        self.tab_widget.currentChanged.connect(self._sync_compact_btn)
+        # ---- 页面栈（取代原来的顶部标签页）----
+        self.page_stack = QStackedWidget()
+        self.page_map: Dict[str, QWidget] = {}
+        self.page_scroll: Dict[str, QScrollArea] = {}
+        self.section_tabs: Dict[str, ui_shell.SectionTabs] = {}
+        for key, widget in (
+            ("send", self.table_filter_tab),
+            ("schedule", self.schedule_tab),
+            ("monitor", self.monitor_tab),
+            ("settings", self.global_settings_tab),
+        ):
+            # 页面内容可能高于窗口（小屏 / 展开多个面板）：
+            # 用透明 QScrollArea 承载，内容被完整保留并可滚动，而不是被压扁裁切
+            scroll = QScrollArea()
+            scroll.setObjectName("PageScroll")
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            scroll.viewport().setAutoFillBackground(False)
+            scroll.setWidget(widget)
+            self.page_scroll[key] = scroll
 
-        self.setCentralWidget(self.tab_widget)
+            page = ElasticPage()
+            lay = QVBoxLayout(page)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(8)
+            # 顶部小节切换条：分组小按钮，点击展开页面内对应的折叠面板
+            spec = list(getattr(widget, "section_spec", []) or [])
+            if spec:
+                tabs = ui_shell.SectionTabs(spec)
+                tabs.section_selected.connect(
+                    lambda section, k=key: self._on_section_chip(k, section))
+                lay.addWidget(tabs, 0, Qt.AlignmentFlag.AlignLeft)
+                self.section_tabs[key] = tabs
+            lay.addWidget(scroll, 1)
+            self.page_stack.addWidget(page)
+            self.page_map[key] = page
+
+        self._page_titles = {
+            "send": "📊 数据发送",
+            "schedule": "⏰ 定时发送",
+            "monitor": "📡 监控轮询",
+            "settings": "⚙️ 全量设置",
+        }
+
+        # ---- 待机画面：收起导航 + 右侧只留时钟（底部日志坞照常显示）----
+        self.standby = ui_shell.StandbyView()
+        self.standby.setVisible(False)
+        # 新闻异步加载完成后内容高度会变，待机中再校正一次窗口高度
+        self.standby.content_updated.connect(self._refit_standby_if_idle)
+        # 待机页内置浏览器滑入 / 滑出：打开时放大窗口便于阅读，返回时收回
+        self.standby.browser_open_changed.connect(self._on_standby_browser_open)
+        self._standby_mode = False
+        # 进入待机后按内容自适应得到的窗口几何（用于判断用户是否手动改过窗口）
+        self._standby_fit_geo: Optional[QRect] = None
+        # 打开待机页内嵌新闻页前的窗口几何（返回待机时恢复原来的宽度）
+        self._pre_browser_geo: Optional[QRect] = None
+
+        # ---- 空闲自动待机：本软件内无鼠标/键盘操作超过 N 分钟自动切待机画面 ----
+        self._idle_standby_enabled = True
+        self._idle_standby_minutes = 10
+        self._last_app_action_ts = time.monotonic()
+        # 装到 QApplication 上：本软件所有窗口/弹窗/菜单里的操作都能刷新计时
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
+        self._idle_standby_timer = QTimer(self)
+        self._idle_standby_timer.setInterval(15000)
+        self._idle_standby_timer.timeout.connect(self._on_idle_standby_tick)
+        self.global_settings_tab.settings_changed.connect(
+            self._apply_standby_idle_settings)
+        self._apply_standby_idle_settings()
+
+        # ---- 底部常驻坞：发送进度 + 全局日志（不随页面切换隐藏）----
+        self.bottom_dock = ui_shell.BottomDock()
+        # 数据发送页的进度条/日志框改为指向底部坞，旧代码调用完全兼容
+        self.table_filter_tab.log_text = None
+        self.table_filter_tab._log_sink = self._append_global_log
+        self.table_filter_tab.progress_bar = self.bottom_dock.progress_bar
+        self.table_filter_tab.progress_label = self.bottom_dock.progress_label
+        self.bottom_dock.follow_check.toggled.connect(
+            self.bottom_dock.log_text.set_auto_follow)
+
+        # ---- 顶部玻璃标题栏 ----
+        self.header = ui_shell.GlassHeaderBar(APP_TITLE, APP_VERSION)
+        self.header.set_theme_mode(ui_theme.current_mode())
+        self.header.density_toggled.connect(self._on_compact_toggle)
+        self.header.theme_toggled.connect(self._on_theme_toggled)
+        self.header.hide_requested.connect(self._hide_to_tray)
+        # 无边框标题栏上的最小化 / 最大化 / 关闭（关闭沿用 closeEvent：隐藏到托盘）
+        self.header.minimize_requested.connect(self.showMinimized)
+        self.header.maximize_requested.connect(self._toggle_maximize)
+        self.header.close_requested.connect(self.close)
+        self.header.set_maximized(self.isMaximized())
+        # 全量设置 →「外观主题」：与标题栏快捷按钮共用同一套应用/持久化逻辑
+        self.global_settings_tab.theme_mode_changed.connect(
+            self._on_theme_mode_from_settings)
+        self.global_settings_tab.sync_theme_mode(ui_theme.current_mode())
+        # 全量设置 →「玻璃质感」（经典磨砂 / 通透玻璃 / 实心高对比）
+        self.global_settings_tab.glass_style_changed.connect(
+            self._on_glass_style_from_settings)
+        self.global_settings_tab.sync_glass_style(ui_theme.current_glass_style())
+        # 主题「跟随系统」：监听系统深浅色变化（Qt 信号 + 定时兜底）
+        self._setup_theme_watch()
+        # 兼容旧引用（原 QTabWidget 右上角按钮 → 现标题栏按钮）
+        self.compact_btn = self.header.density_btn
+
+        # ---- 左侧竖排导航（只保留主标签：子菜单已移到右侧顶部的小节按钮）----
+        nav_spec = [
+            {"key": "send", "icon": "📊", "title": "数据发送"},
+            {"key": "schedule", "icon": "⏰", "title": "定时发送"},
+            {"key": "monitor", "icon": "📡", "title": "监控轮询"},
+            {"key": "settings", "icon": "⚙️", "title": "全量设置"},
+        ]
+        self.nav = ui_shell.SideNavPanel(nav_spec)
+        self.nav.page_selected.connect(self._on_nav_page)
+
+        # 小节按钮 → 页面内折叠面板的映射（手风琴：只展开对应面板，其余收起）
+        self._section_groups: Dict[str, Dict[str, List[Any]]] = {}
+        for key, tab in (
+            ("send", self.table_filter_tab),
+            ("schedule", self.schedule_tab),
+            ("monitor", self.monitor_tab),
+            ("settings", self.global_settings_tab),
+        ):
+            self._section_groups[key] = {
+                k: list(groups) for (k, _label, groups)
+                in getattr(tab, "nav_sections", [])
+            }
+        # 折叠状态 ↔ 顶部小节按钮选中态双向同步
+        for key, tabs in self.section_tabs.items():
+            for section, groups in self._section_groups.get(key, {}).items():
+                tabs.bind_group(section, groups)
+        # 风琴式初始状态：每页只保留一个小节展开（避免多块内容堆叠、看不出归属）
+        for key, tab in (
+            ("send", self.table_filter_tab),
+            ("schedule", self.schedule_tab),
+            ("monitor", self.monitor_tab),
+            ("settings", self.global_settings_tab),
+        ):
+            groups = [g for g in getattr(tab, "_collapsible_groups", [])
+                      if g is not None]
+            keep: Set[Any] = set()
+            for _section, targets in self._section_groups.get(key, {}).items():
+                if any(g is not None and not g.is_collapsed() for g in targets):
+                    keep = {g for g in targets if g is not None}
+                    break
+            for g in groups:
+                if g not in keep and not g.is_collapsed():
+                    g.set_collapsed(True)
+        self.nav.select_page("send")
+        # 启动时同步一次顶部小节按钮选中态（与各页默认展开的面板一致）
+        QTimer.singleShot(0, lambda: self._sync_section_tabs("send"))
+
+        # ---- 组装窗口 ----
+        central = QWidget()
+        central.setObjectName("AppRoot")
+        root = QVBoxLayout(central)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(10)
+
+        root.addWidget(self.header, 0)
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        body.addWidget(self.nav, 0)
+        # 编辑区与待机画面互斥：同一时刻只显示一个，占满右侧全部空间
+        body.addWidget(self.page_stack, 1)
+        body.addWidget(self.standby, 1)
+        root.addLayout(body, 1)
+        root.addWidget(self.bottom_dock, 0)
+        self.setCentralWidget(central)
+        # 无边框窗口四周的透明缩放把手（压在 10px 外层留白上）
+        self._install_edge_handles()
+
+        self.page_stack.currentChanged.connect(self._sync_compact_btn)
 
         # 注入 worker 创建回调：任何发送 worker 启动后，在任务栏/窗口标题显示进度，
         # 主窗口被微信窗口挡住时也能在任务栏看到发送进度
@@ -8500,56 +8987,605 @@ class MainWindow(QMainWindow):
         self.schedule_tab.worker_created_cb = self._attach_global_progress_schedule
         self.table_filter_tab.progress_dismissed_cb = self._dismiss_send_progress
         self._taskbar = None
+        # 底部坞进度条是否处于“不确定进度（忙碌条）”状态
+        self._dock_progress_busy = False
         self._send_progress_active = False
+        # 进度归属：None / "manual"（数据发送弹窗流程）/ "schedule"（定时任务）。
+        # 手动发送的完成弹窗还没点掉时，定时任务开始需要能接管进度显示，
+        # 之后手动弹窗关闭也不能反过来清掉定时任务的进度与结果。
+        self._progress_owner: Optional[str] = None
         # 门闩：数据发送完成弹窗等待用户点击期间，禁止 worker.finished 提前清除任务栏
         self._progress_waiting_dismiss = False
 
-    def _current_tab_content(self) -> QWidget:
-        """取当前 tab 内的真实业务页面（穿透 ElasticPage 包装层）。"""
-        page = self.tab_widget.currentWidget()
-        if isinstance(page, ElasticPage):
-            return page.content_widget()
-        return page
+    # ------------------------- 导航 / 主题 -------------------------
+    def _unwrap_page(self, page: QWidget) -> QWidget:
+        """穿透 ElasticPage / QScrollArea 包装层，取真实业务页面。"""
+        target = page
+        if isinstance(target, ElasticPage):
+            target = target.content_widget()
+        if isinstance(target, QScrollArea):
+            inner = target.widget()
+            if inner is not None:
+                target = inner
+        return target
 
-    def _on_compact_toggle(self):
-        """全局精简/详细模式：折叠/展开当前 tab 的所有可折叠分组。"""
-        self._compact_mode = not self._compact_mode
-        widget = self._current_tab_content()
-        groups = getattr(widget, "_collapsible_groups", [])
-        for g in groups:
-            g.set_collapsed(self._compact_mode)
-        self.compact_btn.setText("📄 详细模式" if self._compact_mode else "📑 精简模式")
+    def _page_widget(self, key: str) -> Optional[QWidget]:
+        page = self.page_map.get(key)
+        if page is None:
+            return None
+        return self._unwrap_page(page)
 
-    def _sync_compact_btn(self, _index):
-        """切换 tab 时根据当前 tab 的折叠状态更新按钮文字。"""
-        widget = self._current_tab_content()
-        groups = getattr(widget, "_collapsible_groups", [])
+    def _on_nav_page(self, key: str, ensure: bool = True):
+        # 待机画面里点导航图标 → 退出待机回到编辑区（导航保持收起的图标栏状态）
+        if getattr(self, "_standby_mode", False):
+            self._set_standby(False)
+        page = self.page_map.get(key)
+        if page is None:
+            return
+        switched = self.page_stack.currentWidget() is not page
+        if switched:
+            self.page_stack.setCurrentWidget(page)
+        self.header.set_page_name(self._page_titles.get(key, ""))
+        self._sync_compact_btn(self.page_stack.currentIndex())
+        if switched and ensure:
+            self._ensure_page_visible(key)
+
+    def _sync_section_tabs(self, key: str, preferred: Optional[str] = None) -> None:
+        """同步顶部小节按钮选中态：优先用指定小节，否则取第一个展开分组。"""
+        tabs = self.section_tabs.get(key)
+        if tabs is None:
+            return
+        if preferred:
+            tabs.set_active(preferred)
+            return
+        for section, targets in self._section_groups.get(key, {}).items():
+            if any(g is not None and not g.is_collapsed() for g in targets):
+                tabs.set_active(section)
+                return
+
+    def _scroll_section_into_view(self, key: str, group: Optional[QWidget]) -> None:
+        """把刚展开的小节面板滚到可视区顶部。
+
+        窗口弹性放大已经足以展示内容时，滚动条上限为 0，这里不会产生副作用；
+        屏幕高度不够 / 用户手动缩小窗口时，也能立刻看到点开的那块内容。
+        """
+        scroll = self.page_scroll.get(key)
+        if scroll is None or group is None:
+            return
+        try:
+            inner = scroll.widget()
+            if inner is None:
+                return
+            pos = group.mapTo(inner, QPoint(0, 0))
+            sb = scroll.verticalScrollBar()
+            sb.setValue(max(sb.minimum(), min(pos.y() - 6, sb.maximum())))
+        except RuntimeError:
+            # group 可能已被销毁（页面重建），忽略即可
+            pass
+
+    def _ensure_page_visible(self, key: str) -> None:
+        """切页后若该页所有面板都折叠，自动展开第一组并同步顶部小节按钮选中态。
+
+        否则用户点左侧导航后，右侧只剩一排小节按钮，看起来像“空白页”。
+        """
+        widget = self._page_widget(key)
+        if widget is None:
+            return
+        groups = [g for g in getattr(widget, "_collapsible_groups", []) if g is not None]
         if not groups:
             return
-        all_collapsed = all(g.is_collapsed() for g in groups)
-        self._compact_mode = all_collapsed
-        self.compact_btn.setText("📄 详细模式" if all_collapsed else "📑 精简模式")
-        # 切换 tab 后按新页理想尺寸适应（折叠的分组不计入 sizeHint，
-        # 已展开内容完整显示，不再出现定时任务页文字被压扁）
+        if any(not g.is_collapsed() for g in groups):
+            self._sync_section_tabs(key)
+            return
+        first = groups[0]
+        first.set_collapsed(False, animate=True, accordion_close=False)
+        section_key = None
+        for sec, targets in self._section_groups.get(key, {}).items():
+            if first in targets:
+                section_key = sec
+                break
+        self._sync_section_tabs(key, section_key)
+        QTimer.singleShot(0, lambda: self.fit_to_content(True, animate_window=True))
+        QTimer.singleShot(500, lambda: self._scroll_section_into_view(key, first))
+
+    def _on_section_chip(self, key: str, section: str):
+        """顶部小节按钮 → 展开对应折叠面板，其余同页面板手风琴收起。"""
+        self._on_nav_page(key, ensure=False)
+        widget = self._page_widget(key)
+        if widget is None:
+            return
+        groups = [g for g in getattr(widget, "_collapsible_groups", []) if g is not None]
+        targets = [g for g in self._section_groups.get(key, {}).get(section, [])
+                   if g is not None]
+        if not targets:
+            return
+        for g in groups:
+            if g in targets:
+                if g.is_collapsed():
+                    g.set_collapsed(False, animate=True)
+            elif not g.is_collapsed():
+                g.set_collapsed(True, animate=True)
+        QTimer.singleShot(0, lambda: self.fit_to_content(True, animate_window=True))
+        # 展开动画 420ms + 窗口弹性动画 300ms 结束后，再把面板滚入可视区
+        first = targets[0]
+        QTimer.singleShot(500, lambda: self._scroll_section_into_view(key, first))
+
+    def focus_page(self, key: str):
+        """程序切换页面（托盘通知点击、监控失败跳转等）：同步导航高亮。"""
+        page = self.page_map.get(key)
+        if page is None:
+            return
+        self.page_stack.setCurrentWidget(page)
+        try:
+            self.nav.select_page(key)
+        except Exception:
+            pass
+        self.header.set_page_name(self._page_titles.get(key, ""))
+        self._sync_compact_btn(self.page_stack.currentIndex())
+        self._ensure_page_visible(key)
+
+    def _append_global_log(self, message, ts: Optional[str] = None):
+        """写底部全局日志坞（唯一入口，带时间戳与级别着色）。"""
+        try:
+            stamp = time.strftime("%H:%M:%S") if ts is None else ts
+            self.bottom_dock.log_text.append_log(message, stamp)
+        except Exception:
+            pass
+
+    def _on_theme_mode_from_settings(self, mode: str) -> None:
+        """「全量设置 → 外观主题」里选择了主题：应用并持久化。"""
+        if mode == ui_theme.current_mode():
+            self.global_settings_tab.sync_theme_mode(mode)
+            return
+        self._apply_theme_mode(mode, announce=True)
+
+    def _refresh_selfpainted(self) -> None:
+        """全局 QSS / 玻璃质感变化后，通知自绘控件重绘（它们不走 QSS 背景）。"""
+        try:
+            self.header.update()
+            self.nav.refresh_theme()
+            self.bottom_dock.refresh_theme()
+            for tabs in getattr(self, "section_tabs", {}).values():
+                tabs.refresh_theme()
+        except Exception:
+            logger.debug("刷新自绘控件失败", exc_info=True)
+        standby = getattr(self, "standby", None)
+        if standby is not None:
+            try:
+                standby.update()
+            except Exception:
+                pass
+
+    def _on_glass_style_from_settings(self, style: str) -> None:
+        """「全量设置 → 外观主题」里选择了玻璃质感：应用并持久化。"""
+        if style == ui_theme.current_glass_style():
+            self.global_settings_tab.sync_glass_style(style)
+            return
+        self._apply_glass_style(style, announce=True)
+
+    def _apply_glass_style(self, style: str, announce: bool = False) -> None:
+        """应用玻璃质感（standard / clear / solid），与日间夜间主题独立组合。"""
+        app = QApplication.instance()
+        if app is None:
+            return
+        try:
+            applied = ui_theme.apply_glass_style(app, style)
+        except Exception:
+            logger.exception("切换玻璃质感失败")
+            return
+        settings_page = getattr(self, "global_settings_tab", None)
+        if settings_page is not None:
+            try:
+                settings_page.sync_glass_style(applied)
+            except Exception:
+                logger.debug("同步玻璃质感单选失败", exc_info=True)
+        self._refresh_selfpainted()
+        if not announce:
+            return
+        names = {
+            ui_theme.GLASS_STANDARD: "经典磨砂",
+            ui_theme.GLASS_CLEAR: "通透玻璃",
+            ui_theme.GLASS_SOLID: "实心高对比",
+        }
+        self.log(f"[界面] 玻璃质感已改为{names.get(applied, applied)}")
+
+    def _on_theme_toggled(self):
+        """日间 → 夜间 → 跟随系统，循环切换（持久化，重启后保持）。"""
+        app = QApplication.instance()
+        if app is None:
+            return
+        mode = ui_theme.current_mode()
+        if mode == ui_theme.LIGHT:
+            nxt = ui_theme.DARK
+        elif mode == ui_theme.DARK:
+            nxt = ui_theme.AUTO
+        else:
+            nxt = ui_theme.LIGHT
+        self._apply_theme_mode(nxt, announce=True)
+
+    def _apply_theme_mode(self, mode: str, announce: bool = False) -> None:
+        """应用主题（light / dark / auto）并刷新所有自绘控件。"""
+        app = QApplication.instance()
+        if app is None:
+            return
+        try:
+            ui_theme.apply_theme(app, mode)
+            ui_theme.save_theme(mode)
+        except Exception:
+            logger.exception("切换主题失败")
+            return
+        self.header.set_theme_mode(mode)
+        # 全量设置页里的「外观主题」单选同步（跟随系统切换时也要回填）
+        settings_page = getattr(self, "global_settings_tab", None)
+        if settings_page is not None:
+            try:
+                settings_page.sync_theme_mode(mode)
+            except Exception:
+                logger.debug("同步主题单选失败", exc_info=True)
+        self._refresh_selfpainted()
+        self._sync_theme_watch()
+        if not announce:
+            return
+        if mode == ui_theme.AUTO:
+            theme = app.property("ui_theme")
+            self.log("[界面] 主题已改为跟随系统（当前"
+                     f"{'夜间' if theme == ui_theme.DARK else '日间'}模式）")
+        else:
+            self.log(f"[界面] 已切换到{'夜间' if mode == ui_theme.DARK else '日间'}模式")
+
+    # ---- 跟随系统主题：Qt 信号 + 定时兜底（部分 Qt 版本没有 colorScheme 信号）----
+    def _setup_theme_watch(self) -> None:
+        try:
+            hints = QApplication.instance().styleHints()
+            signal = getattr(hints, "colorSchemeChanged", None)
+            if signal is not None:
+                signal.connect(self._on_system_theme_changed)
+        except Exception:
+            logger.debug("无法监听系统深浅色变化，改用定时检测", exc_info=True)
+        self._theme_watch_timer = QTimer(self)
+        self._theme_watch_timer.setInterval(8000)
+        self._theme_watch_timer.timeout.connect(self._poll_system_theme)
+        self._sync_theme_watch()
+
+    def _sync_theme_watch(self) -> None:
+        timers = getattr(self, "_theme_watch_timer", None)
+        if timers is None:
+            return
+        app = QApplication.instance()
+        mode = app.property("ui_theme_mode") if app is not None else ""
+        if mode == ui_theme.AUTO:
+            if not timers.isActive():
+                timers.start()
+        elif timers.isActive():
+            timers.stop()
+
+    def _on_system_theme_changed(self, *_args) -> None:
+        self._poll_system_theme()
+
+    def _poll_system_theme(self) -> None:
+        """跟随系统时：系统深浅色变化了就立刻重刷主题。"""
+        app = QApplication.instance()
+        if app is None:
+            return
+        if app.property("ui_theme_mode") != ui_theme.AUTO:
+            return
+        if ui_theme.system_theme() != app.property("ui_theme"):
+            self._apply_theme_mode(ui_theme.AUTO)
+
+    # ---- 无边框窗口：最大化 / 边缘缩放 ----
+    def _toggle_maximize(self) -> None:
+        """标题栏最大化按钮：在最大化与还原之间切换。"""
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
+    def _install_edge_handles(self) -> None:
+        """在窗口四周铺 8 条透明缩放热区（无边框窗口的“系统边框”）。"""
+        central = self.centralWidget()
+        if central is None or getattr(self, "_edge_handles", None):
+            return
+        specs = (
+            ("left", Qt.Edge.LeftEdge, Qt.CursorShape.SizeHorCursor),
+            ("right", Qt.Edge.RightEdge, Qt.CursorShape.SizeHorCursor),
+            ("top", Qt.Edge.TopEdge, Qt.CursorShape.SizeVerCursor),
+            ("bottom", Qt.Edge.BottomEdge, Qt.CursorShape.SizeVerCursor),
+            ("top_left", Qt.Edge.LeftEdge | Qt.Edge.TopEdge,
+             Qt.CursorShape.SizeFDiagCursor),
+            ("top_right", Qt.Edge.RightEdge | Qt.Edge.TopEdge,
+             Qt.CursorShape.SizeBDiagCursor),
+            ("bottom_left", Qt.Edge.LeftEdge | Qt.Edge.BottomEdge,
+             Qt.CursorShape.SizeBDiagCursor),
+            ("bottom_right", Qt.Edge.RightEdge | Qt.Edge.BottomEdge,
+             Qt.CursorShape.SizeFDiagCursor),
+        )
+        for name, edges, shape in specs:
+            handle = ui_shell.WindowEdgeHandle(central, edges, shape)
+            handle.raise_()
+            self._edge_handles[name] = handle
+        self._layout_edge_handles()
+
+    def _layout_edge_handles(self) -> None:
+        """把 8 条缩放热区贴到窗口四边（全部落在 10px 外层留白内）。"""
+        central = self.centralWidget()
+        handles = getattr(self, "_edge_handles", None)
+        if central is None or not handles:
+            return
+        w, h = central.width(), central.height()
+        t, corner = 6, 10
+        rects = {
+            "left": QRect(0, corner, t, max(0, h - 2 * corner)),
+            "right": QRect(w - t, corner, t, max(0, h - 2 * corner)),
+            "top": QRect(corner, 0, max(0, w - 2 * corner), t),
+            "bottom": QRect(corner, h - t, max(0, w - 2 * corner), t),
+            "top_left": QRect(0, 0, corner, corner),
+            "top_right": QRect(w - corner, 0, corner, corner),
+            "bottom_left": QRect(0, h - corner, corner, corner),
+            "bottom_right": QRect(w - corner, h - corner, corner, corner),
+        }
+        for name, handle in handles.items():
+            handle.setGeometry(rects[name])
+            handle.raise_()
+
+    def _sync_window_handles(self) -> None:
+        """最大化/全屏时隐藏缩放把手，并同步标题栏的最大化图标。"""
+        maximized = self.isMaximized() or self.isFullScreen()
+        for handle in getattr(self, "_edge_handles", {}).values():
+            handle.setVisible(not maximized)
+        header = getattr(self, "header", None)
+        if header is not None:
+            try:
+                header.set_maximized(self.isMaximized())
+            except Exception:
+                pass
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_edge_handles()
+        self._sync_window_handles()
+
+    def _hide_to_tray(self):
+        """隐藏主窗口（继续在托盘运行）。"""
+        try:
+            self.hide()
+            if getattr(self, "tray_icon", None) is not None and self._tray_available:
+                self.tray_icon.showMessage(
+                    APP_TITLE, "程序已隐藏到系统托盘，双击托盘图标可重新打开。",
+                    QSystemTrayIcon.MessageIcon.Information, 3000)
+        except Exception:
+            logger.exception("隐藏到托盘失败")
+
+    def _current_tab_content(self) -> QWidget:
+        """取当前页内的真实业务页面（穿透 ElasticPage / QScrollArea 包装层）。"""
+        page = self.page_stack.currentWidget()
+        return self._unwrap_page(page) if page is not None else page
+
+    def _set_standby(self, standby: bool) -> None:
+        """进入 / 退出待机画面。
+
+        进入后：左侧导航自动收成图标栏，右侧编辑区整体换成时钟待机画面，
+        底部日志坞与后台的发送 / 定时 / 监控任务完全不受影响。
+        """
+        standby = bool(standby)
+        if standby == getattr(self, "_standby_mode", False):
+            return
+        self._standby_mode = standby
+        if standby:
+            self.nav.set_rail(True)
+            # 天气 / 热点由 StandbyView.showEvent 里的 refresh_now 统一处理
+            # （只读缓存，按数据年龄决定要不要后台更新），这里不要重复触发
+            self.header.set_page_name("待机中")
+            self.standby.setVisible(True)
+            self.page_stack.setVisible(False)
+            # 关键：编辑区隐藏后窗口不会自动跟着待机内容走，若之前停在较大/较小
+            # 的页面（如自动发送页），待机画面就会被裁掉、要滚动才能看全。
+            # 这里按待机内容自适应窗口高度，并在导航收起动画、新闻/天气异步
+            # 加载完成后分几拍校正（用户手动改过窗口则不再动）。
+            self._standby_fit_geo = None
+            QTimer.singleShot(0, self._fit_standby_window)
+            for delay in (400, 1200, 3000):
+                QTimer.singleShot(delay, self._refit_standby_if_idle)
+        else:
+            # 离开待机：先把内嵌新闻页收起来，回到编辑页时是干净状态
+            self.standby.close_browser(animate=False)
+            self._standby_fit_geo = None
+            self._pre_browser_geo = None
+            self.page_stack.setVisible(True)
+            self.standby.setVisible(False)
+            # 主动退出待机本身就是一次操作：刷新空闲计时，避免下一个 tick
+            # 立刻又按“旧时间”自动进入待机
+            self._last_app_action_ts = time.monotonic()
+            self.header.set_page_name(
+                self._page_titles.get(self.nav.active_page(), ""))
+            QTimer.singleShot(0, lambda: self.fit_to_content(True))
+        self.header.set_density(standby)
+
+    def _apply_standby_idle_settings(self) -> None:
+        """读取「全量设置 → 待机与空闲」，配置空闲自动待机定时器。"""
+        tab = getattr(self, "global_settings_tab", None)
+        settings = getattr(tab, "settings", {}) if tab is not None else {}
+        standby = settings.get("standby") or {}
+        self._idle_standby_enabled = bool(standby.get("idle_enabled", True))
+        try:
+            minutes = int(standby.get("idle_minutes", 10))
+        except (TypeError, ValueError):
+            minutes = 10
+        self._idle_standby_minutes = max(1, min(120, minutes))
+        timer = getattr(self, "_idle_standby_timer", None)
+        if timer is None:
+            return
+        if self._idle_standby_enabled:
+            if not timer.isActive():
+                timer.start()
+        else:
+            timer.stop()
+
+    def _on_idle_standby_tick(self) -> None:
+        """空闲检查：本软件内无操作达到阈值时自动进入待机画面。"""
+        if not getattr(self, "_idle_standby_enabled", True):
+            return
+        if getattr(self, "_standby_mode", False):
+            return
+        # 隐藏/最小化期间不计空闲；恢复显示后重新计时，避免一打开就立刻待机
+        if not self.isVisible() or self.isMinimized():
+            self._last_app_action_ts = time.monotonic()
+            return
+        # 弹窗（如详情/确认框）打开时不强制切画面，避免打断用户操作
+        if QApplication.activeModalWidget() is not None:
+            self._last_app_action_ts = time.monotonic()
+            return
+        idle_seconds = time.monotonic() - getattr(
+            self, "_last_app_action_ts", time.monotonic())
+        if idle_seconds < self._idle_standby_minutes * 60:
+            return
+        self._set_standby(True)
+        self.log(f"[界面] 已空闲 {self._idle_standby_minutes} 分钟，自动进入待机画面")
+
+    def _fit_standby_window(self, width: Optional[int] = None) -> None:
+        """进入待机后按待机画面的内容自适应窗口大小（重点是高度）。
+
+        宽度默认保持用户当前窗口宽度，只把高度调整到「待机内容刚好不需要滚动」，
+        并约束在屏幕可用区域内；最大化 / 全屏时保持不动。
+        :param width: 指定目标宽度（从内嵌新闻页返回时用来恢复打开前的宽度）。
+        """
+        if not getattr(self, "_standby_mode", False) or not self.isVisible():
+            return
+        if self.isMinimized() or self.isMaximized() or self.isFullScreen():
+            return
+        if self.standby.is_browser_open():
+            return  # 正在看内嵌新闻页，不要把窗口收回到待机尺寸
+        app = QApplication.instance()
+        if app is not None:
+            # 先吃掉挂起的布局事件，保证读到收起导航后的真实视口宽度
+            app.sendPostedEvents(None, QEvent.Type.LayoutRequest)
+        standby = self.standby
+        scroll = standby.scroll_area()
+        viewport_w = max(320, scroll.viewport().width())
+        content_h = standby.preferred_height(viewport_w)
+        chrome_h = max(0, standby.height() - scroll.viewport().height())
+        delta_h = max(0, self.height() - standby.height())
+        target_h = content_h + chrome_h + delta_h
+        screen = (QGuiApplication.screenAt(self.geometry().center())
+                  or QGuiApplication.primaryScreen())
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        w = max(760, min(int(width or self.width()), avail.width()))
+        h = max(470, min(target_h, avail.height()))
+        geo = self.geometry()
+        x = max(avail.left(), min(geo.x(), avail.right() - w + 1))
+        y = max(avail.top(), min(geo.y(), avail.bottom() - h + 1))
+        target = QRect(x, y, w, h)
+        self._standby_fit_geo = QRect(target)
+        self._animate_window_geometry(target)
+
+    def _refit_standby_if_idle(self) -> None:
+        """待机内容异步加载完成后再校正一次；用户手动改过窗口则不再干预。"""
+        if not getattr(self, "_standby_mode", False):
+            return
+        if self.standby.is_browser_open():
+            return
+        fit = getattr(self, "_standby_fit_geo", None)
+        if fit is None or self.geometry() != fit:
+            return
+        self._fit_standby_window()
+
+    def _on_standby_browser_open(self, opened: bool) -> None:
+        """待机页内嵌浏览器滑入 / 滑出：放大窗口便于阅读，返回时收回待机尺寸。"""
+        if not getattr(self, "_standby_mode", False):
+            return
+        if opened:
+            if getattr(self, "_pre_browser_geo", None) is None:
+                self._pre_browser_geo = QRect(self.geometry())
+            self._standby_fit_geo = None
+            self._expand_for_browser()
+        else:
+            pre = getattr(self, "_pre_browser_geo", None)
+            self._pre_browser_geo = None
+            # 回到打开前的宽度，并按当前待机内容重新贴合高度
+            self._fit_standby_window(width=pre.width() if pre is not None else None)
+
+    def _expand_for_browser(self) -> None:
+        """打开内嵌新闻页时把窗口放大到便于阅读的尺寸（不超出屏幕可用区）。"""
+        if (not self.isVisible() or self.isMinimized()
+                or self.isMaximized() or self.isFullScreen()):
+            return
+        screen = (QGuiApplication.screenAt(self.geometry().center())
+                  or QGuiApplication.primaryScreen())
+        if screen is None:
+            return
+        avail = screen.availableGeometry()
+        w = max(self.width(), min(1180, max(760, avail.width() - 40)))
+        h = max(self.height(), min(840, max(470, avail.height() - 60)))
+        geo = self.geometry()
+        x = max(avail.left(), min(geo.x(), avail.right() - w + 1))
+        y = max(avail.top(), min(geo.y(), avail.bottom() - h + 1))
+        self._standby_fit_geo = None
+        self._animate_window_geometry(QRect(x, y, w, h))
+
+    def _on_compact_toggle(self):
+        """标题栏「待机 / 返回编辑」按钮（保留旧方法名以兼容既有连接）。"""
+        self._set_standby(not getattr(self, "_standby_mode", False))
+
+    def _sync_compact_btn(self, _index=0):
+        """切换页面后按新页理想尺寸适应（待机模式下不干预窗口）。"""
+        if getattr(self, "_standby_mode", False):
+            return
         QTimer.singleShot(0, lambda: self.fit_to_content(True))
 
+    def eventFilter(self, obj, event):
+        """软件内任意窗口的鼠标/键盘操作都刷新空闲计时（用于自动待机）。"""
+        try:
+            if event.type() in _APP_ACTIVITY_EVENTS:
+                self._last_app_action_ts = time.monotonic()
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
     def changeEvent(self, event):
-        """系统明暗（夜间/日间）主题切换时，重刷精简按钮配色。"""
+        """系统明暗（夜间/日间）主题切换时，重刷自绘导航与标题栏配色。"""
         super().changeEvent(event)
         if event.type() == QEvent.Type.PaletteChange:
             try:
-                self.compact_btn.setStyleSheet(_compact_btn_css())
+                self.nav.refresh_theme()
+                self.bottom_dock.refresh_theme()
+                for tabs in getattr(self, "section_tabs", {}).values():
+                    tabs.refresh_theme()
+                self.header.set_theme_mode(ui_theme.current_mode())
             except Exception:
                 pass
         elif event.type() == QEvent.Type.WindowStateChange:
+            # 最大化/还原/最小化切换：同步标题栏图标与边缘缩放把手
+            QTimer.singleShot(0, self._sync_window_handles)
             # 从最小化恢复：最小化期间折叠/展开被跳过，恢复后补一次自适应
             if not self.isMinimized() and not self.isMaximized() \
                     and not self.isFullScreen() and self._startup_fit_done:
                 QTimer.singleShot(0, lambda: self.fit_to_content(True))
 
+    def hideEvent(self, event):
+        """隐藏到托盘 / 最小化：保持当前界面状态（待机画面原样保留）。
+
+        以前这里会强制退出待机，导致“待机中最小化或关闭到托盘，再从托盘/桌面
+        图标打开就变回编辑模式”。用户预期是保持待机，只有主动点“返回编辑”
+        或点导航页面才退出，因此隐藏时不再改动待机状态。
+        """
+        super().hideEvent(event)
+
     def showEvent(self, event):
         """首次显示后按内容理想尺寸自适应一次，修复启动时部分文字被压缩。"""
         super().showEvent(event)
+        # 无边框窗口：显示后再铺一次缩放把手，确保贴在最终窗口尺寸上
+        self._layout_edge_handles()
+        self._sync_window_handles()
+        if getattr(self, "_standby_mode", False):
+            # 待机画面在最小化 / 隐藏到托盘后重新打开时保持原状（不切回编辑模式）。
+            # 用户重新打开就是一次操作，先刷新空闲计时；再按待机内容补一次尺寸校正
+            # （用户手动改过窗口时 _refit_standby_if_idle 不会动它）。
+            self._last_app_action_ts = time.monotonic()
+            if getattr(self, "_standby_fit_geo", None) is None:
+                QTimer.singleShot(0, self._fit_standby_window)
+            else:
+                QTimer.singleShot(0, self._refit_standby_if_idle)
         if not self._startup_fit_done:
             self._startup_fit_done = True
             QTimer.singleShot(0, lambda: self.fit_to_content(True))
@@ -8600,11 +9636,13 @@ class MainWindow(QMainWindow):
           刚好不裁切内容的最小尺寸；
         - expanding=True（展开触发）：目标取当前页 sizeHint，窗口放大到理想尺寸；
         - expanding=None（如切换 tab）：仅保证不小于 minimumSizeHint，不强行放大。
-        - 注意不能用 QTabWidget.sizeHint()：QStackedWidget 会取所有页面的最大值，
+        - 注意不能用整个页面栈的 sizeHint：QStackedWidget 会取所有页面的最大值，
           当前页折叠后它仍报其它页的大尺寸，无法用于弹性收缩。
         - 限制在屏幕可用区域内，保留最小尺寸地板；最大化/全屏/未显示时不干预。
         """
         try:
+            if getattr(self, "_standby_mode", False):
+                return  # 待机画面下编辑区已隐藏，不参与弹性尺寸计算
             if (
                 not self.isVisible()
                 or self.isMinimized()
@@ -8617,14 +9655,26 @@ class MainWindow(QMainWindow):
             app = QApplication.instance()
             if app is not None:
                 app.sendPostedEvents(None, QEvent.Type.LayoutRequest)
-            page = self.tab_widget.currentWidget()
+            page = self.page_stack.currentWidget()
             if page is None:
                 return
-            min_hint = page.minimumSizeHint()
+            # 用真实业务页面（穿透 QScrollArea）的尺寸提示：
+            # 滚动区只负责“装不下时可滚动”，不参与窗口弹性尺寸计算，
+            # 否则滚动区的最小尺寸会让窗口过度收缩、内容藏进滚动条里。
+            content = self._unwrap_page(page)
+            # 页面内除业务内容外还有顶部小节切换条等“镶边”：目标尺寸必须把
+            # 这部分算进去，否则展开面板后窗口会短一截（正好差切换条的高度），
+            # 表现为「点开小节后还得往下滚动才能看到内容」。
+            chrome_w = chrome_h = 0
+            scroll = page.content_widget() if isinstance(page, ElasticPage) else None
+            if isinstance(scroll, QScrollArea):
+                chrome_w = max(0, page.width() - scroll.width())
+                chrome_h = max(0, page.height() - scroll.height())
+            min_hint = content.minimumSizeHint()
             if not min_hint.isValid() or min_hint.width() <= 0:
-                min_hint = page.sizeHint()
+                min_hint = content.sizeHint()
             if expanding:
-                hint = page.sizeHint()
+                hint = content.sizeHint()
                 if not hint.isValid() or hint.width() <= 0:
                     hint = min_hint
                 # 展开时理想尺寸与最小尺寸取较大者
@@ -8637,8 +9687,8 @@ class MainWindow(QMainWindow):
             # 加上非页面部分增量（tab 栏高度、边框等）：当前窗口尺寸减去页面实际尺寸
             delta_w = self.width() - page.width()
             delta_h = self.height() - page.height()
-            target_w += max(0, delta_w)
-            target_h += max(0, delta_h)
+            target_w += max(0, delta_w) + chrome_w
+            target_h += max(0, delta_h) + chrome_h
 
             screen = (
                 QGuiApplication.screenAt(self.geometry().center())
@@ -8647,7 +9697,7 @@ class MainWindow(QMainWindow):
             if screen is None:
                 return
             avail = screen.availableGeometry()
-            min_w, min_h = 520, 300
+            min_w, min_h = 760, 470
             w = max(min_w, min(target_w, avail.width()))
             h = max(min_h, min(target_h, avail.height()))
             # 关键：setGeometry 设的是客户区几何，屏幕可用区约束的是整个窗口
@@ -8703,12 +9753,59 @@ class MainWindow(QMainWindow):
             self.log(f"[系统] 任务栏进度条初始化异常: {exc}")
         return self._taskbar if self._taskbar is not False else None
 
-    def _begin_send_progress(self):
-        # 终态门禁：完成/出错弹窗正等待用户点击时，忽略新的“开始”（如定时任务
-        # 恰好并发触发），不得把定格标题/任务栏冲回“发送中…”。新一轮正常发送
-        # 只会在弹窗关闭（门闩复位）后由用户手动启动。
-        if self._progress_waiting_dismiss:
+    def _set_dock_progress(self, current, total, text: str) -> None:
+        """更新底部常驻坞的“发送进度”条与状态文字（定时/配置链同样可见）。
+
+        total 传 None 表示不确定进度（忙碌条），传数字则按 0..total 显示。
+        """
+        dock = getattr(self, "bottom_dock", None)
+        if dock is None:
             return
+        try:
+            bar = dock.progress_bar
+            if total is None:
+                self._dock_progress_busy = True
+                bar.setRange(0, 0)
+            else:
+                self._dock_progress_busy = False
+                total = max(1, int(total))
+                current = max(0, min(int(current), total))
+                bar.setRange(0, total)
+                bar.setValue(current)
+            dock.progress_label.setText(str(text))
+        except Exception:
+            pass
+
+    def _reset_dock_progress(self) -> None:
+        """发送结束/取消后把底部进度条恢复为等待状态。"""
+        dock = getattr(self, "bottom_dock", None)
+        if dock is None:
+            return
+        try:
+            dock.progress_bar.setRange(0, 100)
+            dock.progress_bar.setValue(0)
+            dock.progress_label.setText("等待发送…")
+            self._dock_progress_busy = False
+        except Exception:
+            pass
+
+    def _begin_send_progress(self, owner: str = "manual"):
+        """开始一轮发送进度显示（任务栏 / 窗口标题 / 底部坞进度条）。
+
+        :param owner: "manual" = 手动数据发送；"schedule" = 定时任务/配置链。
+            手动发送的完成/出错弹窗还开着（门闩为 True）时，手动新发送会被
+            忽略，避免把定格标题冲回“发送中…”；定时任务走
+            _begin_schedule_progress，会先清门闩再进来，因此不会被挡住。
+        """
+        if owner == "manual":
+            # 终态门禁：完成/出错弹窗正等待用户点击时，忽略新的“开始”（如定时任务
+            # 恰好并发触发），不得把定格标题/任务栏冲回“发送中…”。
+            if self._progress_waiting_dismiss:
+                return
+        else:
+            # 定时任务接管：手动弹窗的门闩不再影响定时进度
+            self._progress_waiting_dismiss = False
+        self._progress_owner = owner
         self._send_progress_active = True
         tb = self._ensure_taskbar()
         if tb:
@@ -8716,19 +9813,47 @@ class MainWindow(QMainWindow):
             self.log("[系统] 任务栏进度条：开始显示发送进度")
         else:
             self.log("[系统] 任务栏进度条未就绪，仅在窗口标题和托盘显示进度")
+        self._set_dock_progress(0, None, "发送中…")
         self.setWindowTitle(f"📤 发送中… - {APP_TITLE}")
         try:
             self.tray_icon.setToolTip(f"{APP_TITLE}\n📤 发送中…")
         except Exception:
             pass
 
+    def _begin_schedule_progress(self):
+        """定时任务（纯文字 / 配置链，含立即执行）接管进度显示。
+
+        worker 刚创建时就会通知这里，但真正开始发送还要等全局批次锁；
+        如果此时手动发送正在跑，先不抢进度显示（避免两条发送的进度互相覆盖），
+        等定时任务发出第一条真实进度时由 _ensure_schedule_progress 接管。
+        """
+        if (self._send_progress_active and self._progress_owner == "manual"
+                and not self._progress_waiting_dismiss):
+            return
+        self._begin_send_progress("schedule")
+
+    def _ensure_schedule_progress(self):
+        """定时任务真正开始发送（已拿到批次锁）→ 无条件接管进度显示。
+
+        手动发送的完成弹窗此时可能还开着（门闩为 True）：必须清掉门闩并切换
+        进度归属，否则定时任务的第一条进度会被门闩丢弃，表现为“没有进度条”。
+        """
+        if self._progress_owner == "schedule" and self._send_progress_active:
+            return
+        self._begin_send_progress("schedule")
+
+    def _progress_blocked(self) -> bool:
+        """进度更新是否应当丢弃：只有手动发送自己的完成弹窗等待期会拦截。"""
+        return bool(self._progress_waiting_dismiss) and \
+            self._progress_owner != "schedule"
+
     def _update_send_progress(self, current, total):
         # 终态门禁：定格期间迟到的 progress（队列残留/并发 worker）一律丢弃
-        if self._progress_waiting_dismiss:
+        if self._progress_blocked():
             return
         if not self._send_progress_active:
             self._begin_send_progress()
-        if self._progress_waiting_dismiss:
+        if self._progress_blocked():
             return
         try:
             current = max(0, int(current))
@@ -8739,38 +9864,47 @@ class MainWindow(QMainWindow):
         tb = self._ensure_taskbar()
         if tb:
             tb.set_value(current, total)
-        title = f"📤 发送中 {current}/{total} ({pct}%) - {APP_TITLE}"
+        label = f"发送中 {current}/{total} ({pct}%)"
+        self._set_dock_progress(current, total, label)
+        title = f"📤 {label} - {APP_TITLE}"
         self.setWindowTitle(title)
         try:
             self.tray_icon.setToolTip(f"{APP_TITLE}\n{title}")
         except Exception:
             pass
 
-    def _update_schedule_send_progress(self, p_cur, p_total, s_cur, s_total):
-        """定时配置链发送进度：标题同时显示发送进度和链路进度。
+    def _update_schedule_text_progress(self, current, total):
+        """纯文字定时任务的发送进度（格式与手动一致，但进度归属定时任务）。"""
+        self._ensure_schedule_progress()
+        self._update_send_progress(current, total)
 
-        格式：📤 发送中 5/10 (50%) 链路1/3 - {APP_TITLE}
+    def _update_schedule_send_progress(self, p_cur, p_total, s_cur, s_total):
+        """定时配置链发送进度：底部进度条按当前配置链的人数单独计算。
+
+        例如第 1 条链路 10 人：进度条 3/10，文字「发送中配置链 1/2：3/10」；
+        第 2 条链路开始后进度条重新按第 2 条链路的人数计算。
         """
+        self._ensure_schedule_progress()
         # 终态门禁：定格期间迟到的 progress 一律丢弃
-        if self._progress_waiting_dismiss:
-            return
-        if not self._send_progress_active:
-            self._begin_send_progress()
-        if self._progress_waiting_dismiss:
+        if self._progress_blocked():
             return
         try:
-            s_cur = max(0, int(s_cur))
-            s_total = max(1, int(s_total))
-            p_cur = max(0, int(p_cur))
+            p_cur = max(1, int(p_cur))
             p_total = max(1, int(p_total))
-            pct = int(s_cur * 100 / s_total)
+            s_cur = max(0, int(s_cur))
+            s_total = max(0, int(s_total))
+            pct = int(s_cur * 100 / s_total) if s_total else 0
         except Exception:
             return
         tb = self._ensure_taskbar()
         if tb:
-            tb.set_value(s_cur, s_total)
-        title = (f"📤 发送中 {s_cur}/{s_total} ({pct}%) "
-                 f"链路{p_cur}/{p_total} - {APP_TITLE}")
+            tb.set_value(s_cur, max(1, s_total))
+        if p_total > 1:
+            label = f"发送中配置链 {p_cur}/{p_total}：{s_cur}/{s_total} ({pct}%)"
+        else:
+            label = f"发送中配置链 {p_cur}：{s_cur}/{s_total} ({pct}%)"
+        self._set_dock_progress(s_cur, s_total, label)
+        title = f"📤 {label} - {APP_TITLE}"
         self.setWindowTitle(title)
         try:
             self.tray_icon.setToolTip(f"{APP_TITLE}\n{title}")
@@ -8783,8 +9917,12 @@ class MainWindow(QMainWindow):
         该状态一直保持到用户点掉完成弹窗（_dismiss_send_progress），
         不再像之前那样 result 一到就清除，导致弹窗还开着任务栏已无数。
         """
+        if self._progress_owner == "schedule":
+            # 定时任务已接管进度显示：手动发送迟到的完成态不得覆盖定时进度
+            return
         if not self._send_progress_active:
             self._begin_send_progress()
+        self._progress_owner = "manual"
         self._progress_waiting_dismiss = True
         # 看门狗：完成弹窗若因窗口在托盘/系统异常/无人值守长时间未关闭，
         # 60 秒后自动收尾，杜绝标题永久停在发送态
@@ -8813,8 +9951,12 @@ class MainWindow(QMainWindow):
 
     def _show_send_error(self):
         """发送异常的“定格”展示：红色任务栏 + 标题提示，等用户点掉错误弹窗。"""
+        if self._progress_owner == "schedule":
+            # 定时任务已接管进度显示：手动发送迟到的错误态不得覆盖定时进度
+            return
         if not self._send_progress_active:
             self._begin_send_progress()
+        self._progress_owner = "manual"
         self._progress_waiting_dismiss = True
         # 看门狗：错误弹窗同样可能无人关闭，60 秒后自动收尾
         QTimer.singleShot(60000, self._dismiss_progress_if_waiting)
@@ -8829,17 +9971,24 @@ class MainWindow(QMainWindow):
             pass
 
     def _dismiss_send_progress(self, failed=0):
-        """用户在完成/错误弹窗点击确定后调用：恢复标题、清除任务栏进度。"""
+        """用户在完成/错误弹窗点击确定后调用：恢复标题、清除任务栏进度。
+
+        只有进度仍归属于手动发送时才收尾：手动弹窗开着期间定时任务可能已接管
+        进度（owner="schedule"），或定时任务已经完成（owner=None，底部坞保留
+        定时结果），此时关闭旧的手动弹窗不得清掉定时进度/结果。
+        """
+        if self._progress_owner != "manual":
+            return
         self._progress_waiting_dismiss = False
         self._finish_send_progress(failed)
 
     def _dismiss_progress_if_waiting(self):
         """看门狗兜底：弹窗超时未关闭时自动恢复标题/任务栏。"""
-        if self._progress_waiting_dismiss:
+        if self._progress_waiting_dismiss and self._progress_owner == "manual":
             self._progress_waiting_dismiss = False
             self._finish_send_progress(0)
 
-    def _finish_send_progress(self, failed=0):
+    def _finish_send_progress(self, failed=0, success=None, total=None):
         # 门闩保护：完成弹窗仍在等待点击时（可能是并发的定时任务结束来清理），
         # 不得提前清除定格状态；弹窗关闭时 _dismiss_send_progress 会统一收尾
         if self._progress_waiting_dismiss:
@@ -8855,18 +10004,38 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._send_progress_active = False
+        self._progress_owner = None
+        if success is None:
+            # 手动发送的弹窗收尾：底部进度条回到等待状态即可
+            self._reset_dock_progress()
+        else:
+            # 定时任务收尾：把“成功/失败”结果留在底部坞，方便回头核对
+            try:
+                success = max(0, int(success))
+            except (TypeError, ValueError):
+                success = 0
+            failed = max(0, int(failed or 0))
+            total = max(1, int(total if total is not None else success + failed))
+            label = (f"发送结束：成功 {success}，失败 {failed}"
+                     if failed else f"发送完成：成功 {success} 人")
+            self._set_dock_progress(success + failed, total, label)
         # 有失败时红色状态停留 4 秒再清，提示用户注意
         if tb and failed:
             QTimer.singleShot(4000, lambda: tb.clear() if tb else None)
 
-    def _force_finish_schedule_progress(self, failed=0):
+    def _force_finish_schedule_progress(self, failed=0, success=None):
         """定时任务结束后强制恢复标题/任务栏（兜底机制）。
 
         不看门闩、不看 _send_progress_active，无条件清除，确保无人值守时
         窗口标题和任务栏进度条不会永久停在“发送中…”。
         _on_schedule_result 已做过正常收尾时这里是空操作，无副作用。
+        传了 success 时会把成功/失败结果留在底部坞；否则仅把忙碌条收回。
         """
         self._progress_waiting_dismiss = False
+        try:
+            fail = max(0, int(failed or 0))
+        except (TypeError, ValueError):
+            fail = 0
         tb = self._ensure_taskbar()
         if tb:
             try:
@@ -8877,13 +10046,35 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(APP_TITLE)
         except Exception:
             pass
+        if success is not None:
+            # 已知成功数：把本轮结果留在底部坞（与 _finish_send_progress 一致），
+            # 避免结束后底部还停在最后一条链路的“发送中…”文字
+            try:
+                ok = max(0, int(success or 0))
+            except (TypeError, ValueError):
+                ok = 0
+            label = (f"发送结束：成功 {ok}，失败 {fail}" if fail
+                     else f"发送完成：成功 {ok} 人")
+            self._set_dock_progress(ok + fail, max(1, ok + fail), label)
+        elif getattr(self, "_dock_progress_busy", False):
+            # 若界面还停在“不确定进度”的忙碌条（结束信号丢失的兜底路径），
+            # 这里把底部进度条也收回去，避免永远转圈。
+            self._reset_dock_progress()
+            if fail:
+                dock = getattr(self, "bottom_dock", None)
+                if dock is not None:
+                    try:
+                        dock.progress_label.setText(f"发送结束：失败 {fail}")
+                    except Exception:
+                        pass
         try:
             self.tray_icon.setToolTip(APP_TITLE)
         except Exception:
             pass
         self._send_progress_active = False
+        self._progress_owner = None
         # 有失败时自动展开日志面板，确保用户能看到失败详情
-        if failed:
+        if fail:
             self._expand_log_on_failure()
 
     def _show_schedule_toast(self, msg, success):
@@ -8897,27 +10088,20 @@ class MainWindow(QMainWindow):
             pass
 
     def _expand_log_on_failure(self):
-        """发送有失败时自动展开对应日志面板，确保用户能看到结果。
+        """发送有失败时让底部常驻日志坞呼吸高亮（日志一直可见，无需展开）。
 
-        手动发送/auto_send → 展开数据发送页日志面板；
-        定时任务/立即执行/配置链 → 展开定时页日志面板；
-        两个都展开以防当前不在对应 tab。
-        所有操作都在主线程（由信号排队触发），线程安全。
+        手动发送 / 定时任务 / 配置链 / 监控轮询的日志都写同一个底部入口，
+        这里只做视觉提醒 + 保证自动跟随，且全部在主线程执行。
         """
         try:
-            tft = self.table_filter_tab
-            if tft is not None and hasattr(tft, "log_group"):
-                lg = tft.log_group
-                if lg is not None and lg.is_collapsed():
-                    lg.set_collapsed(False, animate=True)
-        except Exception:
-            pass
-        try:
-            st = self.schedule_tab
-            if st is not None and hasattr(st, "schedule_log_group"):
-                lg = st.schedule_log_group
-                if lg is not None and lg.is_collapsed():
-                    lg.set_collapsed(False, animate=True)
+            dock = getattr(self, "bottom_dock", None)
+            if dock is None:
+                return
+            if not dock.follow_check.isChecked():
+                dock.follow_check.setChecked(True)
+            sb = dock.log_text.verticalScrollBar()
+            sb.setValue(sb.maximum())
+            dock.flash_attention()
         except Exception:
             pass
 
@@ -8940,6 +10124,9 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_table_progress_pct(self, current, total):
+        if self._progress_owner == "schedule":
+            # 定时任务已接管进度：手动 worker 迟到的进度不得覆盖
+            return
         self._update_send_progress(current, total)
 
     def _on_table_result(self, r):
@@ -8961,13 +10148,17 @@ class MainWindow(QMainWindow):
         连接是独立的；绑定方法 receiver 在主线程，AutoConnection → 排队到主线程。
         """
         try:
-            # emit 线程安全；_begin_send_progress 经排队在主线程执行，
-            # 保证本方法即便被调度线程调用也不会跨线程碰 GUI/COM
-            self._progress_begin_signal.emit()
-            worker.progress.connect(self._update_send_progress)
-            # 配置链特有的发送进度信号（链路当前, 链路总数, 发送当前, 发送总数）
+            # emit 线程安全；_begin_schedule_progress 经排队在主线程执行，
+            # 保证本方法即便被调度线程调用也不会跨线程碰 GUI/COM。
+            # 定时任务用独立信号：手动发送的完成弹窗还开着时也能接管进度显示。
+            self._schedule_progress_begin_signal.emit()
+            # 配置链特有的发送进度信号（链路当前, 链路总数, 发送当前, 发送总数）。
+            # 配置链不再接 progress（那是“第几个配置”），否则会用链路序号
+            # 覆盖掉按人数计算的进度条文字。
             if hasattr(worker, 'send_progress'):
                 worker.send_progress.connect(self._update_schedule_send_progress)
+            else:
+                worker.progress.connect(self._update_schedule_text_progress)
             worker.finished_with_result.connect(self._on_schedule_result)
             # 兜底：若结束信号因任何原因未到达，QThread 结束时也恢复标题/清任务栏，
             # 避免窗口标题永久停留在“发送中…”
@@ -8987,15 +10178,16 @@ class MainWindow(QMainWindow):
             ok_n = int(ok_n) if isinstance(ok_n, (int, float)) else 0
             fail = int(fail) if isinstance(fail, (int, float)) else 0
             if fail == 0:
-                toast_msg = f"定时任务发送成功，共 {ok_n} 条"
+                toast_msg = f"定时任务发送成功，共 {ok_n} 人"
             else:
                 names = [str(n) for n in (recipients or []) if str(n).strip()]
-                toast_msg = f"定时任务完成：成功 {ok_n}，失败 {fail}"
+                total_n = ok_n + fail
+                toast_msg = f"定时任务完成：共 {total_n} 人，成功 {ok_n}，失败 {fail}"
                 if names:
-                    shown = names[:5]
-                    suffix = f" 等{len(names)}人" if len(names) > 5 else ""
+                    shown = names[:8]
+                    suffix = f" 等{len(names)}人" if len(names) > 8 else ""
                     toast_msg += f"\n失败：{'、'.join(shown)}{suffix}"
-                toast_msg += "（点击查看）"
+                toast_msg += "\n完整名单已写入运行日志（点击查看）"
             logger.info(
                 "[定时] 弹出完成通知：成功=%s 失败=%s 失败人数=%s",
                 ok_n, fail, len(recipients or []))
@@ -9011,7 +10203,7 @@ class MainWindow(QMainWindow):
         # 无条件恢复：即便残留了手动发送的"等待关闭弹窗"门闩，也不能挡住定时收尾，
         # 否则无人值守时窗口标题会永久停在"发送中…"。
         self._progress_waiting_dismiss = False
-        self._finish_send_progress(fail)
+        self._finish_send_progress(fail, success=_ok)
         logger.info(
             "[定时] worker 完成信号到达：成功=%s 失败=%s", _ok, fail)
         # Toast 通知（定时任务完成；有失败时常驻等待手动关闭，并列出失败人名）
@@ -9028,7 +10220,7 @@ class MainWindow(QMainWindow):
         排队事件意外丢失，则由这里补发，保证无人值守时通知不缺席。
         """
         try:
-            self._force_finish_schedule_progress(failed)
+            self._force_finish_schedule_progress(failed, success)
         except Exception:
             logger.exception("[定时] 兜底收尾异常")
         if not self._schedule_result_toast_shown:
@@ -9040,14 +10232,18 @@ class MainWindow(QMainWindow):
         # finished 在 result/error 之后触发，会借完成弹窗的局部事件循环投递到主线程。
         # 若完成弹窗仍在等待用户点击，必须保留“已发送完成”定格状态，禁止提前清除；
         # 仅在 result/error 都没到达的异常退出场景下做兜底清除。
+        if self._progress_owner == "schedule":
+            # 定时任务已接管进度：手动 worker 迟到的 finished 不得清掉定时进度
+            return
         if self._progress_waiting_dismiss:
             return
         if self._send_progress_active:
             self._finish_send_progress(0)
 
     def _schedule_log_to_main(self, message):
+        """定时 / 监控 / 配置链日志统一写底部全局日志坞（带时间戳，单一路由）。"""
         try:
-            self.table_filter_tab.log(message)
+            self._append_global_log(message)
         except Exception:
             pass
 
@@ -9295,6 +10491,8 @@ class MainWindow(QMainWindow):
                 f"[定时] 任务「{task.name}」时间点 {slot} 完成："
                 f"成功{result['success']}，失败{result['failed']}"
             )
+            for line in _failed_name_lines(result.get("failed_list")):
+                self._post_schedule_log_from_worker(line)
             # 强制兜底恢复标题/任务栏：无论 worker 结束信号是否正确到达，
             # 分段等待循环一定退出（正常结束/超时/排队被停止），这里无条件恢复，
             # 杜绝标题永久停“发送中”
@@ -9390,7 +10588,7 @@ class MainWindow(QMainWindow):
             self.tray_icon.show()
 
     def log(self, message):
-        self.table_filter_tab.log(message)
+        self._append_global_log(message)
 
     def _on_autostart_toggled(self, checked: bool):
         ok = set_autostart(checked)
@@ -9693,10 +10891,24 @@ class MainWindow(QMainWindow):
 
 
 def run_gui():
+    # QtWebEngine（待机页的内置浏览器）要求在创建 QApplication 之前开启
+    # 共享 OpenGL 上下文；未安装 PyQt6-WebEngine 时该属性无副作用。
+    try:
+        QApplication.setAttribute(
+            Qt.ApplicationAttribute.AA_ShareOpenGLContexts, True)
+    except Exception:
+        logger.debug("设置 AA_ShareOpenGLContexts 失败，内置浏览器可能不可用",
+                     exc_info=True)
+
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     app.setQuitOnLastWindowClosed(False)
     app.setStyle("Fusion")
+    # 应用上次保存的日间/夜间主题（调色板 + 全局现代玻璃风 QSS）
+    try:
+        ui_theme.apply_theme(app, ui_theme.load_theme())
+    except Exception:
+        logger.exception("应用主题失败，使用默认 Fusion 样式")
     
     app_icon = get_application_icon()
     if not app_icon.isNull():

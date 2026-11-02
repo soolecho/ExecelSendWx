@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 logger = logging.getLogger(__name__)
@@ -93,6 +93,110 @@ def save_weather_config(api_key: str = "", base_url: str = "",
                 current.get("base_url"), current.get("default_city"),
                 len(current.get("api_key", "")))
     return current
+
+
+MAX_STANDBY_CITIES = 8
+# 待机画面后台刷新间隔（分钟）：默认 2 小时，避免频繁请求
+DEFAULT_STANDBY_REFRESH_MINUTES = 120
+STANDBY_REFRESH_OPTIONS = (30, 60, 120, 180, 360)
+
+
+def load_standby_refresh_minutes() -> int:
+    """读取待机画面后台天气刷新间隔（分钟），非法值回退 120（2 小时）。"""
+    cfg = load_weather_config()
+    try:
+        minutes = int(cfg.get("standby_refresh_minutes") or 0)
+    except (TypeError, ValueError):
+        minutes = 0
+    return minutes if minutes in STANDBY_REFRESH_OPTIONS \
+        else DEFAULT_STANDBY_REFRESH_MINUTES
+
+
+def save_standby_refresh_minutes(minutes: int) -> int:
+    """保存待机刷新间隔（分钟），保留其余天气配置。返回实际生效值。"""
+    try:
+        minutes = int(minutes)
+    except (TypeError, ValueError):
+        minutes = DEFAULT_STANDBY_REFRESH_MINUTES
+    if minutes not in STANDBY_REFRESH_OPTIONS:
+        minutes = DEFAULT_STANDBY_REFRESH_MINUTES
+    data: Dict = {}
+    try:
+        if WEATHER_CONFIG_FILE.exists():
+            with WEATHER_CONFIG_FILE.open("r", encoding="utf-8") as fp:
+                raw = json.load(fp)
+            if isinstance(raw, dict):
+                data = raw
+    except Exception as exc:
+        logger.warning("读取天气配置失败: %s", exc)
+    data["standby_refresh_minutes"] = minutes
+    data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    fd, tmp = tempfile.mkstemp(prefix=f".{WEATHER_CONFIG_FILE.name}.",
+                               suffix=".tmp", dir=WEATHER_CONFIG_FILE.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2)
+            fp.write("\n")
+        os.replace(tmp, WEATHER_CONFIG_FILE)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return minutes
+
+
+def load_standby_cities() -> List[str]:
+    """待机画面轮询显示的城市列表；未单独设置时回退到全局默认城市。"""
+    cfg = load_weather_config()
+    raw = cfg.get("standby_cities")
+    cities: List[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            name = str(item or "").strip()
+            if name and name not in cities:
+                cities.append(name)
+    if not cities:
+        default = str(cfg.get("default_city") or "").strip()
+        if default:
+            cities = [default]
+    return cities[:MAX_STANDBY_CITIES]
+
+
+def save_standby_cities(cities: List[str]) -> List[str]:
+    """保存待机画面多城市列表（去重去空、最多 8 个），保留其余天气配置。"""
+    cleaned: List[str] = []
+    for item in cities or []:
+        name = str(item or "").strip()
+        if name and name not in cleaned:
+            cleaned.append(name)
+    cleaned = cleaned[:MAX_STANDBY_CITIES]
+    data: Dict = {}
+    try:
+        if WEATHER_CONFIG_FILE.exists():
+            with WEATHER_CONFIG_FILE.open("r", encoding="utf-8") as fp:
+                raw = json.load(fp)
+            if isinstance(raw, dict):
+                data = raw
+    except Exception as exc:
+        logger.warning("读取天气配置失败: %s", exc)
+    data["standby_cities"] = cleaned
+    data["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    fd, tmp = tempfile.mkstemp(prefix=f".{WEATHER_CONFIG_FILE.name}.",
+                               suffix=".tmp", dir=WEATHER_CONFIG_FILE.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            json.dump(data, fp, ensure_ascii=False, indent=2)
+            fp.write("\n")
+        os.replace(tmp, WEATHER_CONFIG_FILE)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return cleaned
 
 
 # ----------------------------- 天气拉取 -----------------------------
@@ -309,7 +413,8 @@ def _format_full(data: Dict) -> str:
 
 
 def fetch_weather(city: str, base_url: str = "",
-                  api_key: str = "", log_fn=None) -> Optional[Dict]:
+                  api_key: str = "", log_fn=None,
+                  force: bool = False) -> Optional[Dict]:
     """
     拉取实时天气。返回 dict:
       {
@@ -320,7 +425,7 @@ def fetch_weather(city: str, base_url: str = "",
         "humidity": "40",
         "update_time": "2026-08-26 08:00"
       }
-    失败返回 None。
+    失败返回 None。force=True 时忽略内存缓存（手动刷新用）。
     """
     def _log(msg):
         try:
@@ -339,11 +444,12 @@ def fetch_weather(city: str, base_url: str = "",
 
     cache_k = _cache_key(city, base_url, api_key)
     now = datetime.now().timestamp()
-    with _CACHE_LOCK:
-        hit = _CACHE.get(cache_k)
-        if hit and (now - hit[0]) < _CACHE_TTL:
-            _log(f"命中缓存（{int(_CACHE_TTL - (now - hit[0]))}s 后过期）：{city}")
-            return hit[1]
+    if not force:
+        with _CACHE_LOCK:
+            hit = _CACHE.get(cache_k)
+            if hit and (now - hit[0]) < _CACHE_TTL:
+                _log(f"命中缓存（{int(_CACHE_TTL - (now - hit[0]))}s 后过期）：{city}")
+                return hit[1]
 
     location_id = lookup_city_id(city, base_url, api_key, log_fn=log_fn)
     if not location_id:
