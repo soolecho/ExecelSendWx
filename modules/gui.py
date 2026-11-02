@@ -25,8 +25,12 @@ from PyQt6.QtCore import (
     Qt, pyqtSignal, QObject, QThread, QTimer, QLockFile, QStandardPaths,
     QTime, QDate, QEvent, QSize, QRect, QPoint, QPropertyAnimation, QEasingCurve,
     QAbstractAnimation, QVariantAnimation, QUrl,
+    QRectF,
 )
-from PyQt6.QtGui import QAction, QFont, QIcon, QGuiApplication, QDesktopServices
+from PyQt6.QtGui import (
+    QAction, QFont, QIcon, QGuiApplication, QDesktopServices,
+    QPainterPath, QRegion,
+)
 
 from modules.config_manager import ConfigError, ConfigManager
 from modules.wechat_sender import WeChatSender
@@ -107,6 +111,8 @@ def _append_log_rich(edit, message: str, ts: str = "") -> None:
 
 APP_TITLE = "表格自动发送By春风予Lu"
 INSTANCE_LOCK_NAME = "ExcelSendWx.lock"
+# 无边框主窗口的背板圆角半径（与内部卡片 14px 圆角视觉一致，略大更自然）
+WINDOW_CORNER_RADIUS = 16
 # 与 installer.iss 的 Run 键值名一致，确保安装器勾选和托盘菜单勾选操作同一注册表项
 _AUTOSTART_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _AUTOSTART_REG_NAME = "ExcelSendWx"
@@ -9272,7 +9278,38 @@ class MainWindow(QMainWindow):
         if ui_theme.system_theme() != app.property("ui_theme"):
             self._apply_theme_mode(ui_theme.AUTO)
 
-    # ---- 无边框窗口：最大化 / 边缘缩放 ----
+    # ---- 无边框窗口：最大化 / 边缘缩放 / 圆角背板 ----
+    def _window_mask_region(self) -> QRegion:
+        """按圆角矩形生成窗口遮罩，让最外层背板与内部部件一样是圆角。
+
+        主窗口是 FramelessWindowHint（Windows 下为 WS_POPUP），系统不会自动
+        做圆角；而内部导航/卡片/日志坞都是 14px 圆角，方形背板会显得突兀。
+        这里用 QRegion 遮罩直接裁出圆角（不启用 WA_TranslucentBackground：
+        该方案在 Nuitka 打包后曾出现整窗全透，不可靠）。
+        最大化 / 全屏时返回整块矩形，避免贴边留缝或裁掉边缘热区。
+        """
+        rect = QRect(0, 0, max(1, self.width()), max(1, self.height()))
+        if self.isMaximized() or self.isFullScreen():
+            return QRegion(rect)
+        radius = min(
+            WINDOW_CORNER_RADIUS,
+            min(rect.width(), rect.height()) / 2.0,
+        )
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(rect), radius, radius)
+        return QRegion(path.toFillPolygon().toPolygon())
+
+    def _apply_window_mask(self) -> None:
+        """把主窗口形状同步为圆角背板（最大化/全屏自动恢复整块矩形）。"""
+        try:
+            if self.isMaximized() or self.isFullScreen():
+                # 最大化贴边：清掉遮罩，避免系统缩放/贴边出现缝隙
+                self.clearMask()
+            else:
+                self.setMask(self._window_mask_region())
+        except Exception:
+            logger.debug("设置窗口圆角遮罩失败", exc_info=True)
+
     def _toggle_maximize(self) -> None:
         """标题栏最大化按钮：在最大化与还原之间切换。"""
         if self.isMaximized():
@@ -9343,6 +9380,8 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         self._layout_edge_handles()
         self._sync_window_handles()
+        # 尺寸变化后重新裁圆角（最大化/还原同样会走到这里）
+        self._apply_window_mask()
 
     def _hide_to_tray(self):
         """隐藏主窗口（继续在托盘运行）。"""
@@ -9557,6 +9596,8 @@ class MainWindow(QMainWindow):
         elif event.type() == QEvent.Type.WindowStateChange:
             # 最大化/还原/最小化切换：同步标题栏图标与边缘缩放把手
             QTimer.singleShot(0, self._sync_window_handles)
+            # 最大化时窗口需贴边（整块矩形），还原后再裁回圆角
+            QTimer.singleShot(0, self._apply_window_mask)
             # 从最小化恢复：最小化期间折叠/展开被跳过，恢复后补一次自适应
             if not self.isMinimized() and not self.isMaximized() \
                     and not self.isFullScreen() and self._startup_fit_done:
@@ -9577,6 +9618,8 @@ class MainWindow(QMainWindow):
         # 无边框窗口：显示后再铺一次缩放把手，确保贴在最终窗口尺寸上
         self._layout_edge_handles()
         self._sync_window_handles()
+        # 显示/重新显示后重新裁一次圆角（隐藏期间窗口尺寸可能被系统改过）
+        self._apply_window_mask()
         if getattr(self, "_standby_mode", False):
             # 待机画面在最小化 / 隐藏到托盘后重新打开时保持原状（不切回编辑模式）。
             # 用户重新打开就是一次操作，先刷新空闲计时；再按待机内容补一次尺寸校正

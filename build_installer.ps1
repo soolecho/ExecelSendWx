@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$CertificateThumbprint = "191C64E4EC07377CA032878878D0A45F554C8146",
     [string]$TimestampServer = "http://timestamp.digicert.com"
 )
@@ -96,8 +96,14 @@ if ($newUninstallers.Count -gt 0) {
 }
 
 # Stage 2: 重试编译，最多 4 次
+# Stage 1 已成功且没有新生成的未签名卸载器时，说明签名卸载器已就绪并被嵌入，
+# 无需再整包重编译一遍（安装包体积 200MB+，能省数分钟）
 $code2 = -1
-for ($i = 1; $i -le 4; $i++) {
+if ($code -eq 0 -and $newUninstallers.Count -eq 0) {
+    Write-Tee "Stage 2: skipped (Stage 1 succeeded with signed uninstaller)"
+    $code2 = 0
+}
+for ($i = 1; $i -le 4 -and $code2 -ne 0; $i++) {
     Start-Sleep -Seconds (2 * $i)
     Write-Tee ("Stage 2: recompile retry {0}/4" -f $i)
     $code2 = Invoke-InnoCompiler -Desc ("S2-R$i")
@@ -106,7 +112,20 @@ for ($i = 1; $i -le 4; $i++) {
 }
 if ($code2 -ne 0) { throw "ISCC failed with exit code $code2 after retries." }
 
-$installer = Get-ChildItem $outputDir -File -Filter "*.exe" | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+# 版本以 installer.iss 的 MyAppVersion 为准（避免从文件名正则解析失败）
+$issText = Get-Content -LiteralPath $installerScript -Raw
+$verMatch = [regex]::Match($issText, '#define\s+MyAppVersion\s+"([^"]+)"')
+if (-not $verMatch.Success) { throw "Cannot read MyAppVersion from installer.iss." }
+$pubVersion = $verMatch.Groups[1].Value
+$expectedName = "ExcelSendWx_v{0}_setup.exe" -f $pubVersion
+$expectedPath = Join-Path $outputDir $expectedName
+$installer = if (Test-Path -LiteralPath $expectedPath) {
+    Get-Item -LiteralPath $expectedPath
+} else {
+    # 兜底：只在 ASCII 命名的安装包里挑最新的一个（不混入历史中文名）
+    Get-ChildItem $outputDir -File -Filter "ExcelSendWx_v*_setup.exe" |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
 if (-not $installer) { throw "Installer output not found." }
 Write-Tee ("Signing installer: {0}" -f $installer.Name)
 Set-CodeSignature -FilePath $installer.FullName
@@ -119,31 +138,17 @@ $sig = Get-AuthenticodeSignature $installer.FullName
 
 # 生成 GitHub Release 校验清单（供客户端自动更新时校验 SHA256）。
 # 注意：文件名必须与 GitHub 发布资产名（ASCII）一致，哈希取签名后的最终安装包。
-$verMatch = [regex]::Match($installer.Name, '_v(\d+\.\d+\.\d+)(?:_setup)?\.exe$')
-if ($verMatch.Success) {
-    $pubVersion = $verMatch.Groups[1].Value
-    $sumsPath = Join-Path $outputDir "SHA256SUMS.txt"
-    $sumsLine = "{0}  ExcelSendWx_v{1}_setup.exe" -f $hash.Hash.ToLower(), $pubVersion
-    [IO.File]::WriteAllText($sumsPath, $sumsLine + "`n", [Text.Encoding]::ASCII)
-    Write-Tee ("SHA256SUMS: {0}" -f $sumsLine)
-
-    # 发布资产名（ASCII，自动更新按此名称下载）。
-    # installer.iss 已直接以该名字输出，避免签名后再复制/改名；
-    # 若历史脚本输出的是中文名，则仅在名字不同时才复制。
-    $asciiName = "ExcelSendWx_v{0}_setup.exe" -f $pubVersion
-    $asciiPath = Join-Path $outputDir $asciiName
-    if (-not [string]::Equals($installer.Name, $asciiName,
-            [System.StringComparison]::OrdinalIgnoreCase)) {
-        Copy-Item $installer.FullName $asciiPath -Force
-    }
-    Write-Tee ("Publish asset: {0}" -f $asciiPath)
-} else {
-    Write-Tee "WARN: cannot parse version from installer name, SHA256SUMS not generated"
-}
+$sumsPath = Join-Path $outputDir "SHA256SUMS.txt"
+$sumsLine = "{0}  ExcelSendWx_v{1}_setup.exe" -f $hash.Hash.ToLower(), $pubVersion
+if ([string]::IsNullOrWhiteSpace($sumsPath)) { throw "SHA256SUMS path is empty." }
+[IO.File]::WriteAllText($sumsPath, $sumsLine + "`n", [Text.Encoding]::ASCII)
+Write-Tee ("SHA256SUMS: {0}" -f $sumsLine)
+Write-Tee ("Publish asset: {0}" -f $installer.FullName)
 Write-Tee ""
 Write-Tee "Installer build completed."
 Write-Tee ("Path: {0}" -f $installer.FullName)
-Write-Tee ("Size: {0:N0} bytes" -f $installer.Length)
+# 重新读取尺寸：签名为追加写，FileInfo 缓存的 Length 会小于最终文件
+Write-Tee ("Size: {0:N0} bytes" -f (Get-Item -LiteralPath $installer.FullName).Length)
 Write-Tee ("Signed: {0}" -f $sig.Status)
 Write-Tee ("Signer: {0}" -f $sig.SignerCertificate.Subject)
 Write-Tee ("SHA256: {0}" -f $hash.Hash)
