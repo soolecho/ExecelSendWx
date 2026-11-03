@@ -168,6 +168,16 @@ class ConfigManager:
                 "region_sheet": str(send.get("region_sheet", "") or "").strip(),
                 # 加载该配置后自动全选筛选人员并直接发送（无需手动点发送）
                 "auto_send": bool(send.get("auto_send", False)),
+                # 群聊 @ 成员（随本配置走）：开关 + 成员名单（多值分隔）+ @所有人
+                "at_enabled": bool(send.get("at_enabled", False)),
+                "at_members": str(send.get("at_members", "") or "").strip(),
+                "at_all": bool(send.get("at_all", False)),
+                # @ 组合方式：text=@和文字同一条；first=@随首条内容
+                "at_attach": (
+                    str(send.get("at_attach", "text") or "text")
+                    if str(send.get("at_attach", "text") or "text")
+                    in ("text", "first") else "text"
+                ),
             },
             "filter_conditions": filter_conditions,
             "recipient_mapping": recipient_mapping,

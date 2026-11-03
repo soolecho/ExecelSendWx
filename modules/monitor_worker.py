@@ -22,7 +22,15 @@ from typing import Dict, Optional
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from . import monitor_engine
-from .monitor_config import MonitorManager, MonitorTask, _now_in_window
+from .monitor_config import (
+    AT_CONDITION_LABELS,
+    MonitorManager,
+    MonitorTask,
+    _now_in_window,
+    normalize_at_attach,
+    should_mention,
+)
+from .profile_runner import _split_rm_values
 from .wechat_sender import WeChatSender
 
 logger = logging.getLogger("ExcelSendWx.monitor")
@@ -471,12 +479,28 @@ class MonitorWorker(QThread):
             files, text_first = self._resolve_send_order(task, png_path, out_file)
             if task.send_source_file and fp and os.path.exists(fp):
                 files = list(files) + [fp]
+            # @ 条数条件：本轮推送条数（clean_rows）满足任务配置的比较式才 @
+            at_ok = should_mention(task, len(clean_rows))
+            if task.at_enabled and not at_ok:
+                if not (str(task.at_members or "").strip() or task.at_all):
+                    self.emit(f"{log_prefix} 任务「{task.name}」已开启 @ 但未填写 @成员/@所有人，本条消息不 @")
+                else:
+                    cond_label = AT_CONDITION_LABELS.get(task.at_condition, "不限条数")
+                    self.emit(
+                        f"{log_prefix} 任务「{task.name}」本轮 {len(clean_rows)} 条"
+                        f"不满足 @ 条件（{cond_label} {task.at_count} 条），本条消息不 @"
+                    )
+            elif at_ok and normalize_at_attach(task.at_attach) == "text" and files and not text:
+                self.emit(
+                    f"{log_prefix} 任务「{task.name}」本轮没有文字内容，@ 需跟随文字，本条不 @"
+                )
             try:
                 for person in task.recipients:
                     if self._stop or not person or not clean_rows:
                         continue
                     try:
-                        self._send_merged(person, text, files, task, log_prefix, text_first)
+                        self._send_merged(person, text, files, task, log_prefix,
+                                          text_first, len(clean_rows))
                         msg_delivered += 1
                     except Exception as exc:
                         msg_failed += 1
@@ -643,30 +667,68 @@ class MonitorWorker(QThread):
         return files, text_first
 
     def _send_merged(self, person: str, text, files, task: MonitorTask,
-                     prefix: str, text_first: bool = False) -> None:
+                     prefix: str, text_first: bool = False,
+                     row_count: int = 0) -> None:
         """合并推送：文字/图片/附件一次粘贴 + 一次 Enter（v1.5.0 批处理合并约束）。
 
         - text+files → send_text_and_files（两步粘贴：文字/文件先后由 text_first 决定）
         - 仅 files → send_files_batch（一次粘贴 + Enter）
         - 仅 text → send_message（原逻辑）
         发送返回 False 视为失败（抛异常由调用方计入 msg_failed）。
+        row_count = 本轮推送条数，用于 @ 的条数阈值条件（大于/小于/等于…）。
         """
         sender = WeChatSender.shared_instance()
-        if files and text:
+        # 群聊 @（随本条监控任务配置走）：@ 开关 + @目标 + 本轮条数条件都满足才 @
+        at_kwargs = {}
+        if should_mention(task, row_count):
+            at_kwargs = {
+                "at_members": _split_rm_values(getattr(task, "at_members", "")),
+                "at_all": bool(getattr(task, "at_all", False)),
+            }
+        at_mode = normalize_at_attach(getattr(task, "at_attach", "text"))
+        if files and text and at_kwargs and at_mode == "text":
+            # @ 跟随文字：文字单独一条（带 @），图片/附件另发一批，@ 与文字同一个气泡
+            if text_first:
+                ok = sender.send_message(
+                    content=text, recipient=person, first_send=False,
+                    chat_delay=task.chat_delay, fast_mode=True,
+                    **at_kwargs,
+                )
+                if ok:
+                    ok = sender.send_files_batch(
+                        file_paths=files, recipient=person,
+                        chat_delay=task.chat_delay, fast_mode=True,
+                    )
+            else:
+                ok = sender.send_files_batch(
+                    file_paths=files, recipient=person,
+                    chat_delay=task.chat_delay, fast_mode=True,
+                )
+                if ok:
+                    ok = sender.send_message(
+                        content=text, recipient=person, first_send=False,
+                        chat_delay=task.chat_delay, fast_mode=True,
+                        **at_kwargs,
+                    )
+        elif files and text:
             ok = sender.send_text_and_files(
                 text=text, file_paths=files, recipient=person,
                 chat_delay=task.chat_delay, fast_mode=True,
                 text_first=text_first,
+                **at_kwargs,
             )
         elif files:
+            # 「跟随文字」模式但没有文字可挂 → 不 @（避免又冒出一条单独的 @）
             ok = sender.send_files_batch(
                 file_paths=files, recipient=person,
                 chat_delay=task.chat_delay, fast_mode=True,
+                **({} if at_mode == "text" else at_kwargs),
             )
         else:
             ok = sender.send_message(
                 content=text or "", recipient=person, first_send=False,
                 chat_delay=task.chat_delay, fast_mode=True,
+                **at_kwargs,
             )
         if not ok:
             raise RuntimeError("微信合并发送返回失败")

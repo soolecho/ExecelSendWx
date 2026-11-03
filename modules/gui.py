@@ -48,6 +48,8 @@ from modules.workstation_guard import (
     is_workstation_locked,
 )
 from modules.monitor_config import (
+    AT_ATTACH_LABELS,
+    AT_CONDITION_LABELS,
     MonitorManager,
     MonitorTask,
     carry_file_baseline_ts,
@@ -2264,6 +2266,37 @@ class TableFilterTab(QWidget):
         self.custom_msg_edit.setEnabled(False)
         send_layout.addWidget(self.custom_msg_edit)
 
+        # 群聊 @ 成员：随当前配置一起保存（手动发送/加载配置自动发送都按这份走）
+        self.at_checkbox = QCheckBox("群聊发送时 @ 成员（仅群聊生效）")
+        self.at_checkbox.setToolTip(
+            "勾选后，给每个接收人的第一条消息会在群里 @ 下面填写的成员。\n"
+            "私聊没有 @ 候选弹层，会自动降级为普通消息（不会发出字面量「@昵称」）。\n"
+            "该设置随本配置保存，切换配置时一起回填。"
+        )
+        send_layout.addWidget(self.at_checkbox)
+
+        at_row = QHBoxLayout()
+        at_row.addWidget(QLabel("@成员:"))
+        self.at_members_edit = QLineEdit()
+        self.at_members_edit.setPlaceholderText(
+            "群成员昵称，多个用 / 或 , 分隔（可留空，只勾下方「@所有人」）"
+        )
+        self.at_members_edit.setEnabled(False)
+        at_row.addWidget(self.at_members_edit, 1)
+        self.at_all_check = QCheckBox("@所有人")
+        self.at_all_check.setEnabled(False)
+        at_row.addWidget(self.at_all_check)
+        send_layout.addLayout(at_row)
+        # @ 与谁一起发：跟随文字（@和文字同一个气泡）或随首条内容（@单独一条）
+        at_mode_row = QHBoxLayout()
+        at_mode_row.addWidget(QLabel("@位置:"))
+        self.at_mode_combo = QComboBox()
+        for _mode_key, _mode_label in AT_ATTACH_LABELS.items():
+            self.at_mode_combo.addItem(_mode_label, _mode_key)
+        self.at_mode_combo.setEnabled(False)
+        at_mode_row.addWidget(self.at_mode_combo, 1)
+        send_layout.addLayout(at_mode_row)
+
         attach_row = QHBoxLayout()
         attach_row.addWidget(QLabel("附加文件:"))
         self.attachment_edit = QLineEdit()
@@ -2536,6 +2569,10 @@ class TableFilterTab(QWidget):
             ("valueChanged", getattr(self, "header_row_spin", None)),
             ("textChanged", getattr(self, "wechat_edit", None)),
             ("textChanged", getattr(self, "custom_msg_edit", None)),
+            ("textChanged", getattr(self, "at_members_edit", None)),
+            ("toggled", getattr(self, "at_checkbox", None)),
+            ("toggled", getattr(self, "at_all_check", None)),
+            ("currentIndexChanged", getattr(self, "at_mode_combo", None)),
             ("textChanged", getattr(self, "region_range_edit", None)),
             ("textChanged", getattr(self, "recipient_mapping_default_edit", None)),
             ("toggled", getattr(self, "auto_send_check", None)),
@@ -2620,6 +2657,7 @@ class TableFilterTab(QWidget):
         self.clear_filter_btn.clicked.connect(self.clear_filter_conditions)
         self.apply_filter_btn.clicked.connect(self.apply_filter)
         self.custom_msg_checkbox.stateChanged.connect(self.on_custom_msg_checkbox_changed)
+        self.at_checkbox.toggled.connect(self.on_at_checkbox_changed)
         self.attach_pick_btn.clicked.connect(self._on_pick_attachment)
         self.attach_clear_btn.clicked.connect(self._on_clear_attachment)
         self.order_up_btn.clicked.connect(lambda: self._move_order_item(-1))
@@ -2715,6 +2753,13 @@ class TableFilterTab(QWidget):
                 # 区域截图所用工作表（留空=当前数据表；可与提取数据的工作表不同）
                 "region_sheet": str(self.region_sheet_combo.currentData() or ""),
                 "auto_send": self.auto_send_check.isChecked(),
+                # 群聊 @ 成员（随本配置走）：开关 + 成员名单（多值分隔）+ @所有人
+                "at_enabled": self.at_checkbox.isChecked(),
+                "at_members": self.at_members_edit.text().strip(),
+                "at_all": self.at_all_check.isChecked(),
+                "at_attach": (
+                    self.at_mode_combo.currentData() or "text"
+                ),
             },
             "filter_conditions": filter_conditions,
             "recipient_mapping": self._collect_recipient_mapping_from_ui(),
@@ -3033,6 +3078,19 @@ class TableFilterTab(QWidget):
         self.auto_send_check.setChecked(
             bool(send_settings.get("auto_send", False))
         )
+        # 群聊 @ 成员：随本配置回填（旧配置无此字段 → 默认关闭/空）
+        self.at_checkbox.blockSignals(True)
+        self.at_checkbox.setChecked(bool(send_settings.get("at_enabled", False)))
+        self.at_checkbox.blockSignals(False)
+        self.at_members_edit.setText(
+            str(send_settings.get("at_members", "") or "").strip()
+        )
+        self.at_all_check.setChecked(bool(send_settings.get("at_all", False)))
+        _attach_idx = self.at_mode_combo.findData(
+            str(send_settings.get("at_attach", "text") or "text")
+        )
+        self.at_mode_combo.setCurrentIndex(_attach_idx if _attach_idx >= 0 else 0)
+        self.on_at_checkbox_changed(self.at_checkbox.isChecked())
 
         # 联系人映射：旧配置无此字段时按禁用+空表初始化（向后兼容）
         rm_cfg = profile.get("recipient_mapping") or {}
@@ -3275,6 +3333,13 @@ class TableFilterTab(QWidget):
         self.custom_msg_edit.setEnabled(checked)
         # 同步发送顺序列表里的“自定义消息”勾选状态
         self._set_order_item_checked("custom", checked)
+
+    def on_at_checkbox_changed(self, checked):
+        """@ 开关：联动成员输入框/@所有人/@位置 的可编辑状态。"""
+        enabled = bool(checked)
+        self.at_members_edit.setEnabled(enabled)
+        self.at_all_check.setEnabled(enabled)
+        self.at_mode_combo.setEnabled(enabled)
 
     def _on_pick_attachment(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -4560,6 +4625,13 @@ class TableFilterTab(QWidget):
         attachment_path = self.attachment_edit.text().strip()
         region_range = self.region_range_edit.text().strip()
         region_sheet = str(self.region_sheet_combo.currentData() or "").strip()
+        # 群聊 @（随本配置/当前 UI）：成员名单按 / ; 、 ， , 拆分；@所有人 单独勾选
+        at_enabled = bool(self.at_checkbox.isChecked())
+        at_members = (
+            self._split_rm_values(self.at_members_edit.text()) if at_enabled else []
+        )
+        at_all = bool(self.at_all_check.isChecked()) and at_enabled
+        at_attach = str(self.at_mode_combo.currentData() or "text")
 
         # 指定区域截图：按源表「原始样式」（合并单元格/底色/字体/数字格式）渲染，
         # 而不是把数据重新排一遍版。本地文件直接给路径，云文档给文件 ID（发送线程
@@ -4678,6 +4750,10 @@ class TableFilterTab(QWidget):
                     "custom_msg": custom_msg,
                     # 指定区域截图的图片数据（{headers, rows}，对每人相同；未勾选为 None）
                     "region_data": region_data,
+                    # 群聊 @（随本条任务走，仅在每个接收人的首条消息上生效）
+                    "at_members": list(at_members),
+                    "at_all": at_all,
+                    "at_attach": at_attach,
                 })
         
         if missing_wechat:
@@ -4700,6 +4776,10 @@ class TableFilterTab(QWidget):
         confirm_text += "\n发送顺序: " + " → ".join(_order_label.get(k, k) for k in effective_order)
         if custom_msg:
             confirm_text += f"\n包含自定义消息: {custom_msg[:30]}..." if len(custom_msg) > 30 else f"\n包含自定义消息: {custom_msg}"
+        if at_members or at_all:
+            at_tip = "、".join(list(at_members) + (["所有人"] if at_all else []))
+            at_stage = "文字消息" if at_attach == "text" else "首条消息"
+            confirm_text += f"\n群聊{at_stage}将 @: {at_tip}"
         
         if auto:
             # 加载配置后自动发送：已按配置全选，跳过人工确认直接发送
@@ -7068,6 +7148,56 @@ class MonitorTab(QWidget):
         self.recipients_edit.setMaximumHeight(90)
         self.recipients_edit.setPlaceholderText("每个微信昵称一行，或用逗号分隔")
         recv_layout.addWidget(self.recipients_edit)
+        # 群聊 @ 成员：随本条监控任务保存（仅群聊生效，私聊自动降级为普通消息）
+        self.monitor_at_check = QCheckBox("群聊发送时 @ 成员（仅群聊生效）")
+        self.monitor_at_check.setToolTip(
+            "勾选后，每条监控推送的首条消息会在群里 @ 下面填写的成员。\n"
+            "私聊没有 @ 候选弹层，会自动降级为普通消息（不会发出「@昵称」字面量）。\n"
+            "该设置随本监控任务保存。"
+        )
+        recv_layout.addWidget(self.monitor_at_check)
+        at_row = QHBoxLayout()
+        at_row.addWidget(QLabel("@成员:"))
+        self.monitor_at_members_edit = QLineEdit()
+        self.monitor_at_members_edit.setPlaceholderText(
+            "群成员昵称，多个用 / 或 , 分隔（可留空，只勾「@所有人」）"
+        )
+        self.monitor_at_members_edit.setEnabled(False)
+        at_row.addWidget(self.monitor_at_members_edit, 1)
+        self.monitor_at_all_check = QCheckBox("@所有人")
+        self.monitor_at_all_check.setEnabled(False)
+        at_row.addWidget(self.monitor_at_all_check)
+        recv_layout.addLayout(at_row)
+        # @ 条数条件：本轮推送条数满足 大于/小于/等于… 才 @（随任务保存）
+        at_cond_row = QHBoxLayout()
+        at_cond_row.addWidget(QLabel("@条件:"))
+        self.monitor_at_condition_combo = QComboBox()
+        for _cond_key, _cond_label in AT_CONDITION_LABELS.items():
+            self.monitor_at_condition_combo.addItem(_cond_label, _cond_key)
+        self.monitor_at_condition_combo.setEnabled(False)
+        at_cond_row.addWidget(self.monitor_at_condition_combo)
+        self.monitor_at_count_spin = QSpinBox()
+        self.monitor_at_count_spin.setRange(0, 1000000)
+        self.monitor_at_count_spin.setSuffix(" 条")
+        self.monitor_at_count_spin.setEnabled(False)
+        at_cond_row.addWidget(self.monitor_at_count_spin)
+        at_cond_row.addWidget(
+            QLabel("（本轮推送条数满足该条件时才 @，默认不限）")
+        )
+        recv_layout.addLayout(at_cond_row)
+        # @ 位置：跟随文字（@和文字同一气泡）/ 随首条内容（@单独一条）
+        at_mode_row = QHBoxLayout()
+        at_mode_row.addWidget(QLabel("@位置:"))
+        self.monitor_at_mode_combo = QComboBox()
+        for _mode_key, _mode_label in AT_ATTACH_LABELS.items():
+            self.monitor_at_mode_combo.addItem(_mode_label, _mode_key)
+        self.monitor_at_mode_combo.setEnabled(False)
+        at_mode_row.addWidget(self.monitor_at_mode_combo, 1)
+        recv_layout.addLayout(at_mode_row)
+        self.monitor_at_check.toggled.connect(self._on_monitor_at_toggled)
+        self.monitor_at_condition_combo.currentIndexChanged.connect(
+            self._on_monitor_at_condition_changed
+        )
         right_layout.addWidget(recv_group)
 
         # 5. 时间窗
@@ -7266,6 +7396,12 @@ class MonitorTab(QWidget):
                    self.compare_cols_list):
             lw.itemChanged.connect(lambda *a: mark())
         self.recipients_edit.textChanged.connect(mark)
+        self.monitor_at_check.stateChanged.connect(mark)
+        self.monitor_at_members_edit.textChanged.connect(mark)
+        self.monitor_at_all_check.stateChanged.connect(mark)
+        self.monitor_at_condition_combo.currentIndexChanged.connect(mark)
+        self.monitor_at_count_spin.valueChanged.connect(mark)
+        self.monitor_at_mode_combo.currentIndexChanged.connect(mark)
         self.repeat_mode_combo.currentIndexChanged.connect(mark)
         for cb in self.weekday_checks.values():
             cb.stateChanged.connect(mark)
@@ -7355,6 +7491,38 @@ class MonitorTab(QWidget):
     def _on_wxwork_toggled(self, _checked=None):
         # 勾选「企业微信Webhook发送」才显示其配置区（程序填充阶段无需额外处理）
         self.wxwork_detail.setVisible(self.wxwork_check.isChecked())
+
+    def _on_monitor_at_toggled(self, checked):
+        """监控任务 @ 开关：联动成员输入框/@所有人/条数条件/@位置 的可编辑状态。"""
+        enabled = bool(checked)
+        self.monitor_at_members_edit.setEnabled(enabled)
+        self.monitor_at_all_check.setEnabled(enabled)
+        self.monitor_at_condition_combo.setEnabled(enabled)
+        self.monitor_at_mode_combo.setEnabled(enabled)
+        self._on_monitor_at_condition_changed()
+
+    def _on_monitor_at_condition_changed(self, _index=-1):
+        """@ 条数条件：只有选择了比较式（非「不限条数」）才启用阈值输入。"""
+        enabled = (
+            self.monitor_at_check.isChecked()
+            and (self.monitor_at_condition_combo.currentData() or "always") != "always"
+        )
+        self.monitor_at_count_spin.setEnabled(enabled)
+
+    def _set_monitor_at_condition(self, condition, count):
+        """载入任务时回填 @ 条数条件（阻断信号，避免误标配置为已修改）。"""
+        idx = self.monitor_at_condition_combo.findData(str(condition or "always"))
+        if idx < 0:
+            idx = self.monitor_at_condition_combo.findData("always")
+        self.monitor_at_condition_combo.blockSignals(True)
+        self.monitor_at_condition_combo.setCurrentIndex(max(0, idx))
+        self.monitor_at_condition_combo.blockSignals(False)
+        self.monitor_at_count_spin.blockSignals(True)
+        try:
+            self.monitor_at_count_spin.setValue(max(0, int(count or 0)))
+        except (TypeError, ValueError):
+            self.monitor_at_count_spin.setValue(0)
+        self.monitor_at_count_spin.blockSignals(False)
 
     def _on_wxwork_fail_toggled(self, _checked=None):
         # 勾选「失败时企微通知」才启用通知 webhook 输入框
@@ -7635,6 +7803,23 @@ class MonitorTab(QWidget):
             self._fill_columns_list(self.compare_cols_list, self._current_headers(),
                                     task.compare_columns)
             self.recipients_edit.setPlainText("\n".join(task.recipients))
+            # 群聊 @ 成员（随任务保存；旧任务无此字段 → 默认关闭/空）
+            self.monitor_at_check.setChecked(bool(getattr(task, "at_enabled", False)))
+            self.monitor_at_members_edit.setText(
+                str(getattr(task, "at_members", "") or "")
+            )
+            self.monitor_at_all_check.setChecked(bool(getattr(task, "at_all", False)))
+            self._set_monitor_at_condition(
+                str(getattr(task, "at_condition", "always") or "always"),
+                int(getattr(task, "at_count", 0) or 0),
+            )
+            _mode_idx = self.monitor_at_mode_combo.findData(
+                str(getattr(task, "at_attach", "text") or "text")
+            )
+            self.monitor_at_mode_combo.setCurrentIndex(
+                _mode_idx if _mode_idx >= 0 else 0
+            )
+            self._on_monitor_at_toggled(self.monitor_at_check.isChecked())
             mode_index = {"daily": 0, "weekly": 1, "once": 2}.get(
                 task.repeat_mode, 0)
             self.repeat_mode_combo.setCurrentIndex(mode_index)
@@ -7708,6 +7893,12 @@ class MonitorTab(QWidget):
         task.clean_rules = self._build_clean_rules(
             self._selected_cols(self.clean_cols_list))
         task.recipients = _parse_recipients(self.recipients_edit.toPlainText())
+        task.at_enabled = self.monitor_at_check.isChecked()
+        task.at_members = self.monitor_at_members_edit.text().strip()
+        task.at_all = self.monitor_at_all_check.isChecked()
+        task.at_condition = self.monitor_at_condition_combo.currentData() or "always"
+        task.at_count = int(self.monitor_at_count_spin.value())
+        task.at_attach = self.monitor_at_mode_combo.currentData() or "text"
         task.repeat_mode = self.repeat_mode_combo.currentData() or "daily"
         task.days = sorted(d for d, cb in self.weekday_checks.items() if cb.isChecked())
         task.run_dates = [d.strip() for d in
@@ -7858,6 +8049,12 @@ class MonitorTab(QWidget):
                 lw.clear()
                 lw.blockSignals(False)
             self.recipients_edit.clear()
+            self.monitor_at_check.setChecked(False)
+            self.monitor_at_members_edit.clear()
+            self.monitor_at_all_check.setChecked(False)
+            self._set_monitor_at_condition("always", 0)
+            self.monitor_at_mode_combo.setCurrentIndex(0)
+            self._on_monitor_at_toggled(False)
             self.repeat_mode_combo.setCurrentIndex(0)
             for cb in self.weekday_checks.values():
                 cb.setChecked(False)

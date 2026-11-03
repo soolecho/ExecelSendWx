@@ -47,6 +47,27 @@ CF_UNICODETEXT = 13
 # 全局内存标志：GMEM_MOVEABLE | GMEM_ZEROINIT
 _GMEM_MOVEABLE_ZEROINIT = 0x0042
 
+# ---------------------------------------------------------------------------
+# @ 成员（群聊）：键入 "@昵称" 后微信弹出 MentionPopover，点选候选项落成 chip。
+# 纯 UIA 实现（与 wechatauto/ui/chatbox.py 的 AtMenu 同一套锚点），不依赖 OCR。
+# ---------------------------------------------------------------------------
+AT_POPOVER_CLASS = "mmui::XPopover"
+AT_POPOVER_NAME = "Weixin"
+AT_POPOVER_AID = "MentionPopover"
+# @所有人 在不同版本/语言包里的候选名（依次尝试）
+AT_ALL_ALIASES = ("所有人", "全部成员", "All", "Everyone")
+
+
+def _mention_key(name: str) -> str:
+    """@ 匹配用的归一化名字：去空格（微信弹层里昵称不含空格）。"""
+    return "".join(str(name or "").split())
+
+
+def _sendkeys_literal(text: str) -> str:
+    """把文本转成 uiautomation SendKeys 字面量（花括号是唯一需要转义的字符）。"""
+    return "".join("{{}" if ch == "{" else "{}}" if ch == "}" else ch
+                   for ch in str(text or ""))
+
 
 # ---------------------------------------------------------------------------
 # 剪贴板（模块级，供两步粘贴使用；带 OpenClipboard 重试防剪贴板争用）
@@ -291,17 +312,213 @@ class UiaBridge:
                 logger.warning("uia_bridge.open_chat(%s) 异常: %s", recipient, e)
                 return False
 
-    def send_text(self, text: str) -> bool:
-        """在已打开会话的输入框发送文本（粘贴 + 回读相似度校验 + 回车）。"""
+    # ---------------- @ 成员（群聊） ----------------
+    @staticmethod
+    def _at_popover(driver, timeout: float = 1.2):
+        """等待并返回 @ 候选弹层（MentionPopover）；没有（如私聊）返回 None。"""
+        win = None
+        try:
+            win = driver._find_main()
+        except Exception:
+            win = None
+        if win is None:
+            win = getattr(driver, "_win", None)
+        if win is None:
+            return None
+        try:
+            popover = win.WindowControl(
+                ClassName=AT_POPOVER_CLASS,
+                Name=AT_POPOVER_NAME,
+                AutomationId=AT_POPOVER_AID,
+            )
+            if popover.Exists(timeout, 0.15):
+                return popover
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _popover_items(popover):
+        """枚举弹层里的候选项（ListControl 子项，兜底用直接子项）。"""
+        items = []
+        try:
+            lst = popover.ListControl()
+            if lst is not None:
+                items = list(lst.GetChildren())
+        except Exception:
+            items = []
+        if not items:
+            try:
+                items = list(popover.GetChildren())
+            except Exception:
+                items = []
+        return [c for c in items if _mention_key(getattr(c, "Name", ""))]
+
+    @staticmethod
+    def _click_at_item(item) -> bool:
+        """点击候选项（Click 失败时退回 Invoke）。"""
+        try:
+            item.Click()
+            return True
+        except Exception:
+            pass
+        try:
+            item.GetInvokePattern().Invoke()
+            return True
+        except Exception:
+            return False
+
+    def _pick_at_item(self, popover, name: str) -> bool:
+        """在弹层里选中目标成员：唯一候选直接选，否则按名字（含别名）匹配。"""
+        items = self._popover_items(popover)
+        if not items:
+            return False
+        key = _mention_key(name)
+        aliases = [key] + [_mention_key(a) for a in AT_ALL_ALIASES]
+        if len(items) == 1:
+            # 唯一候选：只有名字确有关联时才点，避免点错人
+            only = _mention_key(getattr(items[0], "Name", ""))
+            at_all_keys = {_mention_key(a) for a in AT_ALL_ALIASES}
+            if (key and (key in only or only in key)) or (
+                    key in at_all_keys and only in at_all_keys):
+                return self._click_at_item(items[0])
+            return False
+        for want in aliases:
+            for item in items:
+                if _mention_key(getattr(item, "Name", "")) == want:
+                    if self._click_at_item(item):
+                        return True
+        # 候选项可能带备注/后缀（如 "张三（备注）"）：退化为包含匹配
+        for want in aliases:
+            for item in items:
+                nm = _mention_key(getattr(item, "Name", ""))
+                if want and want in nm:
+                    if self._click_at_item(item):
+                        return True
+        return False
+
+    @staticmethod
+    def _undo_typed(e, count: int) -> None:
+        """@ 插入失败时清理已键入的 "@昵称"（先关弹层再退格）。"""
+        try:
+            e.SendKeys("{Esc}", waitTime=0.05)
+        except Exception:
+            pass
+        for _ in range(max(0, int(count))):
+            try:
+                e.SendKeys("{Back}", waitTime=0.02)
+            except Exception:
+                return
+
+    def _insert_mentions(self, driver, e, at_members=None, at_all: bool = False) -> int:
+        """把 @成员 / @所有人 逐个落成输入框 chip，返回成功插入个数。
+
+        弹层不存在（私聊/版本不支持）时立即清理已键入内容并停止，降级为普通
+        发送——绝不把字面量 "@昵称" 发出去。
+        """
+        names = []
+        seen = set()
+        raw_members = at_members
+        if isinstance(raw_members, str):
+            raw_members = [raw_members]
+        for raw in list(raw_members or []):
+            nm = str(raw or "").strip()
+            if not nm:
+                continue
+            if _mention_key(nm) not in seen:
+                seen.add(_mention_key(nm))
+                names.append(nm)
+        if at_all:
+            alias = AT_ALL_ALIASES[0]
+            if _mention_key(alias) not in seen:
+                seen.add(_mention_key(alias))
+                names.append(alias)
+
+        inserted = 0
+        for nm in names:
+            typed = _mention_key(nm)
+            if not typed:
+                continue
+            try:
+                e.SendKeys("@" + _sendkeys_literal(typed), waitTime=0.05)
+            except Exception as exc:
+                logger.debug("uia_bridge: 键入 @%s 失败: %s", typed, exc)
+                continue
+            popover = self._at_popover(driver, timeout=1.2)
+            if popover is None:
+                # 私聊/不支持 @：清掉已键入文本，整体降级为普通发送
+                logger.info("uia_bridge: 未出现 @ 候选弹层，跳过 @%s（按普通消息发送）", typed)
+                self._undo_typed(e, len(typed) + 1)
+                break
+            if not self._pick_at_item(popover, typed):
+                logger.info("uia_bridge: @ 候选里没有「%s」，已清理", typed)
+                self._undo_typed(e, len(typed) + 1)
+                continue
+            inserted += 1
+            time.sleep(0.25)  # 等 chip 落位、焦点回到输入框
+        return inserted
+
+    def send_text(self, text: str, at_members=None, at_all: bool = False) -> bool:
+        """在已打开会话的输入框发送文本（粘贴 + 回读相似度校验 + 回车）。
+
+        带 ``at_members`` / ``at_all`` 时先把 @ chip 插进输入框再粘文字；
+        不带 @ 时走驱动原路径（行为完全不变）。
+        """
+        has_at = bool([m for m in (at_members or []) if str(m or "").strip()]) or bool(at_all)
         with self._lock:
             try:
-                return self._get_driver().send_text(text or "")
+                if not has_at:
+                    return self._get_driver().send_text(text or "")
+                if not self.ensure():
+                    return False
+                driver = self._get_driver()
+                e = driver._chat_input()
+                if e is None:
+                    logger.warning("uia_bridge.send_text: 找不到聊天输入框")
+                    return False
+                if not driver._click_ctrl(e):
+                    logger.warning("uia_bridge.send_text: 点击输入框拿焦点失败")
+                    return False
+                time.sleep(0.1)
+                try:
+                    e.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)
+                except Exception:
+                    pass
+                inserted = self._insert_mentions(driver, e, at_members, at_all)
+                text = text or ""
+                if text:
+                    if not clipboard_set_text(text):
+                        logger.warning("uia_bridge.send_text: 写文字剪贴板失败")
+                        return False
+                    try:
+                        e.SendKeys("{Ctrl}v", waitTime=0.05)
+                    except Exception as exc:
+                        logger.warning("uia_bridge.send_text: 粘贴文字异常: %s", exc)
+                        return False
+                    time.sleep(0.4)
+                    if not self._text_landed(e, text):
+                        logger.warning("uia_bridge.send_text: 文字未落进输入框，清空不回车")
+                        try:
+                            e.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)
+                        except Exception:
+                            pass
+                        return False
+                elif inserted == 0:
+                    return False
+                try:
+                    e.SendKeys("{Enter}", waitTime=0.05)
+                except Exception as exc:
+                    logger.warning("uia_bridge.send_text: 回车发送异常: %s", exc)
+                    return False
+                time.sleep(0.2)
+                return True
             except Exception as e:
                 logger.warning("uia_bridge.send_text 异常: %s", e)
                 return False
 
     def send_files(self, paths, text: Optional[str] = None,
-                   verify_text: bool = True, text_first: bool = False) -> bool:
+                   verify_text: bool = True, text_first: bool = False,
+                   at_members=None, at_all: bool = False) -> bool:
         """两步粘贴 + 一次 Enter 发送文件/图片，可混合文字（批处理合并约束）。
 
         两步粘贴的先后决定合并消息里的排列顺序（微信输入框按粘贴顺序排列，
@@ -314,6 +531,9 @@ class UiaBridge:
         ``_click_ctrl`` 拿焦点（不吃 WS_EX_TRANSPARENT 的亏）。文字粘贴后可
         回读校验（读不到值按放行），校验失败则清空不回车。文字在前时在校验时
         输入框只有文字，读回最可靠。
+
+        带 ``at_members`` / ``at_all`` 时，@ chip 插在清空输入框之后、粘贴
+        文字/文件之前；带 chip 后不再用 Ctrl+A 清空（会删掉 mention chip）。
         """
         with self._lock:
             if not self.ensure():
@@ -336,6 +556,8 @@ class UiaBridge:
                 e.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)
             except Exception:
                 pass
+            # @ 成员/所有人：必须在清空之后、粘贴之前插入（chip 不能被 Ctrl+A 删）
+            self._insert_mentions(driver, e, at_members, at_all)
             text = (text or "").strip()
 
             # 文字在前：先粘文字（此刻输入框只有文字，回读校验最可靠），再粘文件
@@ -408,10 +630,11 @@ class UiaBridge:
         if got is None:
             return True
         want = WeChatUIA._compare_norm(text)
-        have = WeChatUIA._compare_norm(got)
+        # @ chip 在输入框里读回可能是 U+FFFC 或 "@昵称" 前缀，去掉后再比对
+        have = WeChatUIA._compare_norm(got).replace("\ufffc", "")
         if not want:
             return True
-        if want in have:
+        if want in have or have.endswith(want):
             return True
         try:
             score = difflib.SequenceMatcher(None, want, have, autojunk=False).ratio()

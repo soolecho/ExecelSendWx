@@ -444,6 +444,20 @@ def prepare_profile(profile, log_fn=None):
         if custom_msg:
             custom_msg = _render_weather(custom_msg, log)
 
+        # 群聊 @ 成员：随本配置（profile）保存，同一条配置链/自动发送都按这份走
+        at_enabled = bool(send.get("at_enabled", False))
+        at_members = (
+            _split_rm_values(send.get("at_members", "")) if at_enabled else []
+        )
+        at_all = bool(send.get("at_all", False)) and at_enabled
+        at_attach = str(send.get("at_attach", "text") or "text")
+        if at_attach not in ("text", "first"):
+            at_attach = "text"
+        if at_members or at_all:
+            names = list(at_members) + (["所有人"] if at_all else [])
+            where = "跟随文字消息" if at_attach == "text" else "随首条内容"
+            log(f"群聊消息将 @ {'、'.join(names)}（{where}）")
+
         # 5) 逐人构造任务
         tasks = []
         for person in persons:
@@ -477,6 +491,10 @@ def prepare_profile(profile, log_fn=None):
                     "recipient": recipient,    # 实际微信接收人
                     "custom_msg": custom_msg,
                     "region_data": region_data,
+                    # 每条任务自带 @ 配置（@ 位置随配置，私聊自动降级）
+                    "at_members": list(at_members),
+                    "at_all": at_all,
+                    "at_attach": at_attach,
                 })
 
         if not tasks:

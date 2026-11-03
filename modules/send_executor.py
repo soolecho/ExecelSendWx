@@ -141,6 +141,28 @@ def run_send_tasks(
         except Exception:
             pass
 
+    def _at_kwargs(task):
+        """本条任务的首条消息要带的 @ 参数（随任务/配置走）。
+
+        每条接收人任务只 @ 一次：成功后置 ``_at_sent``，后续步骤/重试不再重复
+        @（重试是新的发送循环，但同一 task dict 会带着 _at_sent 回到这里）。
+        私聊不弹 @ 候选时底层会自动降级为普通消息。
+        """
+        if task.get("_at_sent"):
+            return {}
+        members = task.get("at_members") or []
+        if isinstance(members, str):
+            members = [members]
+        members = [str(m).strip() for m in members if str(m).strip()]
+        at_all = bool(task.get("at_all", False))
+        if not members and not at_all:
+            return {}
+        return {"at_members": members, "at_all": at_all}
+
+    def _mark_at(task):
+        if _at_kwargs(task):
+            task["_at_sent"] = True
+
     # 去重保序，只保留合法类型
     order = []
     for kind in send_order or []:
@@ -217,6 +239,17 @@ def run_send_tasks(
                     break
 
             _log(f"{prefix}[{i+1}/{total_count}] 正在发送给 {recipient} ({name})...")
+            _at_cfg = _at_kwargs(task)
+            if _at_cfg:
+                _at_names = list(_at_cfg.get("at_members") or [])
+                if _at_cfg.get("at_all"):
+                    _at_names.append("所有人")
+                _at_stage = (
+                    "文字消息"
+                    if str(task.get("at_attach", "text") or "text") == "text"
+                    else "首条消息"
+                )
+                _log(f"{prefix}[{i+1}/{total_count}] {_at_stage}将 @ {'、'.join(_at_names)}")
             _progress(i + 1, total_count)
 
             messages = []
@@ -313,7 +346,93 @@ def run_send_tasks(
                     else:
                         merge_text = None
 
-                    if merge_text is not None:
+                    at_mode = str(task.get("at_attach", "text") or "text")
+                    at_cfg = _at_kwargs(task)
+                    in_order_text = [
+                        s for s in steps if s["type"] in ("text", "custom")
+                    ]
+                    in_order_files = [
+                        s for s in steps if s["type"] not in ("text", "custom")
+                    ]
+                    # @ 跟随文字：文字单独一条（带 @），图片/附件另发一批，
+                    # 这样 @ 与文字在同一个气泡里，不会先冒出一条 @ 再发图/文字。
+                    split_at_with_text = bool(
+                        at_cfg and at_mode == "text" and (has_text or has_custom)
+                    )
+
+                    def _send_text_with_at():
+                        if has_text:
+                            _log(
+                                f"{prefix}[{i+1}/{total_count}] 发送文字消息（带 @）给 {recipient}"
+                            )
+                            ok_t, _ni = sender.send_multiple_messages_progress(
+                                messages,
+                                recipient,
+                                chat_delay=chat_delay,
+                                start_index=0,
+                                stop_event=stop_event,
+                                fast_mode=True,
+                                **_at_kwargs(task),
+                            )
+                            return ok_t
+                        _log(
+                            f"{prefix}[{i+1}/{total_count}] 发送自定义消息（带 @）给 {recipient}"
+                        )
+                        return sender.send_message(
+                            task["custom_msg"],
+                            recipient,
+                            chat_delay=chat_delay,
+                            fast_mode=True,
+                            stop_event=stop_event,
+                            **_at_kwargs(task),
+                        )
+
+                    def _send_files_only():
+                        if not file_paths:
+                            return True
+                        _log(
+                            f"{prefix}[{i+1}/{total_count}] 发送{len(file_paths)}个文件给 {recipient}"
+                        )
+                        return sender.send_files_batch(
+                            file_paths,
+                            recipient,
+                            chat_delay=chat_delay,
+                            fast_mode=True,
+                            stop_event=stop_event,
+                        )
+
+                    success = False
+                    if split_at_with_text:
+                        # 先后顺序仍按 send_order：文字类排在文件类前 → 先发文字（带 @）
+                        _custom_steps = [s for s in steps if s["type"] == "custom"]
+                        if text_first:
+                            success = _send_text_with_at()
+                            if success:
+                                _mark_at(task)
+                                # 文字已发：后续补文件 + 剩余 custom
+                                task["pending_steps"] = list(in_order_files)
+                                if has_text:
+                                    task["pending_steps"] += _custom_steps
+                                success = _send_files_only()
+                                if success:
+                                    task["pending_steps"] = (
+                                        _custom_steps if (has_text and has_custom) else []
+                                    )
+                        else:
+                            success = _send_files_only()
+                            if success:
+                                task["pending_steps"] = list(in_order_text)
+                                success = _send_text_with_at()
+                                if success:
+                                    _mark_at(task)
+                                    task["pending_steps"] = (
+                                        _custom_steps if (has_text and has_custom) else []
+                                    )
+                        if not success:
+                            _log(
+                                f"{prefix}[{i+1}/{total_count}] ❌ 文字/文件发送失败，未完成部分保留待重发"
+                            )
+                    elif merge_text is not None:
                         _log(
                             f"{prefix}[{i+1}/{total_count}] 合并发送文字+{len(file_paths)}个文件给 {recipient}"
                         )
@@ -325,6 +444,7 @@ def run_send_tasks(
                             fast_mode=True,
                             stop_event=stop_event,
                             text_first=text_first,
+                            **_at_kwargs(task),
                         )
                     else:
                         _log(
@@ -336,21 +456,26 @@ def run_send_tasks(
                             chat_delay=chat_delay,
                             fast_mode=True,
                             stop_event=stop_event,
+                            # 「跟随文字」模式但没有文字可挂 → 不 @
+                            **({} if at_mode == "text" else _at_kwargs(task)),
                         )
                     # 清理生成的表格图片/区域截图临时文件（附件是用户文件，不删）
                     _remove_images(sender, temp_images)
                     if not success:
-                        _log(
-                            f"{prefix}[{i+1}/{total_count}] ❌ 合并发送失败，整批保留待重发"
-                        )
+                        if not split_at_with_text:
+                            _log(
+                                f"{prefix}[{i+1}/{total_count}] ❌ 合并发送失败，整批保留待重发"
+                            )
                         break
-                    # 消费整批：仅 text 与 custom 并存时留下 custom 单独发
-                    if has_text and has_custom:
-                        task["pending_steps"] = [
-                            s for s in steps if s["type"] == "custom"
-                        ]
-                    else:
-                        task["pending_steps"] = []
+                    if not split_at_with_text:
+                        _mark_at(task)
+                        # 消费整批：仅 text 与 custom 并存时留下 custom 单独发
+                        if has_text and has_custom:
+                            task["pending_steps"] = [
+                                s for s in steps if s["type"] == "custom"
+                            ]
+                        else:
+                            task["pending_steps"] = []
                 else:
                     # ---------- 无图片/附件：逐项发送（原逻辑） ----------
                     step = steps[0]
@@ -366,6 +491,7 @@ def run_send_tasks(
                             start_index=start_index,
                             stop_event=stop_event,
                             fast_mode=True,
+                            **_at_kwargs(task),
                         )
                         step["index"] = next_index
                     elif step_type == "text":
@@ -376,6 +502,7 @@ def run_send_tasks(
                             start_index=start_index,
                             stop_event=stop_event,
                             fast_mode=True,
+                            **_at_kwargs(task),
                         )
                         step["index"] = next_index
                     elif step_type == "attachment":
@@ -386,6 +513,7 @@ def run_send_tasks(
                             chat_delay=chat_delay,
                             fast_mode=True,
                             stop_event=stop_event,
+                            **_at_kwargs(task),
                         )
                         if success:
                             _log(f"{prefix}[{i+1}/{total_count}] 已发送附加文件")
@@ -397,12 +525,14 @@ def run_send_tasks(
                             chat_delay=chat_delay,
                             fast_mode=True,
                             stop_event=stop_event,
+                            **_at_kwargs(task),
                         )
                         if success:
                             _log(f"{prefix}[{i+1}/{total_count}] 已发送自定义消息")
 
                     if not success:
                         break
+                    _mark_at(task)
 
                     task["pending_steps"].pop(0)
 

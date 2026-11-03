@@ -912,17 +912,20 @@ class WeChatSender:
                 pass
             time.sleep(0.5)
 
-    def _send_msg_with_dialog_retry(self, content, recipient, stop_event=None) -> bool:
+    def _send_msg_with_dialog_retry(self, content, recipient, stop_event=None,
+                                    at_members=None, at_all=False) -> bool:
         """发送消息，检测发送失败弹窗并重试。最多 3 次。
 
         弹窗失败通常因频率限制/网络问题，重试间隔 1 秒；
         bridge.send_text 返回失败间隔 0.5 秒。
+        at_members/at_all 仅对本方法的第一条消息生效（重试会重新插入 @）。
         """
         max_retries = 3
         for attempt in range(max_retries):
             if self._stop_requested(stop_event):
                 return False
-            ok = self.bridge.send_text(content)
+            ok = self.bridge.send_text(content, at_members=at_members,
+                                      at_all=at_all)
             # 等待弹窗可能出现
             if self._wait_or_stopped(0.3, stop_event):
                 return False
@@ -946,18 +949,21 @@ class WeChatSender:
         return False
 
     def _send_files_with_dialog_retry(self, file_paths, text, recipient,
-                                      stop_event=None, text_first=False) -> bool:
+                                      stop_event=None, text_first=False,
+                                      at_members=None, at_all=False) -> bool:
         """合并发送文件/图片（可带文字），检测发送失败弹窗并重试。最多 3 次。
 
         text 为 None 时仅发文件；非 None 时「文件 + 文字」一次粘贴 + 一次
         Enter（v1.5.0 批处理合并约束）。text_first 控制文字在前/文件在前。
+        at_members/at_all 透传给桥接层（仅在本条消息上插入 @）。
         """
         max_retries = 3
         label = f"{recipient}" + (f" 文字+{len(file_paths)}文件" if text else f" {len(file_paths)}文件")
         for attempt in range(max_retries):
             if self._stop_requested(stop_event):
                 return False
-            ok = self.bridge.send_files(file_paths, text=text, text_first=text_first)
+            ok = self.bridge.send_files(file_paths, text=text, text_first=text_first,
+                                        at_members=at_members, at_all=at_all)
             if self._wait_or_stopped(0.3, stop_event):
                 return False
             if self._dismiss_send_failure_dialog():
@@ -1258,8 +1264,11 @@ class WeChatSender:
         first_send=False,
         chat_delay=0.3,
         fast_mode=False,
-        stop_event=None
+        stop_event=None,
+        at_members=None,
+        at_all=False
     ):
+        """发送一条文字消息；at_members/at_all 指定本条消息要 @ 的群成员。"""
         if self._stop_requested(stop_event):
             return False
 
@@ -1315,7 +1324,9 @@ class WeChatSender:
                     current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
                     if self._is_target_chat(current_chat, recipient):
                         self.log(f"当前窗口正确，直接发送")
-                        if not self._send_msg_with_dialog_retry(content, recipient, stop_event):
+                        if not self._send_msg_with_dialog_retry(
+                                content, recipient, stop_event,
+                                at_members=at_members, at_all=at_all):
                             return False
                         self.log(f"✅ 快速发送成功")
                         return True
@@ -1354,7 +1365,9 @@ class WeChatSender:
                     self.log(f"当前窗口: {current_chat}")
 
                     if self._is_target_chat(current_chat, recipient):
-                        if not self._send_msg_with_dialog_retry(content, recipient, stop_event):
+                        if not self._send_msg_with_dialog_retry(
+                                content, recipient, stop_event,
+                                at_members=at_members, at_all=at_all):
                             return False
                         self.log(f"✅ 消息发送成功")
                         return True
@@ -1391,12 +1404,15 @@ class WeChatSender:
         recipient,
         chat_delay=0.3,
         fast_mode=False,
-        stop_event=None
+        stop_event=None,
+        at_members=None,
+        at_all=False
     ):
-        """发送单个文件（兼容旧接口）。"""
+        """发送单个文件（兼容旧接口）；at_* 仅作用在这一个文件上。"""
         return self._send_files_inner(
             [file_path], None, recipient,
             chat_delay=chat_delay, fast_mode=fast_mode, stop_event=stop_event,
+            at_members=at_members, at_all=at_all,
         )
 
     def send_text_and_files(
@@ -1407,17 +1423,21 @@ class WeChatSender:
         chat_delay=0.3,
         fast_mode=False,
         stop_event=None,
-        text_first=False
+        text_first=False,
+        at_members=None,
+        at_all=False
     ):
         """合并发送「文字 + 文件/图片」：一次粘贴 + 一次 Enter（v1.5.0 批处理合并）。
 
         text_first=True 时先粘文字再粘文件（合并消息里文字在前、文件卡片在后）；
         默认 False 保持「文件卡片在前、文字追加在后」（与发送顺序配置联动）。
+        at_members/at_all 指定本条合并消息要 @ 的群成员。
         """
         return self._send_files_inner(
             list(file_paths), text, recipient,
             chat_delay=chat_delay, fast_mode=fast_mode,
             stop_event=stop_event, text_first=text_first,
+            at_members=at_members, at_all=at_all,
         )
 
     def send_files_batch(
@@ -1426,12 +1446,15 @@ class WeChatSender:
         recipient,
         chat_delay=0.3,
         fast_mode=False,
-        stop_event=None
+        stop_event=None,
+        at_members=None,
+        at_all=False
     ):
         """合并发送「仅文件/图片（无文字）」：一次粘贴 + 一次 Enter。"""
         return self._send_files_inner(
             list(file_paths), None, recipient,
             chat_delay=chat_delay, fast_mode=fast_mode, stop_event=stop_event,
+            at_members=at_members, at_all=at_all,
         )
 
     def _send_files_inner(
@@ -1442,12 +1465,15 @@ class WeChatSender:
         chat_delay=0.3,
         fast_mode=False,
         stop_event=None,
-        text_first=False
+        text_first=False,
+        at_members=None,
+        at_all=False
     ):
         """合并发送实现：文件列表（可含图片/附件）+ 可选文字，一次粘贴 + 一次 Enter。
 
         send_file / send_text_and_files / send_files_batch 的统一底层。
         text_first 透传给桥接层控制「文字在前」还是「文件在前」的粘贴顺序。
+        at_members/at_all 透传给桥接层，插在清空输入框之后、粘贴之前。
         """
         if self._stop_requested(stop_event):
             return False
@@ -1500,7 +1526,8 @@ class WeChatSender:
                     current_chat = chatinfo.get('chat_name', '') if chatinfo else ''
                     if self._is_target_chat(current_chat, recipient):
                         if not self._send_files_with_dialog_retry(
-                                file_paths, text, recipient, stop_event, text_first):
+                                file_paths, text, recipient, stop_event, text_first,
+                                at_members=at_members, at_all=at_all):
                             return False
                         self.log(f"✅ 图片发送成功")
                         return True
@@ -1536,7 +1563,8 @@ class WeChatSender:
                     self.log(f"当前窗口: {current_chat}")
                     if self._is_target_chat(current_chat, recipient):
                         if not self._send_files_with_dialog_retry(
-                                file_paths, text, recipient, stop_event, text_first):
+                                file_paths, text, recipient, stop_event, text_first,
+                                at_members=at_members, at_all=at_all):
                             return False
                         self.log(f"✅ 图片发送成功")
                         return True
@@ -1917,8 +1945,11 @@ class WeChatSender:
         chat_delay=0.3,
         start_index=0,
         stop_event=None,
-        fast_mode=False
+        fast_mode=False,
+        at_members=None,
+        at_all=False
     ):
+        """逐张发送表格图片；at_members/at_all 只作用在整批的第一张上。"""
         image_paths = []
         next_index = start_index
         try:
@@ -1934,13 +1965,16 @@ class WeChatSender:
 
                 image_path = image_paths[index]
                 self.log(f"发送图片 {index + 1}/{len(image_paths)} 给 {recipient}")
+                first = (index == 0)
                 if not self.send_file(
                     image_path,
                     recipient,
                     chat_delay=chat_delay,
                     # fast_mode=True 时所有图片都直接在当前窗口发（窗口已预切换）
                     fast_mode=fast_mode or index > 0,
-                    stop_event=stop_event
+                    stop_event=stop_event,
+                    at_members=at_members if first else None,
+                    at_all=at_all if first else False,
                 ):
                     return False, next_index
                 next_index = index + 1
@@ -1974,8 +2008,11 @@ class WeChatSender:
         chat_delay=0.2,
         start_index=0,
         stop_event=None,
-        fast_mode=False
+        fast_mode=False,
+        at_members=None,
+        at_all=False
     ):
+        """逐条发送文字；at_members/at_all 只作用在整批的第一条上。"""
         next_index = start_index
         for i in range(start_index, len(messages)):
             if self._stop_requested(stop_event):
@@ -1983,13 +2020,16 @@ class WeChatSender:
 
             message = messages[i]
             self.log(f"发送消息 {i+1}/{len(messages)} 给 {recipient}")
+            first = (i == 0)
             if not self.send_message(
                 message,
                 recipient,
                 first_send=(i == 0 and not fast_mode),
                 chat_delay=chat_delay,
                 fast_mode=fast_mode,
-                stop_event=stop_event
+                stop_event=stop_event,
+                at_members=at_members if first else None,
+                at_all=at_all if first else False,
             ):
                 return False, next_index
 

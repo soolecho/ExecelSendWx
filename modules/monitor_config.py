@@ -22,6 +22,66 @@ from typing import Dict, List, Optional
 
 MONITOR_VERSION = 11
 
+# 监控任务 @ 触发的「本轮条数」条件：clean_rows 与阈值比较，满足才 @。
+# 旧配置 at_condition=always → 保持"只要 @ 开关打开就 @"的原行为。
+AT_CONDITION_LABELS = {
+    "always": "不限条数",
+    "gt": "大于",
+    "ge": "大于等于",
+    "lt": "小于",
+    "le": "小于等于",
+    "eq": "等于",
+}
+
+# @ 与内容的组合方式：text=@ 和文字同一条（图片/附件另发）；first=@ 随首条内容（旧行为）
+AT_ATTACH_LABELS = {
+    "text": "跟随文字消息（@和文字同一条）",
+    "first": "随首条内容（@单独一条）",
+}
+
+
+def normalize_at_attach(value) -> str:
+    v = str(value or "text").strip()
+    return v if v in AT_ATTACH_LABELS else "text"
+
+
+def at_condition_met(task: "MonitorTask", row_count: int) -> bool:
+    """本轮推送条数是否满足该监控任务的 @ 条件（仅判断条数，不看 @ 开关）。"""
+    cond = str(getattr(task, "at_condition", "always") or "always").strip()
+    if cond not in AT_CONDITION_LABELS or cond == "always":
+        return True
+    try:
+        threshold = int(getattr(task, "at_count", 0) or 0)
+    except (TypeError, ValueError):
+        threshold = 0
+    try:
+        count = int(row_count or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if cond == "gt":
+        return count > threshold
+    if cond == "ge":
+        return count >= threshold
+    if cond == "lt":
+        return count < threshold
+    if cond == "le":
+        return count <= threshold
+    if cond == "eq":
+        return count == threshold
+    return True
+
+
+def should_mention(task: "MonitorTask", row_count: int) -> bool:
+    """本轮是否需要 @：@ 开关打开 + 有 @ 目标 + 条数条件满足，三者都成立。"""
+    if not bool(getattr(task, "at_enabled", False)):
+        return False
+    has_target = bool(str(getattr(task, "at_members", "") or "").strip()) or bool(
+        getattr(task, "at_all", False)
+    )
+    if not has_target:
+        return False
+    return at_condition_met(task, row_count)
+
 
 def _default_send_order() -> List[str]:
     """监控合并发送默认顺序：文字 → 图片 → 表格文件（旧行为兼容）。"""
@@ -160,6 +220,16 @@ class MonitorTask:
     send_file: bool = False
     # 推送目标（个人微信名）
     recipients: List[str] = field(default_factory=list)
+    # 群聊 @ 成员（随本条监控任务配置走）：开关 + 成员名单（/ ; 、 ， , 分隔）+ @所有人
+    at_enabled: bool = False
+    at_members: str = ""
+    at_all: bool = False
+    # 本轮 @ 触发条数条件（随任务保存）：always/gt/ge/lt/le/eq + 阈值条数。
+    # 例：at_condition="gt", at_count=10 → 本轮新增超过 10 条才 @。
+    at_condition: str = "always"
+    at_count: int = 0
+    # @ 组合方式（随任务保存）：text=@和文字同一条；first=@随首条内容
+    at_attach: str = "text"
     # 时间窗 + 轮询周期：times 空=全天；repeat_mode/days/run_dates 同 ScheduleTask
     repeat_mode: str = "daily"
     days: List[int] = field(default_factory=list)
@@ -295,6 +365,12 @@ class MonitorTask:
             send_image=_b("send_image", False),
             send_file=_b("send_file", False),
             recipients=_split_list(data.get("recipients")),
+            at_enabled=_b("at_enabled", False),
+            at_members=_s("at_members"),
+            at_all=_b("at_all", False),
+            at_condition=_s("at_condition", "always") or "always",
+            at_count=max(0, _i("at_count", 0)),
+            at_attach=normalize_at_attach(data.get("at_attach", "text")),
             repeat_mode=_s("repeat_mode", "daily") or "daily",
             days=days,
             run_dates=run_dates,
