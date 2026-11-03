@@ -368,8 +368,12 @@ class UiaBridge:
         except Exception:
             return False
 
-    def _pick_at_item(self, popover, name: str) -> bool:
-        """在弹层里选中目标成员：唯一候选直接选，否则按名字（含别名）匹配。"""
+    def _pick_at_item(self, popover, name: str, exact_only: bool = False) -> bool:
+        """在弹层里选中目标成员：唯一候选直接选，否则按名字（含别名）匹配。
+
+        ``exact_only=True`` 时不做"包含"匹配：输入名字前缀阶段（弹层里还有
+        多个候选）用，避免把"张三丰"当成"张三"点错人。
+        """
         items = self._popover_items(popover)
         if not items:
             return False
@@ -388,6 +392,8 @@ class UiaBridge:
                 if _mention_key(getattr(item, "Name", "")) == want:
                     if self._click_at_item(item):
                         return True
+        if exact_only:
+            return False
         # 候选项可能带备注/后缀（如 "张三（备注）"）：退化为包含匹配
         for want in aliases:
             for item in items:
@@ -398,8 +404,100 @@ class UiaBridge:
         return False
 
     @staticmethod
-    def _undo_typed(e, count: int) -> None:
-        """@ 插入失败时清理已键入的 "@昵称"（先关弹层再退格）。"""
+    def _has_at_targets(at_members, at_all) -> bool:
+        """是否配置了 @ 目标（成员或 @所有人）。"""
+        raw = at_members
+        if isinstance(raw, str):
+            raw = [raw]
+        if any(str(m or "").strip() for m in (raw or [])):
+            return True
+        return bool(at_all)
+
+    @staticmethod
+    def _main_hwnd(driver) -> int:
+        """当前微信主窗口句柄（取不到返回 0）。"""
+        try:
+            win = driver._find_main()
+        except Exception:
+            win = None
+        if win is None:
+            win = getattr(driver, "_win", None)
+        try:
+            return int(getattr(win, "NativeWindowHandle", 0) or 0)
+        except Exception:
+            return 0
+
+    @staticmethod
+    def _foreground_hwnd() -> int:
+        """系统当前前台窗口句柄（失败返回 0）。"""
+        try:
+            return int(ctypes.windll.user32.GetForegroundWindow())
+        except Exception:
+            return 0
+
+    def _focus_chat_input(self, driver, e) -> bool:
+        """让微信主窗处于前台并把键盘焦点交给聊天输入框，返回是否 SetFocus 成功。
+
+        不能依赖 ``_click_ctrl`` 的屏幕坐标点击：输入框被置顶窗口（视频会议、
+        图片/视频预览等）遮挡时，点击会落到遮挡窗口上，后续 SendKeys 的
+        "@昵称" 也送给那个窗口——表现就是输入框里没有 @、候选弹层不出现、
+        清理时又像"把内容删掉了"。UIA SetFocus 直接作用于输入框控件，
+        不经过屏幕坐标。
+        """
+        hwnd = self._main_hwnd(driver)
+        if hwnd:
+            try:
+                driver._force_foreground(hwnd)
+            except Exception:
+                pass
+            time.sleep(0.2)
+        focused = False
+        for _ in range(2):
+            try:
+                e.SetFocus()
+                focused = True
+            except Exception:
+                pass
+            time.sleep(0.2)
+            if not hwnd or self._foreground_hwnd() == hwnd:
+                return focused
+            try:
+                driver._force_foreground(hwnd)
+            except Exception:
+                pass
+            time.sleep(0.15)
+        logger.warning(
+            "uia_bridge: 微信主窗口未处于前台（可能被其它置顶窗口遮挡），@ 可能输入失败"
+        )
+        return focused
+
+    @staticmethod
+    def _input_value(e) -> Optional[str]:
+        """读输入框当前文本；读不到返回 None。"""
+        try:
+            return WeChatUIA._read_edit_value(e)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _clear_chat_input(e) -> None:
+        """清空输入框（此时还没有 mention chip，Ctrl+A 安全）。"""
+        try:
+            e.SetFocus()
+        except Exception:
+            pass
+        try:
+            e.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)
+        except Exception:
+            pass
+        time.sleep(0.1)
+
+    def _undo_typed(self, driver, e, count: int) -> None:
+        """@ 插入失败时清理已键入的 "@昵称"（重新聚焦，先关弹层再退格）。"""
+        try:
+            self._focus_chat_input(driver, e)
+        except Exception:
+            pass
         try:
             e.SendKeys("{Esc}", waitTime=0.05)
         except Exception:
@@ -410,11 +508,73 @@ class UiaBridge:
             except Exception:
                 return
 
+    @staticmethod
+    def _typed_prefix(name: str) -> str:
+        """在 @ 弹层里用于过滤候选的键入字符：只保留字母/数字/汉字。
+
+        微信候选过滤对标点很敏感：候选名是「Lin威廉  .」时键入完整原名
+        「@Lin威廉.」，过滤结果为空、弹层直接关闭——既选不到人，看起来
+        又像"输入了 @ 但没选人名"。只键入有效字符（如「Lin威廉」）时弹层
+        会稳定停在唯一候选上，再按去空格后的全名精确匹配即可点选。
+        """
+        return "".join(ch for ch in str(name or "") if ch.isalnum())
+
+    def _insert_one_mention(self, driver, e, name: str):
+        """插入单个 @，返回 (status, typed_len)。
+
+        status: True=已落成 chip；False=弹层里没有该成员；None=没有出现弹层。
+        typed_len: 当前输入框里由本函数键入的字符数（含 "@"），供失败清理退格。
+        """
+        typed = self._typed_prefix(name) or _mention_key(name)
+        pending = 1  # "@" 本身
+        self._focus_chat_input(driver, e)
+        try:
+            e.SendKeys("@", waitTime=0.05)
+        except Exception:
+            return None, 0
+        popover = self._at_popover(driver, timeout=2.0)
+        if popover is None:
+            return None, pending
+        if self._pick_at_item(popover, name, exact_only=True):
+            return True, pending
+        for ch in typed:
+            try:
+                e.SendKeys(_sendkeys_literal(ch), waitTime=0.05)
+            except Exception:
+                return None, pending
+            pending += 1
+            time.sleep(0.2)
+            popover = self._at_popover(driver, timeout=1.2)
+            if popover is None:
+                # 过滤过头（该字符把候选全部滤掉、弹层关闭）：退格回到有候选的状态
+                for _ in range(2):
+                    try:
+                        e.SendKeys("{Back}", waitTime=0.05)
+                    except Exception:
+                        break
+                    pending = max(1, pending - 1)
+                    time.sleep(0.25)
+                    popover = self._at_popover(driver, timeout=1.2)
+                    if popover is not None:
+                        break
+                break
+            if self._pick_at_item(popover, name, exact_only=True):
+                return True, pending
+        if popover is None:
+            return None, pending
+        if self._pick_at_item(popover, name):
+            return True, pending
+        return False, pending
+
     def _insert_mentions(self, driver, e, at_members=None, at_all: bool = False) -> int:
         """把 @成员 / @所有人 逐个落成输入框 chip，返回成功插入个数。
 
-        弹层不存在（私聊/版本不支持）时立即清理已键入内容并停止，降级为普通
-        发送——绝不把字面量 "@昵称" 发出去。
+        每个名字按「键入 @ → 等弹层 → 渐进键入名字 → 匹配点选」执行：
+        - 弹层出现且匹配 → 落成 chip；
+        - 弹层没出现但输入框已有文本（私聊/版本不支持 @）→ 清理并整体降级为
+          普通发送，绝不把字面量 "@昵称" 发出去；
+        - 弹层没出现且输入框仍为空（多为焦点被遮挡窗口抢走）→ 重新聚焦后最多
+          重试 3 次，避免静默丢掉 @。
         """
         names = []
         seen = set()
@@ -436,26 +596,41 @@ class UiaBridge:
 
         inserted = 0
         for nm in names:
-            typed = _mention_key(nm)
-            if not typed:
-                continue
-            try:
-                e.SendKeys("@" + _sendkeys_literal(typed), waitTime=0.05)
-            except Exception as exc:
-                logger.debug("uia_bridge: 键入 @%s 失败: %s", typed, exc)
-                continue
-            popover = self._at_popover(driver, timeout=1.2)
-            if popover is None:
-                # 私聊/不支持 @：清掉已键入文本，整体降级为普通发送
-                logger.info("uia_bridge: 未出现 @ 候选弹层，跳过 @%s（按普通消息发送）", typed)
-                self._undo_typed(e, len(typed) + 1)
+            status = None
+            pending = 0
+            for attempt in range(3):
+                status, pending = self._insert_one_mention(driver, e, nm)
+                if status is True:
+                    inserted += 1
+                    time.sleep(0.25)  # 等 chip 落位、焦点回到输入框
+                    break
+                if status is None:
+                    value = self._input_value(e)
+                    # 已插入的 mention chip 读回是 U+FFFC，去掉后为空说明
+                    # 本次 "@名字" 根本没落进输入框（焦点被抢），要重试；
+                    # 去掉 chip 后仍有文本才是私聊/不支持 @ 的降级场景。
+                    clean = (value or "").replace("\ufffc", "").strip()
+                    if clean:
+                        # 私聊/不支持 @：弹层不会出现，清掉已键入文本后整体降级
+                        logger.info(
+                            "uia_bridge: 未出现 @ 候选弹层，跳过 @%s（按普通消息发送）", nm)
+                        self._undo_typed(driver, e, pending)
+                        return inserted
+                    # 输入框仍是空的：按键没落进输入框（焦点被抢），重新聚焦再试
+                    if attempt < 2:
+                        logger.debug("uia_bridge: @%s 未落进输入框，重新聚焦重试", nm)
+                        self._clear_chat_input(e)
+                        continue
+                    logger.info(
+                        "uia_bridge: @%s 输入未能落进输入框（焦点被抢占），跳过", nm)
+                    self._clear_chat_input(e)
+                    break
+                # status=False：弹层在，但候选里没有该成员
+                logger.info("uia_bridge: @ 候选里没有「%s」，已清理", nm)
+                self._undo_typed(driver, e, pending)
                 break
-            if not self._pick_at_item(popover, typed):
-                logger.info("uia_bridge: @ 候选里没有「%s」，已清理", typed)
-                self._undo_typed(e, len(typed) + 1)
+            if status is not True:
                 continue
-            inserted += 1
-            time.sleep(0.25)  # 等 chip 落位、焦点回到输入框
         return inserted
 
     def send_text(self, text: str, at_members=None, at_all: bool = False) -> bool:
@@ -464,7 +639,7 @@ class UiaBridge:
         带 ``at_members`` / ``at_all`` 时先把 @ chip 插进输入框再粘文字；
         不带 @ 时走驱动原路径（行为完全不变）。
         """
-        has_at = bool([m for m in (at_members or []) if str(m or "").strip()]) or bool(at_all)
+        has_at = self._has_at_targets(at_members, at_all)
         with self._lock:
             try:
                 if not has_at:
@@ -476,14 +651,10 @@ class UiaBridge:
                 if e is None:
                     logger.warning("uia_bridge.send_text: 找不到聊天输入框")
                     return False
-                if not driver._click_ctrl(e):
-                    logger.warning("uia_bridge.send_text: 点击输入框拿焦点失败")
+                if not self._focus_chat_input(driver, e):
+                    logger.warning("uia_bridge.send_text: 聚焦输入框失败")
                     return False
-                time.sleep(0.1)
-                try:
-                    e.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)
-                except Exception:
-                    pass
+                self._clear_chat_input(e)
                 inserted = self._insert_mentions(driver, e, at_members, at_all)
                 text = text or ""
                 if text:
@@ -547,16 +718,21 @@ class UiaBridge:
             if not file_paths:
                 logger.warning("uia_bridge.send_files: 没有有效文件路径")
                 return False
-            if not driver._click_ctrl(e):
-                logger.warning("uia_bridge.send_files: 点击输入框拿焦点失败")
-                return False
+            has_at = self._has_at_targets(at_members, at_all)
+            if not has_at:
+                if not driver._click_ctrl(e):
+                    logger.warning("uia_bridge.send_files: 点击输入框拿焦点失败")
+                    return False
+            # 清空输入框残留草稿，保证从干净状态开始
             time.sleep(0.15)
-            try:
-                # 清空输入框残留草稿，保证从干净状态开始
-                e.SendKeys("{Ctrl}a{Delete}", waitTime=0.05)
-            except Exception:
-                pass
+            self._clear_chat_input(e)
             # @ 成员/所有人：必须在清空之后、粘贴之前插入（chip 不能被 Ctrl+A 删）
+            if has_at:
+                # 有 @ 时不能用坐标点击拿焦点（输入框被置顶窗口遮挡会点到别处，
+                # 后续 "@昵称" 也会丢给那个窗口），改用 UIA SetFocus。
+                if not self._focus_chat_input(driver, e):
+                    logger.warning("uia_bridge.send_files: 聚焦输入框失败")
+                    return False
             self._insert_mentions(driver, e, at_members, at_all)
             text = (text or "").strip()
 
