@@ -364,6 +364,14 @@ class ConfigManager:
                 "idle_enabled": bool(standby.get("idle_enabled", True)),
                 "idle_minutes": idle_minutes,
             },
+            # 右下角运行进度卡片；旧配置缺省开启，完成通知不受此开关影响
+            "progress_toast_enabled": bool(
+                raw.get("progress_toast_enabled", True)
+            ),
+            # 数据发送页的“发送后最小化微信”偏好，跨启动保持
+            "manual_minimize_wechat": bool(
+                raw.get("manual_minimize_wechat", True)
+            ),
         }
 
     def load_global_settings(self):

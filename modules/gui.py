@@ -1188,6 +1188,7 @@ class ScheduleSendWorker(QThread):
 
     finished_with_result = pyqtSignal(int, int, list)  # success, failed, failed_recipients
     progress = pyqtSignal(int, int)  # current, total：用于任务栏/标题进度（主线程连接）
+    log_signal = pyqtSignal(str)  # 运行卡片按 worker 接收日志，避免串入其他任务
 
     def __init__(
         self,
@@ -1201,6 +1202,7 @@ class ScheduleSendWorker(QThread):
         attachment="",
         attach_order="after",
         send_order=None,
+        region_spec=None,
     ):
         super().__init__()
         self.recipients = list(recipients or [])
@@ -1210,9 +1212,12 @@ class ScheduleSendWorker(QThread):
         self.default_city = str(default_city or "")
         self.minimize_after = bool(minimize_after)
         self.attachment = str(attachment or "").strip()
+        # 指定区域截图（在线表格）：{cloud_file_id, cloud_file_name, sheet, range}
+        self.region_spec = dict(region_spec) if isinstance(region_spec, dict) else {}
         # 发送顺序：显式 send_order 优先；否则按 attach_order 兼容旧调用
         if isinstance(send_order, list) and send_order:
-            order = [k for k in send_order if k in ("message", "attachment")]
+            order = [k for k in send_order
+                     if k in ("message", "attachment", "region")]
             if "message" not in order:
                 order.append("message")
             self.send_order = order
@@ -1231,6 +1236,10 @@ class ScheduleSendWorker(QThread):
         self.stopped_event.set()
 
     def log(self, msg):
+        try:
+            self.log_signal.emit(str(msg))
+        except Exception:
+            pass
         if self._log_cb:
             try:
                 self._log_cb(msg)
@@ -1249,7 +1258,7 @@ class ScheduleSendWorker(QThread):
                 )
         except Exception:
             pass
-        if not self.message.strip():
+        if not (self.message.strip() or self.attachment or self.region_spec):
             self.log("[定时] 消息为空，跳过发送")
             self.finished_with_result.emit(0, len(self.recipients), list(self.recipients))
             return
@@ -1332,6 +1341,23 @@ class ScheduleSendWorker(QThread):
                 self.log(f"[定时] 本任务将附加发送文件: {os.path.basename(self.attachment)}")
             else:
                 self.log(f"[定时] ⚠ 附加文件不存在，跳过附件发送: {self.attachment}")
+        # 指定区域截图：与「数据发送」页一致——按需下载在线表格，再按原表样式渲染。
+        # 整批只渲染一张、所有接收人共用，结束后删除缓存文件。
+        region_png = ""
+        region_ok = False
+        if "region" in self.send_order and self.region_spec:
+            try:
+                from modules.region_snapshot import ensure_region_png
+                self.log("[定时] 正在生成在线表格指定区域截图…")
+                rendered = ensure_region_png(self.region_spec, log_fn=self.log)
+                if rendered and os.path.isfile(rendered):
+                    region_png = rendered
+                    region_ok = True
+                    self.log("[定时] 区域截图已生成")
+                else:
+                    self.log("[定时] ⚠ 区域截图生成失败，本次不发送区域图")
+            except Exception as exc:
+                self.log(f"[定时] ⚠ 区域截图生成异常，本次不发送区域图: {exc}")
         current_idx = 0
         try:
             for idx, recipient in enumerate(self.recipients):
@@ -1355,15 +1381,23 @@ class ScheduleSendWorker(QThread):
                 # 文字/附件直接在当前窗口用 fast_mode 发送，不再重复
                 # "搜索-切换-确认"（与数据发送 Tab 逻辑一致）。
                 chat_opened = False
-                # v1.5.0 批处理合并：文字 + 附件合并为一次 send_text_and_files
-                # （一次粘贴 + 一次 Enter），绝不逐条发；仅附件时单独发文件。
-                # 接收人成败以消息文字为准，附件失败不计入失败。
-                kinds = [k for k in self.send_order if k in ("message", "attachment")]
+                # v1.5.0 批处理合并：文字 + 文件/图片合并为一次 send_text_and_files
+                # （一次粘贴 + 一次 Enter），绝不逐条发；仅文件时用批量文件发送。
+                # 接收人成败以消息文字（或唯一的文件内容）为准。
+                kinds = [k for k in self.send_order
+                         if (k == "message" and self.message.strip())
+                         or (k == "attachment" and attachment_ok)
+                         or (k == "region" and region_ok)]
                 has_msg = "message" in kinds
-                has_attach = "attachment" in kinds and attachment_ok
-                # 发送顺序联动粘贴顺序：message 排在 attachment 前 → 先粘文字再粘附件
+                file_paths = []
+                for k in kinds:
+                    if k == "attachment":
+                        file_paths.append(self.attachment)
+                    elif k == "region":
+                        file_paths.append(region_png)
+                # 发送顺序联动粘贴顺序：message 排在最前 → 先粘文字再粘文件
                 text_first = bool(kinds) and kinds[0] == "message"
-                if has_msg or has_attach:
+                if kinds:
                     if self.stopped_event.is_set():
                         break
                     if not self._sender.open_chat(
@@ -1376,11 +1410,11 @@ class ScheduleSendWorker(QThread):
                     else:
                         chat_opened = True
                 if chat_opened:
-                    if has_msg and has_attach:
-                        self.log(f"[定时] 合并发送文字+附件给 {recipient}")
+                    if has_msg and file_paths:
+                        self.log(f"[定时] 合并发送文字+{len(file_paths)}个文件给 {recipient}")
                         text_ok = self._sender.send_text_and_files(
                             text=self.message,
-                            file_paths=[self.attachment],
+                            file_paths=file_paths,
                             recipient=recipient,
                             chat_delay=self.chat_delay,
                             fast_mode=True,
@@ -1395,15 +1429,16 @@ class ScheduleSendWorker(QThread):
                             fast_mode=True,
                             stop_event=self.stopped_event,
                         )
-                    elif has_attach:
-                        if not self._sender.send_file(
-                            self.attachment,
+                    elif file_paths:
+                        sender_ok = self._sender.send_files_batch(
+                            file_paths,
                             recipient,
                             chat_delay=self.chat_delay,
                             fast_mode=True,
                             stop_event=self.stopped_event,
-                        ):
-                            self.log(f"[定时] ⚠ 附加文件发送失败: {recipient}")
+                        )
+                        if not sender_ok:
+                            self.log(f"[定时] ⚠ 文件发送失败: {recipient}")
                             text_ok = False
                         else:
                             text_ok = True
@@ -1428,6 +1463,19 @@ class ScheduleSendWorker(QThread):
                     failed_recipients.append(r)
                     existing.add(r)
         finally:
+            # 区域截图是整批共用的临时渲染图：发送结束后立即删除缓存/临时文件
+            if region_png:
+                try:
+                    from modules.region_snapshot import drop_cached_file
+                    drop_cached_file(region_png)
+                except Exception:
+                    pass
+            if self.region_spec:
+                try:
+                    from modules.region_snapshot import drop_cache_for
+                    drop_cache_for(self.region_spec)
+                except Exception:
+                    pass
             if self._sender is not None:
                 # 整个定时任务结束后统一最小化微信窗口（任务级一次，按任务开关）
                 if self.minimize_after:
@@ -2470,7 +2518,14 @@ class TableFilterTab(QWidget):
             "开启后：整个发送任务完成后把微信窗口最小化一次（保护隐私）。\n"
             "关闭后微信窗口保持原样，不会被最小化。"
         )
-        self.minimize_check.setChecked(True)
+        self.minimize_check.setChecked(
+            bool(self.config_manager.load_global_settings().get(
+                "manual_minimize_wechat", True
+            ))
+        )
+        self.minimize_check.toggled.connect(
+            self._on_minimize_preference_changed
+        )
         control_layout.addWidget(self.minimize_check, 0,
                                  Qt.AlignmentFlag.AlignLeft)
         
@@ -4916,6 +4971,18 @@ class TableFilterTab(QWidget):
         pct = int(current * 100 / total)
         self.progress_label.setText(f"发送进度: {current}/{total} ({pct}%)")
 
+    def _on_minimize_preference_changed(self, checked):
+        """持久化“手动发送后最小化微信”，并同步全局设置页的内存副本。"""
+        try:
+            settings = self.config_manager.load_global_settings()
+            settings["manual_minimize_wechat"] = bool(checked)
+            self.config_manager.save_global_settings(settings)
+            settings_page = getattr(self.window(), "global_settings_tab", None)
+            if settings_page is not None:
+                settings_page.settings["manual_minimize_wechat"] = bool(checked)
+        except Exception as exc:
+            logger.warning("保存手动发送后最小化微信偏好失败: %s", exc)
+
     def on_send_result(self, result):
         success_count, failed_count, total_count, failed_tasks = result
         self.last_failed_tasks = failed_tasks
@@ -4927,7 +4994,8 @@ class TableFilterTab(QWidget):
             tip = f"自动发送完成：成功 {success_count}，失败 {failed_count}，总计 {total_count}"
             self.log(f"⚡ {tip}")
             try:
-                ToastNotification.show_toast(
+                ToastNotification.finish_progress(
+                    getattr(self.worker, "progress_toast", None),
                     "表格自动发送", tip,
                     success=(failed_count == 0),
                     duration=8000, parent=mw)
@@ -4954,7 +5022,8 @@ class TableFilterTab(QWidget):
         # 手动发送完成：用 Toast 通知替代模态弹窗，避免无人值守时弹窗无人关闭
         # 导致标题/任务栏永久卡在发送态。Toast 自动消失且不阻塞。
         try:
-            ToastNotification.show_toast(
+            ToastNotification.finish_progress(
+                getattr(self.worker, "progress_toast", None),
                 "发送完成",
                 f"成功 {success_count}，失败 {failed_count}，总计 {total_count}",
                 success=(failed_count == 0),
@@ -4983,7 +5052,8 @@ class TableFilterTab(QWidget):
     def on_send_error(self, error):
         mw = self.window()
         try:
-            ToastNotification.show_toast(
+            ToastNotification.finish_progress(
+                getattr(self.worker, "progress_toast", None),
                 "发送出错", f"发送失败: {error}",
                 success=False, duration=8000, parent=mw)
         except Exception:
@@ -5025,24 +5095,16 @@ class ToastNotification(QFrame):
     @classmethod
     def show_toast(cls, title: str, message: str, *,
                     success: bool = True, duration: int = 8000,
-                    parent=None, on_click=None):
-        """弹出通知窗口。
-
-        Args:
-            title: 通知标题
-            message: 通知内容
-            success: True=绿色成功图标，False=红色错误图标
-            duration: 成功通知自动消失毫秒数；失败通知强制不自动隐藏
-            parent: 父 QWidget（点击通知时把它带到前台，通常传 MainWindow）
-            on_click: 可选点击回调；提供时点击通知执行回调（由回调负责
-                关闭通知和后续动作），不提供则保持默认“带到前台并关闭”
-        """
+                    parent=None, on_click=None, running: bool = False,
+                    total: int = 0):
+        """弹出通知窗口；``running=True`` 时创建可更新的任务进度卡片。"""
         try:
-            # 有发送失败的通知常驻，必须手动关闭
-            if not success:
+            # 有发送失败的通知常驻，必须手动关闭；运行卡片在结束前也常驻
+            if not success or running:
                 duration = 0
             toast = cls(title, message, success=success,
-                        duration=duration, parent=parent, on_click=on_click)
+                        duration=duration, parent=parent, on_click=on_click,
+                        running=running, total=total)
             cls._active_instances.append(toast)
             toast.destroyed.connect(
                 lambda *_: cls._active_instances.remove(toast)
@@ -5077,9 +5139,41 @@ class ToastNotification(QFrame):
             # 不再静默吞掉：记录异常便于定位"通知不显示"类问题
             logger.exception("[Toast] show_toast 失败 title=%s", title)
 
+    @classmethod
+    def show_progress(cls, title: str, total: int = 0, parent=None):
+        """在右下角创建运行中卡片，不抢微信的鼠标、键盘或前台焦点。"""
+        return cls.show_toast(
+            title, "正在准备任务…", duration=0, parent=parent,
+            running=True, total=total,
+        )
+
+    @classmethod
+    def finish_progress(cls, toast, title: str, message: str, *,
+                        success: bool = True, duration: int = 8000, parent=None):
+        """把运行卡片切换为结果；卡片已被关闭时补发普通结果通知。"""
+        if toast is not None:
+            try:
+                if toast._running:
+                    if toast.isVisible() and not toast._closing:
+                        toast.finish(
+                            title, message, success=success, duration=duration
+                        )
+                        return toast
+                    # 已点击 X 但 C++ 对象可能尚未 deleteLater：不能重新 show，
+                    # 否则随后仍会被销毁，落到下面补发一张普通结果通知。
+                else:
+                    # 同一张卡片已完成：重复完成信号直接忽略，避免双通知
+                    return toast
+            except (RuntimeError, AttributeError):
+                pass
+        return cls.show_toast(
+            title, message, success=success, duration=duration, parent=parent,
+        )
+
     def __init__(self, title: str, message: str, *,
                  success: bool = True, duration: int = 8000,
-                 parent=None, on_click=None):
+                 parent=None, on_click=None, running: bool = False,
+                 total: int = 0):
         # parent 用于点击时把主窗口带到前台；不强设为 Qt 父对象，避免窗口嵌入
         self._main_window = parent
         # 自定义点击回调（如“发现新版本”点击后打开更新对话框）
@@ -5100,6 +5194,8 @@ class ToastNotification(QFrame):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._duration = duration
         self._closing = False
+        self._running = bool(running)
+        self._recent_logs = []
         self._dark = self._is_dark_mode()
 
         # 跟随系统亮/暗模式的配色（完全不透明，确保文字清晰可读）
@@ -5124,34 +5220,49 @@ class ToastNotification(QFrame):
         # 图标
         icon_label = QLabel()
         icon_label.setFixedSize(32, 32)
-        if success:
-            icon_label.setStyleSheet(
-                "QLabel { background: #27ae60; border-radius: 16px; "
-                "color: white; font-size: 18px; font-weight: bold; }")
-            icon_label.setText("✓")
-            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._icon_label = icon_label
+        if running:
+            self._set_icon_state("running")
         else:
-            icon_label.setStyleSheet(
-                "QLabel { background: #e74c3c; border-radius: 16px; "
-                "color: white; font-size: 18px; font-weight: bold; }")
-            icon_label.setText("✕")
-            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._set_icon_state("success" if success else "error")
 
         # 文字区
         text_layout = QVBoxLayout()
         text_layout.setSpacing(4)
         title_label = QLabel(title)
+        self._title_label = title_label
         title_label.setStyleSheet(
             f"color: {title_color}; font-size: 14px; "
             f"font-weight: bold; background: transparent;")
         msg_label = QLabel(message)
+        self._msg_label = msg_label
         msg_label.setStyleSheet(
             f"color: {msg_color}; font-size: 12px; "
             f"background: transparent;")
         msg_label.setWordWrap(True)
-        msg_label.setMaximumWidth(280)
+        msg_label.setMaximumWidth(310)
         text_layout.addWidget(title_label)
         text_layout.addWidget(msg_label)
+
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setFixedHeight(16)
+        self._progress_bar.setTextVisible(True)
+        self._progress_bar.setStyleSheet(
+            "QProgressBar { border: none; border-radius: 6px; "
+            "background: rgba(127, 127, 127, 45); font-size: 10px; }"
+            "QProgressBar::chunk { border-radius: 6px; background: #3498db; }"
+        )
+        self._log_label = QLabel("等待任务日志…")
+        self._log_label.setWordWrap(True)
+        self._log_label.setMaximumWidth(310)
+        self._log_label.setStyleSheet(
+            f"color: {msg_color}; font-size: 11px; background: transparent;")
+        text_layout.addWidget(self._progress_bar)
+        text_layout.addWidget(self._log_label)
+        self._progress_bar.setVisible(running)
+        self._log_label.setVisible(running)
+        if running:
+            self.update_progress(0, total, "正在准备任务…")
 
         layout.addWidget(icon_label)
         layout.addLayout(text_layout, 1)
@@ -5175,29 +5286,97 @@ class ToastNotification(QFrame):
             f"border: 1px solid {border_color}; }}")
         # 鼠标手型，提示可点击
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedSize(380, max(70, 30 + 20 * (message.count('\n') + 1)))
+        if running:
+            self.setFixedSize(400, 176)
+        else:
+            self.setFixedSize(380, max(70, 30 + 20 * (message.count('\n') + 1)))
 
         # 非按钮子 widget 鼠标事件穿透，使点击通知任意区域都触发 QFrame.mousePressEvent
-        for w in (icon_label, title_label, msg_label):
+        for w in (icon_label, title_label, msg_label,
+                  self._progress_bar, self._log_label):
             w.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
-        # 定位到右下角（叠加排列）
+        self._reposition()
+
+        # 自动消失定时器（失败/运行中 duration=0，常驻直到状态切换或手动关闭）
+        if duration > 0 and not running:
+            QTimer.singleShot(duration, self._fade_out)
+
+    def _set_icon_state(self, state: str) -> None:
+        colors = {"running": "#3498db", "success": "#27ae60", "error": "#e74c3c"}
+        texts = {"running": "…", "success": "✓", "error": "✕"}
+        state = state if state in colors else "running"
+        self._icon_label.setStyleSheet(
+            f"QLabel {{ background: {colors[state]}; border-radius: 16px; "
+            "color: white; font-size: 18px; font-weight: bold; }"
+        )
+        self._icon_label.setText(texts[state])
+        self._icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def _reposition(self) -> None:
+        """定位到当前主屏幕右下角；多张通知向上叠加。"""
         screen = QApplication.primaryScreen()
-        if screen is not None:
-            geo = screen.availableGeometry()
-        else:
-            geo = self.geometry()
-        # 从右下角往上叠加
+        geo = screen.availableGeometry() if screen is not None else self.geometry()
         offset_y = 10
         for prev in ToastNotification._active_instances:
-            if prev is not self and prev.isVisible():
-                offset_y += prev.height() + 8
+            try:
+                if prev is not self and prev.isVisible():
+                    offset_y += prev.height() + 8
+            except RuntimeError:
+                continue
         x = geo.x() + geo.width() - self.width() - 16
         y = geo.y() + geo.height() - self.height() - offset_y
         self.move(x, y)
 
-        # 自动消失定时器（失败通知 duration=0，常驻直到手动关闭）
-        if duration > 0:
+    def update_progress(self, current, total, text: str = "") -> None:
+        """更新任务进度；total<=0 时使用忙碌条，不伪造百分比。"""
+        if not self._running:
+            return
+        try:
+            total = int(total or 0)
+            current = max(0, int(current or 0))
+        except (TypeError, ValueError):
+            total, current = 0, 0
+        if total > 0:
+            current = min(current, total)
+            self._progress_bar.setRange(0, total)
+            self._progress_bar.setValue(current)
+            pct = int(current * 100 / total)
+            status = text or f"任务进度：{current}/{total}（{pct}%）"
+        else:
+            self._progress_bar.setRange(0, 0)
+            status = text or "任务正在执行…"
+        self._msg_label.setText(str(status))
+
+    def append_log(self, message) -> None:
+        """只保留最近 3 行日志，避免卡片随任务运行不断变高。"""
+        if not self._running:
+            return
+        lines = [line.strip()[:120] for line in str(message or "").splitlines()
+                 if line.strip()]
+        if not lines:
+            return
+        self._recent_logs = (self._recent_logs + lines)[-3:]
+        self._log_label.setText("\n".join(self._recent_logs))
+
+    def finish(self, title: str, message: str, *,
+               success: bool = True, duration: int = 8000) -> None:
+        """运行卡片原位切换为结果卡片，沿用原成功/失败关闭规则。"""
+        if not self._running:
+            return
+        self._running = False
+        self._closing = False
+        self._title_label.setText(str(title))
+        self._msg_label.setText(str(message))
+        self._set_icon_state("success" if success else "error")
+        self._progress_bar.hide()
+        self._log_label.hide()
+        self.setFixedSize(380, max(70, 30 + 20 * (str(message).count('\n') + 1)))
+        self._reposition()
+        if not self.isVisible():
+            self.show()
+        self.raise_()
+        if success and duration > 0:
             QTimer.singleShot(duration, self._fade_out)
 
     def _find_main_window(self):
@@ -5595,6 +5774,41 @@ class ScheduleTab(QWidget):
         attach_row.addWidget(self.attach_clear_btn)
         msg_layout.addLayout(attach_row)
 
+        # 在线表格指定区域截图：复用「数据发送」页的区域截图逻辑——任务触发时
+        # 按需下载在线表格、按原表样式渲染，发送结束后自动删除下载与缓存文件。
+        region_row = QHBoxLayout()
+        region_row.addWidget(QLabel("在线表格:"))
+        self.region_cloud_edit = QLineEdit()
+        # 选中的在线表格名（仅用于显示提示，保存时不参与渲染）
+        self._region_cloud_name = ""
+        self.region_cloud_edit.setPlaceholderText(
+            "粘贴金山文档链接/ID，或点“选择...”从在线表格中挑选"
+        )
+        region_row.addWidget(self.region_cloud_edit, 1)
+        self.region_pick_btn = QPushButton("选择...")
+        self.region_pick_btn.setFixedWidth(60)
+        region_row.addWidget(self.region_pick_btn)
+        msg_layout.addLayout(region_row)
+
+        region_cfg_row = QHBoxLayout()
+        region_cfg_row.addWidget(QLabel("工作表:"))
+        self.region_sheet_edit = QLineEdit()
+        self.region_sheet_edit.setPlaceholderText("留空=第一个工作表")
+        region_cfg_row.addWidget(self.region_sheet_edit, 1)
+        region_cfg_row.addWidget(QLabel("区域:"))
+        self.region_range_edit = QLineEdit()
+        self.region_range_edit.setPlaceholderText("如 A1:F20，留空=整表已用区域")
+        region_cfg_row.addWidget(self.region_range_edit, 1)
+        msg_layout.addLayout(region_cfg_row)
+
+        self.region_tip = QLabel(
+            "勾选“在线表格截图”后生效：发送时下载在线表格并按原表样式截图，"
+            "任务结束后自动删除下载与缓存文件；需先在「数据发送」页配置 Cookie 凭证。"
+        )
+        self.region_tip.setWordWrap(True)
+        ui_theme.apply_tone(self.region_tip, "muted", small=True)
+        msg_layout.addWidget(self.region_tip)
+
         order_caption = QLabel("发送顺序(勾选要发送的内容，选中后点右侧按钮调整先后):")
         msg_layout.addWidget(order_caption)
         sched_order_row = QHBoxLayout()
@@ -5603,6 +5817,7 @@ class ScheduleTab(QWidget):
         self._SCHED_ORDER_ITEMS = [
             ("message", "消息文字"),
             ("attachment", "附加文件"),
+            ("region", "在线表格截图"),
         ]
         for key, label in self._SCHED_ORDER_ITEMS:
             item = QListWidgetItem(label)
@@ -5760,6 +5975,8 @@ class ScheduleTab(QWidget):
         self.sched_order_up_btn.clicked.connect(lambda: self._move_sched_order_item(-1))
         self.sched_order_down_btn.clicked.connect(lambda: self._move_sched_order_item(1))
         self.sched_order_list.itemChanged.connect(self._on_sched_order_item_changed)
+        self.region_pick_btn.clicked.connect(self._on_pick_region_cloud)
+        self._update_region_controls()
         self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
         self.profile_add_btn.clicked.connect(self._on_add_profiles)
         self.profile_remove_btn.clicked.connect(self._on_remove_profile)
@@ -5935,13 +6152,34 @@ class ScheduleTab(QWidget):
             self.relock_check.setChecked(bool(getattr(task, "relock_after", False)))
             self.minimize_check.setChecked(bool(getattr(task, "minimize_after", True)))
             self.attachment_edit.setText(getattr(task, "attachment", "") or "")
+            # 在线表格指定区域截图（旧任务无此配置时为空）
+            region_cfg = getattr(task, "region", None) or {}
+            self.region_cloud_edit.setText(
+                str(region_cfg.get("cloud_file_id", "") or "")
+            )
+            self._region_cloud_name = str(
+                region_cfg.get("cloud_file_name", "") or ""
+            )
+            self.region_cloud_edit.setToolTip(self._region_cloud_name)
+            self.region_sheet_edit.setText(
+                str(region_cfg.get("sheet", "") or "")
+            )
+            self.region_range_edit.setText(
+                str(region_cfg.get("range", "") or "")
+            )
             order = getattr(task, "send_order", None) or ["message"]
             # 附件为空时即使顺序里含 attachment 也不勾选
             if not self.attachment_edit.text().strip():
                 order = [k for k in order if k != "attachment"]
                 if "message" not in order:
                     order = ["message"] + order
+            # 未配置在线表格时同样不勾选区域截图，避免保存时校验失败
+            if not self.region_cloud_edit.text().strip():
+                order = [k for k in order if k != "region"]
+                if "message" not in order:
+                    order = ["message"] + order
             self._set_sched_order(order)
+            self._update_region_controls()
             kind = getattr(task, "kind", "message") or "message"
             kind_idx = 0
             for ki in range(self.kind_combo.count()):
@@ -5984,7 +6222,13 @@ class ScheduleTab(QWidget):
             self.relock_check.setChecked(False)
             self.minimize_check.setChecked(True)
             self.attachment_edit.clear()
+            self.region_cloud_edit.clear()
+            self.region_cloud_edit.setToolTip("")
+            self._region_cloud_name = ""
+            self.region_sheet_edit.clear()
+            self.region_range_edit.clear()
             self._set_sched_order(["message"])
+            self._update_region_controls()
             self.kind_combo.setCurrentIndex(0)
             self._set_profile_paths([])
             self._on_kind_changed()
@@ -6089,6 +6333,7 @@ class ScheduleTab(QWidget):
         message = ""
         attachment = ""
         send_order = ["message"]
+        region = {}
         if kind == "profiles":
             if not profile_paths:
                 raise ValueError("请至少添加一个要执行的配置文件")
@@ -6101,6 +6346,22 @@ class ScheduleTab(QWidget):
                 raise ValueError("请填写自定义文字消息")
             attachment = self.attachment_edit.text().strip()
             send_order = self._get_sched_order()
+            if "region" in send_order:
+                raw_cloud = self.region_cloud_edit.text().strip()
+                if not raw_cloud:
+                    raise ValueError(
+                        "勾选了「在线表格截图」，请填写或选择在线表格"
+                    )
+                try:
+                    cloud_token = parse_file_input(raw_cloud)
+                except WpsCloudError as exc:
+                    raise ValueError(f"在线表格链接/ID 无效: {exc}")
+                region = {
+                    "cloud_file_id": cloud_token,
+                    "cloud_file_name": self._region_cloud_name or "",
+                    "sheet": self.region_sheet_edit.text().strip(),
+                    "range": self.region_range_edit.text().strip(),
+                }
         task = ScheduleTask(
             id=_new_task_id() if new_id else (self.current_task_id or _new_task_id()),
             name=name,
@@ -6118,6 +6379,7 @@ class ScheduleTab(QWidget):
             relock_after=self.relock_check.isChecked(),
             minimize_after=self.minimize_check.isChecked(),
             attachment=attachment,
+            region=region,
             send_order=send_order,
             kind=kind,
             profile_paths=profile_paths,
@@ -6197,6 +6459,55 @@ class ScheduleTab(QWidget):
             finally:
                 self.sched_order_list.blockSignals(False)
             self.log("[定时] 消息文字为必发项，已保持勾选")
+        self._update_region_controls()
+
+    def _update_region_controls(self):
+        """在线表格截图的输入项仅在勾选「在线表格截图」时可编辑。"""
+        _idx, item = self._find_sched_order_item("region")
+        enabled = item is not None and item.checkState() == Qt.CheckState.Checked
+        for w in (self.region_cloud_edit, self.region_pick_btn,
+                  self.region_sheet_edit, self.region_range_edit):
+            w.setEnabled(enabled)
+
+    def _on_pick_region_cloud(self):
+        """从金山云文档列表中选择在线表格（复用数据发送页的列表与选择框）。"""
+        store = WpsOAuthStore()
+        if not store.is_configured():
+            QMessageBox.warning(
+                self, "未配置凭证",
+                "请先到「数据发送」页 → 在线文档 → Cookie 凭证设置，"
+                "粘贴浏览器里的 wps_sid",
+            )
+            return
+        self.region_pick_btn.setEnabled(False)
+        worker = WpsFileListWorker(store)
+        self._region_cloud_worker = worker
+        worker.signals.result.connect(self._on_region_cloud_files)
+        worker.signals.error.connect(self._on_region_cloud_error)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_region_cloud_files(self, result):
+        self.region_pick_btn.setEnabled(True)
+        files = (result or {}).get("files") or []
+        if not files:
+            QMessageBox.information(
+                self, "在线表格",
+                "未获取到在线表格文件（账号下需要存在 xlsx/xls/et 在线表格）",
+            )
+            return
+        dialog = CloudFilePickerDialog(files, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.selected:
+            name, file_id, group_id = dialog.selected
+            token = f"{group_id}:{file_id}" if group_id else file_id
+            self._region_cloud_name = name
+            self.region_cloud_edit.setText(token)
+            self.region_cloud_edit.setToolTip(name)
+            self._mark_form_dirty()
+
+    def _on_region_cloud_error(self, error):
+        self.region_pick_btn.setEnabled(True)
+        QMessageBox.warning(self, "获取在线表格失败", str(error))
 
     # ------------------------- 任务类型 / 配置链 -------------------------
     def _on_kind_changed(self, _index=None):
@@ -6461,6 +6772,7 @@ class ScheduleTab(QWidget):
                 minimize_after=getattr(current, "minimize_after", True),
                 attachment=getattr(current, "attachment", "") or "",
                 send_order=list(getattr(current, "send_order", None) or ["message"]),
+                region_spec=getattr(current, "region", None) or {},
             )
 
         # 保存任务配置供完成回调使用
@@ -6527,7 +6839,8 @@ class ScheduleTab(QWidget):
         # Toast 通知（立即执行完成）
         mw = self.window()
         try:
-            ToastNotification.show_toast(
+            ToastNotification.finish_progress(
+                getattr(getattr(self, "send_worker", None), "progress_toast", None),
                 "发送完成",
                 f"成功 {success}，失败 {failed}",
                 success=(failed == 0),
@@ -6720,6 +7033,7 @@ class MonitorTab(QWidget):
         self.current_task_id: Optional[str] = None
         self._one_shot_worker: Optional[MonitorWorker] = None
         self._poll_worker: Optional[MonitorWorker] = None
+        self.progress_toast_enabled = True
         self._log_max_applied = False
         self._loading_form = False
         # 接收 MainWindow 的统一日志回调，外部赋值（复用定时页主面板汇总）
@@ -8134,18 +8448,71 @@ class MonitorTab(QWidget):
         worker.start()
 
     def _bind_worker_signals(self, worker: MonitorWorker):
+        worker.progress_toast = None
         worker.log.connect(self._worker_log_signal.emit)
+        worker.log.connect(self._append_worker_progress_log)
+        worker.task_started.connect(self._on_task_started)
+        worker.task_progress.connect(self._on_task_progress)
         worker.task_finished.connect(self._on_task_finished)
         worker.task_paused.connect(self._on_task_paused)
         worker.run_finished.connect(self._on_run_finished)
 
-    def _on_task_finished(self, task_name: str, success: int, failed: int):
+    def _append_worker_progress_log(self, message: str):
+        """worker 日志直接投递主线程，只追加到该 worker 自己的卡片。"""
+        toast = getattr(self.sender(), "progress_toast", None)
+        if toast is not None:
+            try:
+                toast.append_log(message)
+            except RuntimeError:
+                pass
+
+    def _on_task_started(self, task_name: str, total: int):
+        worker = self.sender()
+        if worker is None:
+            return
+        try:
+            previous = getattr(worker, "progress_toast", None)
+            if previous is not None and previous._running:
+                previous.close()
+        except (RuntimeError, AttributeError):
+            pass
+        worker.progress_toast = None
+        if not self.progress_toast_enabled:
+            return
+        worker.progress_toast = ToastNotification.show_progress(
+            f"监控执行中：{task_name}", total=total, parent=self.window()
+        )
+
+    def _on_task_progress(self, task_name: str, current: int, total: int):
+        toast = getattr(self.sender(), "progress_toast", None)
+        if toast is not None:
+            try:
+                toast.update_progress(
+                    current, total, f"{task_name}：{current}/{total}"
+                )
+            except RuntimeError:
+                pass
+
+    def _on_task_finished(self, task_name: str, success: int, failed: int,
+                          notify_failed: bool = False):
         self.log(f"[监控] 任务「{task_name}」完成: 成功 {success} / 失败 {failed}")
         # 失败弹窗已迁移至 _on_task_paused（连续失败达阈值才弹一次，避免每轮刷屏）。
         # 此处仅负责：全部成功（连败已清零）时对该任务的暂停通知重新布防，
         # 使下次连续失败再次达到阈值时能重新弹窗提醒。
         if failed == 0:
             self._monitor_fail_notified.discard(task_name)
+        # 未创建运行卡片时保持原有监控通知策略，避免每轮额外弹完成通知。
+        toast = getattr(self.sender(), "progress_toast", None)
+        if toast is not None:
+            message = f"监控「{task_name}」\n微信成功 {success}，失败 {failed}"
+            if notify_failed and not failed:
+                message += "\n其他推送或写入渠道存在失败，详情见日志"
+            ToastNotification.finish_progress(
+                toast,
+                "监控任务失败" if notify_failed else "监控任务完成",
+                message, success=not notify_failed,
+                duration=8000, parent=self.window(),
+            )
 
     def _on_task_paused(self, task_name: str):
         """监控任务连续发送失败达阈值、被暂停自动重试 → 弹一次红色常驻通知。
@@ -8218,6 +8585,13 @@ class MonitorTab(QWidget):
             logger.exception("[监控] 滚动到失败日志失败")
 
     def _on_run_finished(self):
+        # 停止排队中的任务时不会再发 task_finished，运行卡片在此收尾。
+        toast = getattr(self.sender(), "progress_toast", None)
+        if toast is not None:
+            ToastNotification.finish_progress(
+                toast, "监控任务已结束", "本轮执行已停止",
+                success=True, duration=5000, parent=self.window(),
+            )
         self.log("[监控] 本轮执行完毕")
 
     # ----------------------------- 日志 -----------------------------
@@ -8445,6 +8819,25 @@ class GlobalSettingsTab(QWidget):
         ui_theme.apply_tone(tip2, "muted", small=True)
         ml.addWidget(tip2)
 
+        # ---------------- 任务通知 ----------------
+        notification_group = bar.add_section("任务通知", collapsed=True)
+        main_layout.addWidget(notification_group)
+        nl = notification_group.contentLayout()
+
+        self.progress_toast_check = QCheckBox("任务运行时显示右下角进度卡片")
+        self.progress_toast_check.setToolTip(
+            "手动发送、监控轮询和定时任务运行时，显示当前进度、进度条和最近日志；"
+            "关闭后仍保留原有的完成结果通知"
+        )
+        nl.addWidget(self.progress_toast_check)
+        notification_tip = QLabel(
+            "运行中无需切回主界面即可查看进度。成功后卡片自动消失；有失败时常驻，"
+            "点击 X 仅关闭，点击卡片其他位置关闭并打开主界面。"
+        )
+        notification_tip.setWordWrap(True)
+        ui_theme.apply_tone(notification_tip, "muted", small=True)
+        nl.addWidget(notification_tip)
+
         # ---------------- 待机与空闲 ----------------
         standby_group = bar.add_section("🌙 待机与空闲", collapsed=True)
         main_layout.addWidget(standby_group)
@@ -8487,20 +8880,25 @@ class GlobalSettingsTab(QWidget):
         self.map_open_btn.clicked.connect(self._on_open_mapping_file)
         self.idle_standby_check.toggled.connect(self._on_debounced_change)
         self.idle_minutes_spin.valueChanged.connect(self._on_debounced_change)
+        self.progress_toast_check.toggled.connect(self._on_immediate_change)
 
         self._load_to_ui()
         self._loading = False
 
         # 供手风琴 / 窗口弹性与左侧导航统一遍历
-        self._collapsible_groups = [theme_group, rhythm_group, map_group, standby_group]
+        self._collapsible_groups = [
+            theme_group, rhythm_group, map_group, notification_group, standby_group
+        ]
         self.theme_group = theme_group
         self.rhythm_group = rhythm_group
         self.map_group = map_group
+        self.notification_group = notification_group
         self.standby_group = standby_group
         self.nav_sections = [
             ("theme", "外观主题", [theme_group]),
             ("rhythm", "拟人节流", [rhythm_group]),
             ("mapping", "全量映射", [map_group]),
+            ("notification", "任务通知", [notification_group]),
             ("standby", "待机与空闲", [standby_group]),
         ]
         # 右侧顶部小节按钮的分组展示
@@ -8508,6 +8906,7 @@ class GlobalSettingsTab(QWidget):
             ("⚙ 设置", [("theme", "外观主题"),
                         ("rhythm", "拟人节流"),
                         ("mapping", "全量映射"),
+                        ("notification", "任务通知"),
                         ("standby", "待机与空闲")]),
         ]
 
@@ -8572,6 +8971,10 @@ class GlobalSettingsTab(QWidget):
                     f"{';'.join(self._fmt_mapping_name(r) for r in recips)}"
                 )
         self.map_edit.setPlainText("\n".join(lines))
+
+        self.progress_toast_check.setChecked(
+            bool(self.settings.get("progress_toast_enabled", True))
+        )
 
         st = self.settings.get("standby") or {}
         self.idle_standby_check.setChecked(bool(st.get("idle_enabled", True)))
@@ -8834,6 +9237,11 @@ class GlobalSettingsTab(QWidget):
                 "idle_enabled": self.idle_standby_check.isChecked(),
                 "idle_minutes": int(self.idle_minutes_spin.value()),
             },
+            "progress_toast_enabled": self.progress_toast_check.isChecked(),
+            # 该选项在数据发送页修改；保存其他全局设置时原样保留
+            "manual_minimize_wechat": bool(
+                self.settings.get("manual_minimize_wechat", True)
+            ),
         }
 
     # ---------------- 落盘 + 应用 -----------------
@@ -8899,6 +9307,8 @@ class MainWindow(QMainWindow):
     # 定时任务异常（超时强制停止等）需要弹常驻通知时，从调度线程
     # 经此信号投递到主线程弹 Toast（msg, success）
     _schedule_toast_signal = pyqtSignal(str, bool)
+    # 定时 worker 可能由调度子线程接入，进度卡片必须转到主线程创建
+    _schedule_progress_toast_begin_signal = pyqtSignal(object)
 
     def __init__(self):
         super().__init__()
@@ -8932,6 +9342,7 @@ class MainWindow(QMainWindow):
         # 正常路径（_on_schedule_result）与兜底路径（_schedule_done_signal）
         # 都会尝试弹，由该标志去重；新任务在主线程触发时复位
         self._schedule_result_toast_shown = False
+        self._schedule_progress_toast = None
 
         # 关键：跨线程日志用 pyqtSignal 投递，不能用 QTimer.singleShot(0,...)
         # 因为子线程没有 Qt event loop，singleShot 永远不会触发
@@ -8947,6 +9358,9 @@ class MainWindow(QMainWindow):
         self._schedule_done_signal.connect(self._on_schedule_done_fallback)
         # 定时任务异常通知（超时强制停止等）在主线程弹 Toast
         self._schedule_toast_signal.connect(self._show_schedule_toast)
+        self._schedule_progress_toast_begin_signal.connect(
+            self._begin_schedule_progress_toast
+        )
 
         # 电脑锁定守护：阻止定时发送期间电脑自动锁定，任务完成后自动锁回
         self.workstation_guard = WorkstationGuard(
@@ -9000,12 +9414,15 @@ class MainWindow(QMainWindow):
         self.schedule_tab = ScheduleTab(self.schedule_store, self.schedule_dispatcher)
         self.monitor_store = MonitorManager()
         self.monitor_tab = MonitorTab(self.monitor_store)
-        # 定时/监控日志统一写入底部全局日志坞（同一入口，天然不会重复显示）
+        # 底部日志统一汇总；运行卡片日志由各 worker 独立连接，避免跨任务串日志
         self.schedule_tab.log_callback = self._schedule_log_to_main
-        self.monitor_tab.log_callback = self._schedule_log_to_main
+        self.monitor_tab.log_callback = self._append_global_log
         # 全量设置：应用级全局设置（拟人节流 + 全量默认映射）
         self.config_manager = ConfigManager()
         self.global_settings_tab = GlobalSettingsTab(self.config_manager)
+        self.monitor_tab.progress_toast_enabled = (
+            self.global_settings_tab.progress_toast_check.isChecked()
+        )
 
         # ---- 页面栈（取代原来的顶部标签页）----
         self.page_stack = QStackedWidget()
@@ -9079,6 +9496,8 @@ class MainWindow(QMainWindow):
         self._idle_standby_timer.timeout.connect(self._on_idle_standby_tick)
         self.global_settings_tab.settings_changed.connect(
             self._apply_standby_idle_settings)
+        self.global_settings_tab.settings_changed.connect(
+            self._apply_progress_card_settings)
         self._apply_standby_idle_settings()
 
         # ---- 底部常驻坞：发送进度 + 全局日志（不随页面切换隐藏）----
@@ -10117,6 +10536,14 @@ class MainWindow(QMainWindow):
         """纯文字定时任务的发送进度（格式与手动一致，但进度归属定时任务）。"""
         self._ensure_schedule_progress()
         self._update_send_progress(current, total)
+        worker = self.sender()
+        toast = (getattr(worker, "progress_toast", None)
+                 if worker is not None else self._schedule_progress_toast)
+        if toast is not None:
+            try:
+                toast.update_progress(current, total)
+            except RuntimeError:
+                pass
 
     def _update_schedule_send_progress(self, p_cur, p_total, s_cur, s_total):
         """定时配置链发送进度：底部进度条按当前配置链的人数单独计算。
@@ -10144,6 +10571,14 @@ class MainWindow(QMainWindow):
         else:
             label = f"发送中配置链 {p_cur}：{s_cur}/{s_total} ({pct}%)"
         self._set_dock_progress(s_cur, s_total, label)
+        worker = self.sender()
+        toast = (getattr(worker, "progress_toast", None)
+                 if worker is not None else self._schedule_progress_toast)
+        if toast is not None:
+            try:
+                toast.update_progress(s_cur, s_total, label)
+            except RuntimeError:
+                pass
         title = f"📤 {label} - {APP_TITLE}"
         self.setWindowTitle(title)
         try:
@@ -10321,7 +10756,8 @@ class MainWindow(QMainWindow):
         """定时任务异常通知（超时强制停止等），主线程弹 Toast。
         success=False 时常驻等待手动关闭（ToastNotification 内强制）。"""
         try:
-            ToastNotification.show_toast(
+            ToastNotification.finish_progress(
+                self._schedule_progress_toast,
                 "定时任务", str(msg), success=bool(success),
                 duration=8000, parent=self)
         except Exception:
@@ -10345,6 +10781,48 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _progress_cards_enabled(self) -> bool:
+        settings_page = getattr(self, "global_settings_tab", None)
+        if settings_page is None:
+            return True
+        return bool(settings_page.progress_toast_check.isChecked())
+
+    def _apply_progress_card_settings(self):
+        """全局开关即时应用到后续监控轮询；已运行的卡片自然收尾。"""
+        enabled = self._progress_cards_enabled()
+        try:
+            self.monitor_tab.progress_toast_enabled = enabled
+        except Exception:
+            pass
+
+    def _begin_schedule_progress_toast(self, worker):
+        """主线程创建定时/配置链运行卡片，并绑定到所属 worker。"""
+        try:
+            previous = getattr(worker, "progress_toast", None)
+            if previous is not None and previous._running:
+                previous.close()
+        except (RuntimeError, AttributeError):
+            pass
+        worker.progress_toast = None
+        self._schedule_progress_toast = None
+        if not self._progress_cards_enabled():
+            return
+        if hasattr(worker, "recipients"):
+            total = len(getattr(worker, "recipients", []) or [])
+        else:
+            total = len(getattr(worker, "profile_paths", []) or [])
+        toast = ToastNotification.show_progress(
+            "定时任务执行中", total=total, parent=self
+        )
+        worker.progress_toast = toast
+        self._schedule_progress_toast = toast
+        if toast is not None:
+            toast.append_log("任务已创建，等待执行…")
+            if hasattr(worker, "log_signal"):
+                worker.log_signal.connect(toast.append_log)
+            elif hasattr(worker, "signals"):
+                worker.signals.log.connect(toast.append_log)
+
     def _attach_global_progress_table(self, worker):
         """数据发送 worker（进度信号为 0-100 百分比）。
 
@@ -10354,6 +10832,15 @@ class MainWindow(QMainWindow):
         直接执行，跨线程操作 GUI/COM 会导致界面卡死。
         """
         try:
+            worker.progress_toast = None
+            if self._progress_cards_enabled():
+                toast = ToastNotification.show_progress(
+                    "手动发送执行中", total=len(worker.tasks), parent=self
+                )
+                worker.progress_toast = toast
+                if toast is not None:
+                    worker.signals.progress.connect(toast.update_progress)
+                    worker.signals.log.connect(toast.append_log)
             self._progress_begin_signal.emit()
             worker.signals.progress.connect(self._on_table_progress_pct)
             # result = (success, failed, total, failed_tasks)
@@ -10388,8 +10875,8 @@ class MainWindow(QMainWindow):
         连接是独立的；绑定方法 receiver 在主线程，AutoConnection → 排队到主线程。
         """
         try:
-            # emit 线程安全；_begin_schedule_progress 经排队在主线程执行，
-            # 保证本方法即便被调度线程调用也不会跨线程碰 GUI/COM。
+            # emit 线程安全；卡片和底部进度都在主线程创建/更新。
+            self._schedule_progress_toast_begin_signal.emit(worker)
             # 定时任务用独立信号：手动发送的完成弹窗还开着时也能接管进度显示。
             self._schedule_progress_begin_signal.emit()
             # 配置链特有的发送进度信号（链路当前, 链路总数, 发送当前, 发送总数）。
@@ -10406,7 +10893,7 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-    def _show_schedule_completion_toast(self, ok_n, fail, recipients):
+    def _show_schedule_completion_toast(self, ok_n, fail, recipients, worker=None):
         """构造并弹出"定时任务完成"Toast；每个执行周期恰好一次（守卫去重）。
 
         正常路径与 _schedule_done_signal 兜底路径都会调用本方法。
@@ -10431,8 +10918,10 @@ class MainWindow(QMainWindow):
             logger.info(
                 "[定时] 弹出完成通知：成功=%s 失败=%s 失败人数=%s",
                 ok_n, fail, len(recipients or []))
-            ToastNotification.show_toast(
-                "定时任务完成", toast_msg,
+            toast = (getattr(worker, "progress_toast", None)
+                     if worker is not None else self._schedule_progress_toast)
+            ToastNotification.finish_progress(
+                toast, "定时任务完成", toast_msg,
                 success=(fail == 0),
                 duration=8000, parent=self)
         except Exception:
@@ -10446,8 +10935,15 @@ class MainWindow(QMainWindow):
         self._finish_send_progress(fail, success=_ok)
         logger.info(
             "[定时] worker 完成信号到达：成功=%s 失败=%s", _ok, fail)
-        # Toast 通知（定时任务完成；有失败时常驻等待手动关闭，并列出失败人名）
-        self._show_schedule_completion_toast(_ok, fail, _recipients)
+        worker = self.sender()
+        # “立即执行”由 ScheduleTab 自己完成通知，不能再走后台定时通知路径。
+        is_immediate = worker is not None and worker is getattr(
+            self.schedule_tab, "send_worker", None
+        )
+        if not is_immediate:
+            self._show_schedule_completion_toast(
+                _ok, fail, _recipients, worker=worker
+            )
         # 有失败时自动展开日志面板
         if fail:
             self._expand_log_on_failure()
@@ -10481,7 +10977,7 @@ class MainWindow(QMainWindow):
             self._finish_send_progress(0)
 
     def _schedule_log_to_main(self, message):
-        """定时 / 监控 / 配置链日志统一写底部全局日志坞（带时间戳，单一路由）。"""
+        """定时/配置链日志写底部全局坞；卡片日志由所属 worker 独立接收。"""
         try:
             self._append_global_log(message)
         except Exception:
@@ -10566,6 +11062,7 @@ class MainWindow(QMainWindow):
                 minimize_after=getattr(task, "minimize_after", True),
                 attachment=getattr(task, "attachment", "") or "",
                 send_order=list(getattr(task, "send_order", None) or ["message"]),
+                region_spec=getattr(task, "region", None) or {},
             )
         self._schedule_worker = worker
         # 新执行周期：复位完成 Toast 去重守卫

@@ -85,7 +85,10 @@ def _render_snapshot_image(snapshot_headers, snapshot_rows, snapshot_spec, tmp):
 
 class MonitorWorker(QThread):
     log = pyqtSignal(str)
-    task_finished = pyqtSignal(str, int, int)  # task_name, success, failed
+    task_started = pyqtSignal(str, int)  # task_name, 接收人总数（仅 HTTP 推送时为 0）
+    task_progress = pyqtSignal(str, int, int)  # task_name, current, total
+    # 最后一项包含智能表格/企微等微信接收人计数之外的失败
+    task_finished = pyqtSignal(str, int, int, bool)
     run_finished = pyqtSignal()  # 一轮（manual/一次循环）完成
     # 连续发送失败达阈值、被暂停自动重试时发出（只在「未暂停→已暂停」边沿发一次）
     task_paused = pyqtSignal(str)
@@ -208,20 +211,23 @@ class MonitorWorker(QThread):
                 self.emit(f"{log_prefix} 任务「{task.name}」检测到新文件，恢复正常推送")
         success = 0
         failed = 0
+        notify_failed = False
         try:
             outcome = self._process_file(task, latest, log_prefix)
             if outcome is None:
                 # 无新增/文件未变：_process_file 已打出原因日志，不发完成信号
                 # （避免每轮「成功 0 / 失败 0」噪音，无新增不涉及发送结果）
                 return
-            # outcome = (成功接收人数, 失败接收人数)
+            # outcome = (成功接收人数, 失败接收人数, 任一渠道是否失败)
             success += outcome[0]
             failed += outcome[1]
+            notify_failed = bool(outcome[2])
         except Exception as exc:
             failed += 1
+            notify_failed = True
             logger.exception("监控处理文件失败 %s", latest)
             self.emit(f"{log_prefix} 处理失败「{os.path.basename(latest)}」: {exc}")
-        self.task_finished.emit(task.name, success, failed)
+        self.task_finished.emit(task.name, success, failed, notify_failed)
 
     def _match_files(self, task: MonitorTask):
         patterns = [p.strip() for p in str(task.file_pattern or "*.*").split(";") if p.strip()]
@@ -251,7 +257,7 @@ class MonitorWorker(QThread):
         out.sort(key=lambda p: os.path.getmtime(p))
         return out
 
-    def _process_file(self, task: MonitorTask, fp: str, log_prefix: str) -> bool:
+    def _process_file(self, task: MonitorTask, fp: str, log_prefix: str) -> Optional[tuple]:
         name = os.path.basename(fp)
         # 读取并筛选
         headers, all_rows = monitor_engine.read_sheet_rows(
@@ -396,6 +402,16 @@ class MonitorWorker(QThread):
                                 f"monitor_{datetime.now().strftime('%H%M%S%f')}.xlsx")
             out_file = monitor_engine.build_out_file(view_headers, view_rows, tmpx)
 
+        # 只有本轮确有内容和有效推送渠道时才创建运行卡片；无新增/无接收人不打扰。
+        recipient_total = sum(1 for p in task.recipients if p) if task.wx_enabled else 0
+        has_push = bool(clean_rows) and bool(
+            recipient_total
+            or task.airsync_enabled
+            or (task.wxwork_enabled and task.wxwork_webhook)
+        )
+        if has_push:
+            self.task_started.emit(task.name, recipient_total)
+
         # 可选出口：写入智能表格（AirScript webhook）。纯 HTTP，不占用微信发送批次锁。
         # 将清洗/提取后的行（去掉首行标题）追加写入用户自己的金山智能表格指定 sheet 指定列。
         airsync_failed = False
@@ -506,6 +522,9 @@ class MonitorWorker(QThread):
                         msg_failed += 1
                         logger.exception("推送失败 %s", person)
                         self.emit(f"{log_prefix} → 「{person}」推送失败: {exc}")
+                    self.task_progress.emit(
+                        task.name, msg_delivered + msg_failed, recipient_total
+                    )
             finally:
                 # 释放全局发送批次锁（推送结束/异常都必须放锁，避免后续任务死等）
                 try:
@@ -617,7 +636,7 @@ class MonitorWorker(QThread):
             self.emit(f"{log_prefix} 任务「{task.name}」未配置微信接收人，跳过微信发送")
         else:
             self.emit(f"{log_prefix} 任务「{task.name}」无可用接收人，跳过发送；已记录处理进度")
-        return (msg_delivered, msg_failed)
+        return (msg_delivered, msg_failed, notify_failed)
 
     @staticmethod
     def _limit_hit(task: MonitorTask, n: int) -> bool:

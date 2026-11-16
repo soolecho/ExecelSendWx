@@ -65,8 +65,11 @@ class ScheduleTask:
     minimize_after: bool = True
     # 附加文件（文件/图片绝对路径），随消息额外发送；空表示不发送附件
     attachment: str = ""
-    # 发送顺序：["message", "attachment"] 等，勾选的内容才发送，列表顺序即发送先后。
-    # 兼容旧字段 attach_order（before/after），读取时迁移。
+    # 指定区域截图（在线表格）：{cloud_file_id, cloud_file_name, sheet, range}。
+    # 任务触发时按需下载在线表格 → 按原表样式渲染，发送完成后删除缓存。
+    region: Dict = field(default_factory=dict)
+    # 发送顺序：["message", "attachment", "region"] 等，勾选的内容才发送，
+    # 列表顺序即发送先后。兼容旧字段 attach_order（before/after），读取时迁移。
     send_order: List[str] = field(default_factory=lambda: ["message"])
     # 任务类型：message=发送纯文字/附件消息；profiles=顺序执行一个或多个表格配置文件
     kind: str = "message"
@@ -165,6 +168,7 @@ class ScheduleTask:
             relock_after=bool(data.get("relock_after", False)),
             minimize_after=bool(data.get("minimize_after", True)),
             attachment=str(data.get("attachment", "") or ""),
+            region=_normalize_region(data.get("region")),
             send_order=_normalize_send_order(data),
             kind=kind,
             profile_paths=profile_paths,
@@ -217,15 +221,30 @@ def _normalize_fired_log(value) -> Dict[str, List[str]]:
     return result
 
 
+def _normalize_region(value) -> Dict:
+    """指定区域截图配置：只认在线表格（wps_cloud），无效时返回空。"""
+    if not isinstance(value, dict):
+        return {}
+    cloud_id = str(value.get("cloud_file_id", "") or "").strip()
+    if not cloud_id:
+        return {}
+    return {
+        "cloud_file_id": cloud_id,
+        "cloud_file_name": str(value.get("cloud_file_name", "") or "").strip(),
+        "sheet": str(value.get("sheet", "") or "").strip(),
+        "range": str(value.get("range", "") or "").strip(),
+    }
+
+
 def _normalize_send_order(data) -> List[str]:
-    """发送顺序：合法项 message / attachment；去重保序；兼容旧 attach_order。
+    """发送顺序：合法项 message / attachment / region；去重保序；兼容旧 attach_order。
 
     旧数据没有 send_order 时：
       - attach_order == "before" 且有附件 -> ["attachment", "message"]
       - 有附件 -> ["message", "attachment"]
       - 无附件 -> ["message"]
     """
-    valid = ("message", "attachment")
+    valid = ("message", "attachment", "region")
     raw = data.get("send_order") if isinstance(data, dict) else None
     if isinstance(raw, list) and raw:
         order: List[str] = []
