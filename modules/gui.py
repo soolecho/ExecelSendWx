@@ -5257,8 +5257,19 @@ class ToastNotification(QFrame):
         self._log_label.setMaximumWidth(310)
         self._log_label.setStyleSheet(
             f"color: {msg_color}; font-size: 11px; background: transparent;")
+        if running:
+            # 运行卡片位置固定：进度文字单行、日志区固定 3 行高度，
+            # 日志长短只影响省略显示，不改变进度条和日志区的位置/尺寸。
+            msg_label.setWordWrap(False)
+            msg_label.setFixedHeight(18)
+            self._log_label.setWordWrap(False)
+            self._log_label.setFixedHeight(self._log_height())
+            self._log_label.setAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         text_layout.addWidget(self._progress_bar)
         text_layout.addWidget(self._log_label)
+        if running:
+            text_layout.addStretch(1)
         self._progress_bar.setVisible(running)
         self._log_label.setVisible(running)
         if running:
@@ -5328,6 +5339,26 @@ class ToastNotification(QFrame):
         y = geo.y() + geo.height() - self.height() - offset_y
         self.move(x, y)
 
+    def _log_height(self) -> int:
+        """日志区固定高度（3 行），保证任务运行中卡片内部不上下抖动。"""
+        try:
+            self._log_label.ensurePolished()
+            return max(36, self._log_label.fontMetrics().lineSpacing() * 3 + 2)
+        except Exception:
+            return 48
+
+    @staticmethod
+    def _elide_label_text(label, text, width: int = 290) -> str:
+        """按控件实际宽度省略文字，避免长日志换行把进度条位置顶动。"""
+        try:
+            label.ensurePolished()
+            fm = label.fontMetrics()
+            avail = label.width() if label.width() > 60 else width
+            return fm.elidedText(str(text), Qt.TextElideMode.ElideRight,
+                                 max(60, avail - 2))
+        except Exception:
+            return str(text)
+
     def update_progress(self, current, total, text: str = "") -> None:
         """更新任务进度；total<=0 时使用忙碌条，不伪造百分比。"""
         if not self._running:
@@ -5346,10 +5377,11 @@ class ToastNotification(QFrame):
         else:
             self._progress_bar.setRange(0, 0)
             status = text or "任务正在执行…"
-        self._msg_label.setText(str(status))
+        self._msg_label.setText(
+            self._elide_label_text(self._msg_label, status))
 
     def append_log(self, message) -> None:
-        """只保留最近 3 行日志，避免卡片随任务运行不断变高。"""
+        """只保留最近 3 行日志，且固定行高，卡片内部布局不随文字长短变化。"""
         if not self._running:
             return
         lines = [line.strip()[:120] for line in str(message or "").splitlines()
@@ -5357,7 +5389,11 @@ class ToastNotification(QFrame):
         if not lines:
             return
         self._recent_logs = (self._recent_logs + lines)[-3:]
-        self._log_label.setText("\n".join(self._recent_logs))
+        display = [
+            self._elide_label_text(self._log_label, line)
+            for line in self._recent_logs
+        ]
+        self._log_label.setText("\n".join(display))
 
     def finish(self, title: str, message: str, *,
                success: bool = True, duration: int = 8000) -> None:
@@ -5366,6 +5402,10 @@ class ToastNotification(QFrame):
             return
         self._running = False
         self._closing = False
+        # 运行态限制过进度文字为单行，切换结果时恢复为可换行，避免长结果被裁掉
+        self._msg_label.setMinimumHeight(0)
+        self._msg_label.setMaximumHeight(16777215)
+        self._msg_label.setWordWrap(True)
         self._title_label.setText(str(title))
         self._msg_label.setText(str(message))
         self._set_icon_state("success" if success else "error")
