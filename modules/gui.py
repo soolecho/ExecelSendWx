@@ -5258,11 +5258,11 @@ class ToastNotification(QFrame):
         self._log_label.setStyleSheet(
             f"color: {msg_color}; font-size: 11px; background: transparent;")
         if running:
-            # 运行卡片位置固定：进度文字单行、日志区固定 3 行高度，
-            # 日志长短只影响省略显示，不改变进度条和日志区的位置/尺寸。
+            # 运行卡片位置固定：进度文字单行、日志区固定高度；
+            # 日志自动换行，只保留能放进固定框内的最新几行，卡片不随文字伸缩。
             msg_label.setWordWrap(False)
             msg_label.setFixedHeight(18)
-            self._log_label.setWordWrap(False)
+            self._log_label.setWordWrap(True)
             self._log_label.setFixedHeight(self._log_height())
             self._log_label.setAlignment(
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
@@ -5340,12 +5340,12 @@ class ToastNotification(QFrame):
         self.move(x, y)
 
     def _log_height(self) -> int:
-        """日志区固定高度（3 行），保证任务运行中卡片内部不上下抖动。"""
+        """日志区固定高度（5 行），保证任务运行中卡片内部不上下抖动。"""
         try:
             self._log_label.ensurePolished()
-            return max(36, self._log_label.fontMetrics().lineSpacing() * 3 + 2)
+            return max(48, self._log_label.fontMetrics().lineSpacing() * 5 + 2)
         except Exception:
-            return 48
+            return 78
 
     @staticmethod
     def _elide_label_text(label, text, width: int = 290) -> str:
@@ -5380,20 +5380,50 @@ class ToastNotification(QFrame):
         self._msg_label.setText(
             self._elide_label_text(self._msg_label, status))
 
+    def _rebuild_log_view(self) -> None:
+        """在固定高度的日志框内自动换行显示最新日志。
+
+        从最新一条向上累加，直到再加一条会超出日志框高度为止，保证：
+        - 日志长时自动换行，不截断成“…”，能看到具体的写入行内容；
+        - 卡片日志框尺寸固定，进度条和日志区位置不随文字长短变化。
+        """
+        if not self._running or not self._recent_logs:
+            return
+        try:
+            self._log_label.ensurePolished()
+            fm = self._log_label.fontMetrics()
+            avail = self._log_label.width()
+            if avail < 60:
+                avail = 288
+            avail = max(60, avail - 2)
+            box_h = max(24, self._log_label.height())
+            chosen = []
+            for line in reversed(self._recent_logs):
+                trial = [line] + chosen
+                rect = fm.boundingRect(
+                    QRect(0, 0, avail, 10000),
+                    Qt.TextFlag.TextWordWrap, "\n".join(trial))
+                if rect.height() > box_h:
+                    if not chosen:
+                        # 极端超长单行：至少保证最新一条有内容可见
+                        chosen = [fm.elidedText(
+                            line, Qt.TextElideMode.ElideRight, avail)]
+                    break
+                chosen = trial
+            self._log_label.setText("\n".join(chosen))
+        except Exception:
+            self._log_label.setText("\n".join(self._recent_logs[-3:]))
+
     def append_log(self, message) -> None:
-        """只保留最近 3 行日志，且固定行高，卡片内部布局不随文字长短变化。"""
+        """保留最近若干行日志，自动换行塞进固定日志框，卡片内部尺寸不变。"""
         if not self._running:
             return
         lines = [line.strip()[:120] for line in str(message or "").splitlines()
                  if line.strip()]
         if not lines:
             return
-        self._recent_logs = (self._recent_logs + lines)[-3:]
-        display = [
-            self._elide_label_text(self._log_label, line)
-            for line in self._recent_logs
-        ]
-        self._log_label.setText("\n".join(display))
+        self._recent_logs = (self._recent_logs + lines)[-6:]
+        self._rebuild_log_view()
 
     def finish(self, title: str, message: str, *,
                success: bool = True, duration: int = 8000) -> None:
@@ -5411,13 +5441,49 @@ class ToastNotification(QFrame):
         self._set_icon_state("success" if success else "error")
         self._progress_bar.hide()
         self._log_label.hide()
-        self.setFixedSize(380, max(70, 30 + 20 * (str(message).count('\n') + 1)))
-        self._reposition()
-        if not self.isVisible():
+        target = QSize(380, max(70, 30 + 20 * (str(message).count('\n') + 1)))
+        if self.isVisible():
+            # 运行卡片 → 结果卡片：右下角锚定，平滑收拢尺寸
+            self._animate_to_size(target)
+        else:
+            self.setFixedSize(target)
+            self._reposition()
             self.show()
         self.raise_()
         if success and duration > 0:
             QTimer.singleShot(duration, self._fade_out)
+
+    def _animate_to_size(self, target) -> None:
+        """运行卡片切换结果时的尺寸过渡：保持右下角不动，平滑收缩/展开。"""
+        try:
+            cur = self.geometry()
+            start = QRect(cur)
+            end = QRect(
+                cur.x() + cur.width() - target.width(),
+                cur.y() + cur.height() - target.height(),
+                target.width(), target.height(),
+            )
+            # 固定尺寸会阻止 geometry 动画，先解除，动画结束后再恢复
+            self.setMinimumSize(0, 0)
+            self.setMaximumSize(16777215, 16777215)
+            self._size_anim = QPropertyAnimation(self, b"geometry", self)
+            self._size_anim.setDuration(220)
+            self._size_anim.setStartValue(start)
+            self._size_anim.setEndValue(end)
+            self._size_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._size_anim.finished.connect(
+                lambda: self._apply_final_size(target))
+            self._size_anim.start()
+        except Exception:
+            self.setFixedSize(target)
+            self._reposition()
+
+    def _apply_final_size(self, target) -> None:
+        try:
+            self.setFixedSize(target)
+            self._reposition()
+        except RuntimeError:
+            pass
 
     def _find_main_window(self):
         """找到主窗口：优先 parent，其次顶层 MainWindow。"""
