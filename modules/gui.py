@@ -1203,6 +1203,9 @@ class ScheduleSendWorker(QThread):
         attach_order="after",
         send_order=None,
         region_spec=None,
+        at_members=None,
+        at_all=False,
+        at_attach="text",
     ):
         super().__init__()
         self.recipients = list(recipients or [])
@@ -1212,6 +1215,10 @@ class ScheduleSendWorker(QThread):
         self.default_city = str(default_city or "")
         self.minimize_after = bool(minimize_after)
         self.attachment = str(attachment or "").strip()
+        # 群聊 @：成员名单 + @所有人；at_attach: text=跟文字 / first=跟首条内容
+        self.at_members = [str(m).strip() for m in (at_members or []) if str(m).strip()]
+        self.at_all = bool(at_all)
+        self.at_attach = "first" if str(at_attach) == "first" else "text"
         # 指定区域截图（在线表格）：{cloud_file_id, cloud_file_name, sheet, range}
         self.region_spec = dict(region_spec) if isinstance(region_spec, dict) else {}
         # 发送顺序：显式 send_order 优先；否则按 attach_order 兼容旧调用
@@ -1410,6 +1417,15 @@ class ScheduleSendWorker(QThread):
                     else:
                         chat_opened = True
                 if chat_opened:
+                    # 群聊 @：文字与文件合并发送时 @ 跟文字；纯文件时仅「@跟首条内容」生效
+                    msg_at_members = list(self.at_members) or None
+                    msg_at_all = self.at_all
+                    file_at_members = (
+                        msg_at_members if self.at_attach == "first" else None
+                    )
+                    file_at_all = (
+                        msg_at_all if self.at_attach == "first" else False
+                    )
                     if has_msg and file_paths:
                         self.log(f"[定时] 合并发送文字+{len(file_paths)}个文件给 {recipient}")
                         text_ok = self._sender.send_text_and_files(
@@ -1420,6 +1436,8 @@ class ScheduleSendWorker(QThread):
                             fast_mode=True,
                             stop_event=self.stopped_event,
                             text_first=text_first,
+                            at_members=msg_at_members,
+                            at_all=msg_at_all,
                         )
                     elif has_msg:
                         text_ok = self._sender.send_message(
@@ -1428,6 +1446,8 @@ class ScheduleSendWorker(QThread):
                             chat_delay=self.chat_delay,
                             fast_mode=True,
                             stop_event=self.stopped_event,
+                            at_members=msg_at_members,
+                            at_all=msg_at_all,
                         )
                     elif file_paths:
                         sender_ok = self._sender.send_files_batch(
@@ -1436,6 +1456,8 @@ class ScheduleSendWorker(QThread):
                             chat_delay=self.chat_delay,
                             fast_mode=True,
                             stop_event=self.stopped_event,
+                            at_members=file_at_members,
+                            at_all=file_at_all,
                         )
                         if not sender_ok:
                             self.log(f"[定时] ⚠ 文件发送失败: {recipient}")
@@ -5880,6 +5902,27 @@ class ScheduleTab(QWidget):
         attach_row.addWidget(self.attach_clear_btn)
         msg_layout.addLayout(attach_row)
 
+        # 群聊 @（随任务保存）：成员名单按 / 或 , 分隔；@位置与手动发送页一致
+        at_row = QHBoxLayout()
+        self.sched_at_check = QCheckBox("群聊 @")
+        at_row.addWidget(self.sched_at_check)
+        self.sched_at_members_edit = QLineEdit()
+        self.sched_at_members_edit.setPlaceholderText(
+            "群成员昵称，多个用 / 或 , 分隔（可留空，只勾「@所有人」）"
+        )
+        self.sched_at_members_edit.setEnabled(False)
+        at_row.addWidget(self.sched_at_members_edit, 1)
+        self.sched_at_all_check = QCheckBox("@所有人")
+        self.sched_at_all_check.setEnabled(False)
+        at_row.addWidget(self.sched_at_all_check)
+        at_row.addWidget(QLabel("@位置:"))
+        self.sched_at_mode_combo = QComboBox()
+        self.sched_at_mode_combo.addItem("跟随文字", "text")
+        self.sched_at_mode_combo.addItem("跟随首条内容", "first")
+        self.sched_at_mode_combo.setEnabled(False)
+        at_row.addWidget(self.sched_at_mode_combo)
+        msg_layout.addLayout(at_row)
+
         # 在线表格指定区域截图：复用「数据发送」页的区域截图逻辑——任务触发时
         # 按需下载在线表格、按原表样式渲染，发送结束后自动删除下载与缓存文件。
         region_row = QHBoxLayout()
@@ -5898,9 +5941,17 @@ class ScheduleTab(QWidget):
 
         region_cfg_row = QHBoxLayout()
         region_cfg_row.addWidget(QLabel("工作表:"))
-        self.region_sheet_edit = QLineEdit()
-        self.region_sheet_edit.setPlaceholderText("留空=第一个工作表")
-        region_cfg_row.addWidget(self.region_sheet_edit, 1)
+        self.region_sheet_combo = QComboBox()
+        self.region_sheet_combo.addItem("（第一个工作表）", "")
+        self.region_sheet_combo.setToolTip(
+            "点右侧「读取」从在线表格加载工作表列表后选择；留空=第一个工作表"
+        )
+        self.region_sheet_combo.setEnabled(False)
+        region_cfg_row.addWidget(self.region_sheet_combo, 1)
+        self.region_read_btn = QPushButton("读取")
+        self.region_read_btn.setFixedWidth(56)
+        self.region_read_btn.setEnabled(False)
+        region_cfg_row.addWidget(self.region_read_btn)
         region_cfg_row.addWidget(QLabel("区域:"))
         self.region_range_edit = QLineEdit()
         self.region_range_edit.setPlaceholderText("如 A1:F20，留空=整表已用区域")
@@ -5908,8 +5959,9 @@ class ScheduleTab(QWidget):
         msg_layout.addLayout(region_cfg_row)
 
         self.region_tip = QLabel(
-            "勾选“在线表格截图”后生效：发送时下载在线表格并按原表样式截图，"
-            "任务结束后自动删除下载与缓存文件；需先在「数据发送」页配置 Cookie 凭证。"
+            "勾选“在线表格截图”后生效：选好在线表格后点「读取」加载工作表列表并选择，"
+            "发送时按原表样式截图，任务结束后自动删除下载与缓存文件；"
+            "需先在「数据发送」页配置 Cookie 凭证。"
         )
         self.region_tip.setWordWrap(True)
         ui_theme.apply_tone(self.region_tip, "muted", small=True)
@@ -6082,6 +6134,9 @@ class ScheduleTab(QWidget):
         self.sched_order_down_btn.clicked.connect(lambda: self._move_sched_order_item(1))
         self.sched_order_list.itemChanged.connect(self._on_sched_order_item_changed)
         self.region_pick_btn.clicked.connect(self._on_pick_region_cloud)
+        self.region_read_btn.clicked.connect(self._on_read_region_sheets)
+        self.region_cloud_edit.textChanged.connect(self._on_region_cloud_text_changed)
+        self.sched_at_check.toggled.connect(self._on_sched_at_toggled)
         self._update_region_controls()
         self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
         self.profile_add_btn.clicked.connect(self._on_add_profiles)
@@ -6118,6 +6173,10 @@ class ScheduleTab(QWidget):
         self.minimize_check.stateChanged.connect(mark)
         self.sched_order_list.itemChanged.connect(lambda *a: mark())
         self.kind_combo.currentIndexChanged.connect(mark)
+        self.sched_at_check.stateChanged.connect(mark)
+        self.sched_at_members_edit.textChanged.connect(mark)
+        self.sched_at_all_check.stateChanged.connect(mark)
+        self.sched_at_mode_combo.currentIndexChanged.connect(mark)
         self.profile_list.model().rowsInserted.connect(lambda *a: mark())
         self.profile_list.model().rowsRemoved.connect(lambda *a: mark())
 
@@ -6267,12 +6326,22 @@ class ScheduleTab(QWidget):
                 region_cfg.get("cloud_file_name", "") or ""
             )
             self.region_cloud_edit.setToolTip(self._region_cloud_name)
-            self.region_sheet_edit.setText(
-                str(region_cfg.get("sheet", "") or "")
-            )
+            self.region_sheet_combo.blockSignals(True)
+            self._set_region_sheet_value(str(region_cfg.get("sheet", "") or ""))
+            self.region_sheet_combo.blockSignals(False)
             self.region_range_edit.setText(
                 str(region_cfg.get("range", "") or "")
             )
+            # 群聊 @（旧任务无此配置时为关闭）
+            self.sched_at_check.setChecked(bool(getattr(task, "at_enabled", False)))
+            self.sched_at_members_edit.setText(
+                str(getattr(task, "at_members", "") or "")
+            )
+            self.sched_at_all_check.setChecked(bool(getattr(task, "at_all", False)))
+            mode = "first" if str(getattr(task, "at_attach", "text")) == "first" else "text"
+            mi = self.sched_at_mode_combo.findData(mode)
+            self.sched_at_mode_combo.setCurrentIndex(mi if mi >= 0 else 0)
+            self._on_sched_at_toggled(self.sched_at_check.isChecked())
             order = getattr(task, "send_order", None) or ["message"]
             # 附件为空时即使顺序里含 attachment 也不勾选
             if not self.attachment_edit.text().strip():
@@ -6331,8 +6400,12 @@ class ScheduleTab(QWidget):
             self.region_cloud_edit.clear()
             self.region_cloud_edit.setToolTip("")
             self._region_cloud_name = ""
-            self.region_sheet_edit.clear()
+            self._set_region_sheet_value("")
             self.region_range_edit.clear()
+            self.sched_at_check.setChecked(False)
+            self.sched_at_members_edit.clear()
+            self.sched_at_all_check.setChecked(False)
+            self.sched_at_mode_combo.setCurrentIndex(0)
             self._set_sched_order(["message"])
             self._update_region_controls()
             self.kind_combo.setCurrentIndex(0)
@@ -6465,7 +6538,7 @@ class ScheduleTab(QWidget):
                 region = {
                     "cloud_file_id": cloud_token,
                     "cloud_file_name": self._region_cloud_name or "",
-                    "sheet": self.region_sheet_edit.text().strip(),
+                    "sheet": self._region_sheet_value(),
                     "range": self.region_range_edit.text().strip(),
                 }
         task = ScheduleTask(
@@ -6487,6 +6560,10 @@ class ScheduleTab(QWidget):
             attachment=attachment,
             region=region,
             send_order=send_order,
+            at_enabled=self.sched_at_check.isChecked(),
+            at_members=self.sched_at_members_edit.text().strip(),
+            at_all=self.sched_at_all_check.isChecked(),
+            at_attach=str(self.sched_at_mode_combo.currentData() or "text"),
             kind=kind,
             profile_paths=profile_paths,
         )
@@ -6572,7 +6649,8 @@ class ScheduleTab(QWidget):
         _idx, item = self._find_sched_order_item("region")
         enabled = item is not None and item.checkState() == Qt.CheckState.Checked
         for w in (self.region_cloud_edit, self.region_pick_btn,
-                  self.region_sheet_edit, self.region_range_edit):
+                  self.region_sheet_combo, self.region_read_btn,
+                  self.region_range_edit):
             w.setEnabled(enabled)
 
     def _on_pick_region_cloud(self):
@@ -6611,9 +6689,106 @@ class ScheduleTab(QWidget):
             self.region_cloud_edit.setToolTip(name)
             self._mark_form_dirty()
 
+    def _on_region_cloud_text_changed(self, _text):
+        """更换在线表格后清空旧的工作表选择，避免选到另一个文件的表名。"""
+        if getattr(self, "_loading_form", False):
+            return
+        if self.region_sheet_combo.count() > 1:
+            self._set_region_sheet_value("")
+
     def _on_region_cloud_error(self, error):
         self.region_pick_btn.setEnabled(True)
         QMessageBox.warning(self, "获取在线表格失败", str(error))
+
+    # ------------------------- 在线表格工作表读取 -------------------------
+    def _region_sheet_value(self):
+        data = self.region_sheet_combo.currentData()
+        return str(data or "").strip()
+
+    def _set_region_sheet_value(self, name):
+        """回填工作表下拉：保留配置里的自定义名称，即使当前还没读取过列表。"""
+        name = str(name or "").strip()
+        self.region_sheet_combo.blockSignals(True)
+        try:
+            self.region_sheet_combo.clear()
+            self.region_sheet_combo.addItem("（第一个工作表）", "")
+            if name:
+                self.region_sheet_combo.addItem(name, name)
+            idx = self.region_sheet_combo.findData(name) if name else 0
+            self.region_sheet_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            self.region_sheet_combo.blockSignals(False)
+
+    def _on_read_region_sheets(self):
+        """读取在线表格的工作表列表，供下拉选择（与手动发送页选表逻辑一致）。"""
+        raw = self.region_cloud_edit.text().strip()
+        if not raw:
+            QMessageBox.warning(self, "提示", "请先填写或选择在线表格")
+            return
+        try:
+            cloud_token = parse_file_input(raw)
+        except WpsCloudError as exc:
+            QMessageBox.warning(self, "在线表格链接/ID 无效", str(exc))
+            return
+        if not WpsOAuthStore().is_configured():
+            QMessageBox.warning(
+                self, "未配置凭证",
+                "请先到「数据发送」页 → 在线文档 → Cookie 凭证设置，"
+                "粘贴浏览器里的 wps_sid",
+            )
+            return
+        self.region_read_btn.setEnabled(False)
+        self.region_read_btn.setText("读取中…")
+        prev_sheet = self._region_sheet_value()
+        worker = CloudExcelReadWorker(
+            cloud_token, getattr(self, "_region_cloud_name", "") or ""
+        )
+        self._region_sheet_worker = worker
+        worker.signals.log.connect(self.log)
+        worker.signals.result.connect(
+            lambda result: self._on_region_sheets_loaded(result, prev_sheet))
+        worker.signals.error.connect(self._on_region_sheets_error)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_region_sheets_loaded(self, result, prev_sheet=""):
+        self.region_read_btn.setEnabled(True)
+        self.region_read_btn.setText("读取")
+        names = [str(n) for n in ((result or {}).get("sheet_names") or []) if str(n).strip()]
+        self.region_sheet_combo.blockSignals(True)
+        try:
+            self.region_sheet_combo.clear()
+            self.region_sheet_combo.addItem("（第一个工作表）", "")
+            for name in names:
+                self.region_sheet_combo.addItem(name, name)
+            want = prev_sheet if prev_sheet in names else ""
+            idx = self.region_sheet_combo.findData(want) if want else 0
+            self.region_sheet_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            self.region_sheet_combo.blockSignals(False)
+        self.log(f"[定时] 已读取在线表格工作表: {', '.join(names) or '无'}")
+        self._mark_form_dirty()
+
+    def _on_region_sheets_error(self, error):
+        self.region_read_btn.setEnabled(True)
+        self.region_read_btn.setText("读取")
+        QMessageBox.warning(self, "读取工作表失败", str(error))
+
+    def _on_sched_at_toggled(self, enabled):
+        """定时任务 @ 开关：联动成员输入框与 @所有人/@位置。"""
+        self.sched_at_members_edit.setEnabled(bool(enabled))
+        self.sched_at_all_check.setEnabled(bool(enabled))
+        self.sched_at_mode_combo.setEnabled(bool(enabled))
+
+    @staticmethod
+    def _sched_at_args(task_like):
+        """任务级 @ 配置 → (成员列表, @所有人, @位置)。"""
+        if not bool(getattr(task_like, "at_enabled", False)):
+            return [], False, "text"
+        raw = str(getattr(task_like, "at_members", "") or "")
+        members = [p.strip() for p in re.split(r"[/;、，,]", raw) if p.strip()]
+        attach = "first" if str(getattr(task_like, "at_attach", "text")) == "first" else "text"
+        return members, bool(getattr(task_like, "at_all", False)), attach
 
     # ------------------------- 任务类型 / 配置链 -------------------------
     def _on_kind_changed(self, _index=None):
@@ -6868,6 +7043,7 @@ class ScheduleTab(QWidget):
                 minimize_after=getattr(current, "minimize_after", True),
             )
         else:
+            _at_members, _at_all, _at_attach = self._sched_at_args(current)
             worker = ScheduleSendWorker(
                 recipients=current.recipients,
                 message=current.message,
@@ -6879,6 +7055,9 @@ class ScheduleTab(QWidget):
                 attachment=getattr(current, "attachment", "") or "",
                 send_order=list(getattr(current, "send_order", None) or ["message"]),
                 region_spec=getattr(current, "region", None) or {},
+                at_members=_at_members,
+                at_all=_at_all,
+                at_attach=_at_attach,
             )
 
         # 保存任务配置供完成回调使用
@@ -11158,6 +11337,11 @@ class MainWindow(QMainWindow):
                 minimize_after=getattr(task, "minimize_after", True),
             )
         else:
+            _sched_at = getattr(self, "schedule_tab", None)
+            if _sched_at is not None:
+                _at_members, _at_all, _at_attach = _sched_at._sched_at_args(task)
+            else:
+                _at_members, _at_all, _at_attach = [], False, "text"
             worker = ScheduleSendWorker(
                 recipients=list(task.recipients),
                 message=task.message,
@@ -11169,6 +11353,9 @@ class MainWindow(QMainWindow):
                 attachment=getattr(task, "attachment", "") or "",
                 send_order=list(getattr(task, "send_order", None) or ["message"]),
                 region_spec=getattr(task, "region", None) or {},
+                at_members=_at_members,
+                at_all=_at_all,
+                at_attach=_at_attach,
             )
         self._schedule_worker = worker
         # 新执行周期：复位完成 Toast 去重守卫

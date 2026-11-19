@@ -71,6 +71,12 @@ class ScheduleTask:
     # 发送顺序：["message", "attachment", "region"] 等，勾选的内容才发送，
     # 列表顺序即发送先后。兼容旧字段 attach_order（before/after），读取时迁移。
     send_order: List[str] = field(default_factory=lambda: ["message"])
+    # 群聊 @：开关 + 成员名单（/ 或 , 分隔）+ @所有人；at_attach:
+    # text=@跟文字消息 first=@跟首条发送内容（与手动发送页语义一致）
+    at_enabled: bool = False
+    at_members: str = ""
+    at_all: bool = False
+    at_attach: str = "text"
     # 任务类型：message=发送纯文字/附件消息；profiles=顺序执行一个或多个表格配置文件
     kind: str = "message"
     # kind=profiles 时：配置文件（.json）绝对路径列表，按列表顺序串行执行
@@ -170,6 +176,11 @@ class ScheduleTask:
             attachment=str(data.get("attachment", "") or ""),
             region=_normalize_region(data.get("region")),
             send_order=_normalize_send_order(data),
+            at_enabled=bool(data.get("at_enabled", False)),
+            at_members=str(data.get("at_members", "") or ""),
+            at_all=bool(data.get("at_all", False)),
+            at_attach=("first" if str(data.get("at_attach", "text")) == "first"
+                       else "text"),
             kind=kind,
             profile_paths=profile_paths,
             fired_log=_normalize_fired_log(data.get("fired_log")),
