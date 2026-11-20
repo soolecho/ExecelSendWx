@@ -7439,9 +7439,16 @@ class MonitorTab(QWidget):
 
         row = QHBoxLayout()
         row.addWidget(QLabel("Sheet名称:"))
-        self.sheet_edit = QLineEdit()
-        self.sheet_edit.setPlaceholderText("留空 = 第一个 sheet")
-        row.addWidget(self.sheet_edit, 1)
+        self.sheet_combo = QComboBox()
+        self.sheet_combo.setEditable(True)
+        self.sheet_combo.addItem("（第一个工作表）", "")
+        self.sheet_combo.lineEdit().setPlaceholderText("留空 = 第一个 sheet")
+        row.addWidget(self.sheet_combo, 1)
+        self.sheet_read_btn = QPushButton("读取工作表")
+        self.sheet_read_btn.setToolTip(
+            "从监控目录最新匹配文件读取全部 Sheet 名称，供下拉选择（也可手动填写）"
+        )
+        row.addWidget(self.sheet_read_btn)
         self.read_header_btn = QPushButton("读取表头")
         row.addWidget(self.read_header_btn)
         filter_layout.addLayout(row)
@@ -7665,13 +7672,14 @@ class MonitorTab(QWidget):
         row.addWidget(self.snapshot_range_edit, 1)
         # 截图来源工作表：可与数据表不同（如数据表是汇总、区域图要发明细）
         row.addWidget(QLabel("工作表:"))
-        self.snapshot_sheet_edit = QLineEdit()
-        self.snapshot_sheet_edit.setPlaceholderText("留空 = 与上方 Sheet 相同")
-        self.snapshot_sheet_edit.setToolTip(
-            "留空 = 用上方「Sheet名称」的数据表；填其他 sheet 名则区域图从该表截取"
+        self.snapshot_sheet_combo = QComboBox()
+        self.snapshot_sheet_combo.setEditable(True)
+        self.snapshot_sheet_combo.addItem("（同数据表）", "")
+        self.snapshot_sheet_combo.setToolTip(
+            "（同数据表）= 用上方「Sheet名称」的数据表；选其他 sheet 名则区域图从该表截取"
         )
-        self.snapshot_sheet_edit.setMaximumWidth(160)
-        row.addWidget(self.snapshot_sheet_edit, 0)
+        self.snapshot_sheet_combo.setMaximumWidth(170)
+        row.addWidget(self.snapshot_sheet_combo, 0)
         self.snapshot_hint = QLabel("⚠ 指定区域截图仅在「关闭对比」模式下生效")
         ui_theme.apply_tone(self.snapshot_hint, "warn", small=True)
         self.snapshot_hint.setVisible(False)
@@ -7935,6 +7943,7 @@ class MonitorTab(QWidget):
         self.run_once_btn.clicked.connect(self._on_run_once)
         self.browse_btn.clicked.connect(self._on_browse)
         self.read_header_btn.clicked.connect(self._on_read_headers)
+        self.sheet_read_btn.clicked.connect(self._on_read_sheets)
         self.repeat_mode_combo.currentIndexChanged.connect(self._sync_time_window)
         self.save_btn.clicked.connect(self._on_save)
         self.clear_btn.clicked.connect(self._reset_form)
@@ -7953,7 +7962,7 @@ class MonitorTab(QWidget):
         self.pattern_edit.textChanged.connect(mark)
         self.file_prefix_edit.textChanged.connect(mark)
         self.interval_spin.valueChanged.connect(mark)
-        self.sheet_edit.textChanged.connect(mark)
+        self.sheet_combo.currentTextChanged.connect(mark)
         self.filter_column_combo.currentTextChanged.connect(mark)
         self.filter_values_edit.textChanged.connect(mark)
         self.compare_check.stateChanged.connect(mark)
@@ -7968,7 +7977,7 @@ class MonitorTab(QWidget):
         self.send_order_combo.currentIndexChanged.connect(mark)
         self.snapshot_check.stateChanged.connect(mark)
         self.snapshot_range_edit.textChanged.connect(mark)
-        self.snapshot_sheet_edit.textChanged.connect(mark)
+        self.snapshot_sheet_combo.currentTextChanged.connect(mark)
         self.airsync_check.stateChanged.connect(mark)
         self.airsync_webhook_edit.textChanged.connect(mark)
         self.airsync_token_edit.textChanged.connect(mark)
@@ -8140,6 +8149,69 @@ class MonitorTab(QWidget):
         if path:
             self.watch_path_edit.setText(path)
 
+    @staticmethod
+    def _sheet_combo_value(combo):
+        """取得可编辑 Sheet 下拉的当前值：占位项返回空，手填文本原样返回。"""
+        text = combo.currentText().strip()
+        idx = combo.currentIndex()
+        if idx >= 0 and text == combo.itemText(idx):
+            return str(combo.itemData(idx) or "").strip()
+        return text
+
+    def _fill_sheet_combo(self, combo, names, current, placeholder):
+        """把读取到的工作表名填入可编辑下拉，保留已选/已填的自定义名称。"""
+        current = str(current or "").strip()
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem(placeholder, "")
+            for name in names:
+                combo.addItem(name, name)
+            if current and current not in names:
+                combo.addItem(current, current)
+            idx = combo.findData(current) if current else 0
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+        finally:
+            combo.blockSignals(False)
+
+    def _on_read_sheets(self):
+        """从监控目录最新匹配文件读取 Sheet 列表，供数据表与截图工作表下拉选择。"""
+        watch_path = self.watch_path_edit.text().strip()
+        if not watch_path or not os.path.isdir(watch_path):
+            self.log("请先填写有效的监控目录")
+            return
+        patterns = [p.strip() for p in
+                    (self.pattern_edit.text() or "*.*").split(";") if p.strip()]
+        candidates = []
+        for pat in patterns or ["*.*"]:
+            for hit in glob.glob(os.path.join(watch_path, pat)):
+                base = os.path.basename(hit)
+                if not os.path.isfile(hit) or base.startswith("~$"):
+                    continue
+                candidates.append(hit)
+        if not candidates:
+            self.log("目录下没有匹配的文件，无法读取工作表")
+            return
+        latest = max(candidates, key=lambda p: os.path.getmtime(p))
+        try:
+            from modules.wps_cloud import read_sheet_names
+            names = read_sheet_names(
+                latest, log_fn=lambda m: self.log(f"[监控] {m}"))
+        except Exception as exc:
+            self.log(f"读取工作表失败: {exc}")
+            return
+        names = [str(n) for n in (names or []) if str(n).strip()]
+        if not names:
+            self.log(f"{os.path.basename(latest)} 中未读取到工作表")
+            return
+        self._fill_sheet_combo(
+            self.sheet_combo, names,
+            self._sheet_combo_value(self.sheet_combo), "（第一个工作表）")
+        self._fill_sheet_combo(
+            self.snapshot_sheet_combo, names,
+            self._sheet_combo_value(self.snapshot_sheet_combo), "（同数据表）")
+        self.log(f"已读取 {os.path.basename(latest)} 的工作表: {', '.join(names)}")
+
     def _on_read_headers(self):
         watch_path = self.watch_path_edit.text().strip()
         if not watch_path or not os.path.isdir(watch_path):
@@ -8162,7 +8234,7 @@ class MonitorTab(QWidget):
         try:
             from modules import monitor_engine
             headers, _rows = monitor_engine.read_sheet_rows(
-                file_path, sheet_name=self.sheet_edit.text().strip())
+                file_path, sheet_name=self._sheet_combo_value(self.sheet_combo))
             self.filter_column_combo.clear()
             self.filter_column_combo.addItem("")  # 空=全表
             for h in headers:
@@ -8188,7 +8260,7 @@ class MonitorTab(QWidget):
                         combo.addItem(str(h))
                         seen.add(str(h))
             self.filter_column_loaded = True
-            if self.sheet_edit.text().strip():
+            if self._sheet_combo_value(self.sheet_combo):
                 self.log(f"已读取 {os.path.basename(file_path)} 的表头 {len(headers)} 列")
             else:
                 self.log(f"已读取 {os.path.basename(file_path)} 首个 sheet 的表头 {len(headers)} 列")
@@ -8337,7 +8409,8 @@ class MonitorTab(QWidget):
             self.pattern_edit.setText(task.file_pattern)
             self.file_prefix_edit.setText(task.file_prefix)
             self.interval_spin.setValue(task.poll_interval_min)
-            self.sheet_edit.setText(task.sheet_name)
+            self._fill_sheet_combo(
+                self.sheet_combo, [], task.sheet_name, "（第一个工作表）")
             self.filter_column_combo.setCurrentText(task.filter_column)
             self.filter_values_edit.setPlainText("\n".join(task.filter_values))
             self.compare_check.setChecked(task.compare_enabled)
@@ -8354,8 +8427,9 @@ class MonitorTab(QWidget):
             self.limit_count_spin.setValue(task.limit_count)
             self.snapshot_check.setChecked(task.snapshot_enabled)
             self.snapshot_range_edit.setText(task.snapshot_range)
-            self.snapshot_sheet_edit.setText(
-                getattr(task, "snapshot_sheet", "") or "")
+            self._fill_sheet_combo(
+                self.snapshot_sheet_combo, [],
+                getattr(task, "snapshot_sheet", "") or "", "（同数据表）")
             self.text_title_edit.setPlainText(task.text_title)
             self.text_detail_check.setChecked(task.text_detail)
             self.remark_edit.setText(task.remark_text)
@@ -8455,7 +8529,7 @@ class MonitorTab(QWidget):
         task.file_pattern = self.pattern_edit.text().strip() or "*.xlsx;*.xls"
         task.file_prefix = self.file_prefix_edit.text().strip()
         task.poll_interval_min = self.interval_spin.value()
-        task.sheet_name = self.sheet_edit.text().strip()
+        task.sheet_name = self._sheet_combo_value(self.sheet_combo)
         task.filter_column = self.filter_column_combo.currentText().strip()
         task.filter_values = self._parse_filter_values(self.filter_values_edit.toPlainText())
         task.compare_enabled = self.compare_check.isChecked()
@@ -8468,7 +8542,7 @@ class MonitorTab(QWidget):
         task.limit_count = self.limit_count_spin.value()
         task.snapshot_enabled = self.snapshot_check.isChecked()
         task.snapshot_range = self.snapshot_range_edit.text().strip()
-        task.snapshot_sheet = self.snapshot_sheet_edit.text().strip()
+        task.snapshot_sheet = self._sheet_combo_value(self.snapshot_sheet_combo)
         task.text_title = self.text_title_edit.toPlainText().strip()
         task.text_detail = self.text_detail_check.isChecked()
         task.remark_text = self.remark_edit.text().strip()
@@ -8598,7 +8672,8 @@ class MonitorTab(QWidget):
             self.pattern_edit.setText("*.xlsx;*.xls")
             self.prefix_edit.clear()
             self.interval_spin.setValue(5)
-            self.sheet_edit.clear()
+            self._fill_sheet_combo(
+                self.sheet_combo, [], "", "（第一个工作表）")
             self.filter_column_combo.clear()
             self.filter_column_loaded = False
             self.filter_column_combo.setCurrentText("")
@@ -8616,7 +8691,8 @@ class MonitorTab(QWidget):
             self.limit_count_spin.setEnabled(False)
             self.snapshot_check.setChecked(False)
             self.snapshot_range_edit.clear()
-            self.snapshot_sheet_edit.clear()
+            self._fill_sheet_combo(
+                self.snapshot_sheet_combo, [], "", "（同数据表）")
             self.text_title_edit.clear()
             self.text_detail_check.setChecked(True)
             self.remark_edit.clear()
