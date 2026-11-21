@@ -10085,7 +10085,9 @@ class MainWindow(QMainWindow):
         for g in groups:
             if g in targets:
                 if g.is_collapsed():
-                    g.set_collapsed(False, animate=True)
+                    # 一个小节可能对应多个面板（如「筛选对比」= 筛选与对比 + 列设置）：
+                    # 展开时关闭手风琴联动，否则后展开的面板会把前面的面板又收起来
+                    g.set_collapsed(False, animate=True, accordion_close=False)
             elif not g.is_collapsed():
                 g.set_collapsed(True, animate=True)
         QTimer.singleShot(0, lambda: self.fit_to_content(True, animate_window=True))
