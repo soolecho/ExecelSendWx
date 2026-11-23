@@ -327,7 +327,7 @@ class SectionChip(QPushButton):
 
     def _chip_font(self) -> QFont:
         font = QFont(self.font())
-        font.setPixelSize(11)
+        font.setPixelSize(10)
         return font
 
     # ---- 状态 ----
@@ -513,15 +513,17 @@ class SectionTabs(QWidget):
         self._active = ""
 
         # 等宽小节按钮：按最长标签算一次，保证第二行按钮整齐一致
+        # 字号 10px + 水平留白 24px：8 个中英文小节也能压在默认窗口宽度内，
+        # 避免「Agent WeChat」这类较长标签被右边缘裁掉。
         chip_font = QFont(self.font())
-        chip_font.setPixelSize(11)
+        chip_font.setPixelSize(10)
         chip_metrics = QFontMetrics(chip_font)
         texts = [str(text) for _group, items in spec for _key, text in items]
         widest = max(chip_metrics.horizontalAdvance(t) for t in texts) if texts else 0
-        self._chip_w = max(88, widest + 34)
+        self._chip_w = max(84, widest + 24)
 
         group_font = QFont(self.font())
-        group_font.setPixelSize(11)
+        group_font.setPixelSize(10)
         group_font.setBold(True)
         group_metrics = QFontMetrics(group_font)
 
@@ -554,7 +556,7 @@ class SectionTabs(QWidget):
         for index, (group_label, items) in enumerate(spec):
             group_key = f"group{index}"
             title = str(group_label or "分组")
-            group_w = max(88, group_metrics.horizontalAdvance(title) + 40)
+            group_w = max(84, group_metrics.horizontalAdvance(title) + 32)
             group_chip = GroupChip(group_key, title, group_w, self)
             group_chip.clicked.connect(
                 lambda _checked=False, k=group_key: self._on_group(k))

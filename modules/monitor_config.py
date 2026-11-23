@@ -295,6 +295,9 @@ class MonitorTask:
     wx_enabled: bool = True
     wxwork_enabled: bool = False
     wxwork_webhook: str = ""          # 企微群机器人 webhook（含 key）
+    # Agent WeChat API 额外推送渠道（连接信息在全局设置，任务级独立开关）。
+    # 纯 HTTP，不占用微信发送批次锁；失败只记日志，不参与基线推进。
+    agent_api_enabled: bool = False
     wxwork_fail_enabled: bool = False # 发送失败时向另一个 webhook 推送失败摘要的开关
     wxwork_fail_webhook: str = ""     # 失败通知 webhook
     send_source_file: bool = False    # 源文件发送：把本轮检出的最新源 Excel 随渠道一起发
@@ -418,6 +421,7 @@ class MonitorTask:
             wxwork_webhook=_s("wxwork_webhook"),
             wxwork_fail_enabled=_b("wxwork_fail_enabled", False),
             wxwork_fail_webhook=_s("wxwork_fail_webhook"),
+            agent_api_enabled=_b("agent_api_enabled", False),
             send_source_file=_b("send_source_file", False),
             created_at=_s("created_at"),
             updated_at=_s("updated_at"),

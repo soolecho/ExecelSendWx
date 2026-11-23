@@ -189,6 +189,89 @@ def _compact_btn_css() -> str:
     )
 
 
+class AgentGroupMemberPicker(QDialog):
+    """从 Agent WeChat API 读取群成员，多选后返回昵称列表。
+
+    供手动发送 / 定时任务 / 监控任务的「@成员」旁「读取成员」按钮复用：
+    连接信息取全局设置，群名可手填，也可由调用方预填（取自已填接收人）。
+    """
+
+    def __init__(self, group_hint: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("读取 Agent WeChat 群成员")
+        self.setMinimumWidth(430)
+        layout = QVBoxLayout(self)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("群名称/群ID:"))
+        self.group_edit = QLineEdit()
+        self.group_edit.setPlaceholderText("群名称或 xxx@chatroom")
+        self.group_edit.setText(str(group_hint or "").strip())
+        row.addWidget(self.group_edit, 1)
+        self.load_btn = QPushButton("读取")
+        row.addWidget(self.load_btn)
+        layout.addLayout(row)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        ui_theme.apply_tone(self.status, "muted", small=True)
+        layout.addWidget(self.status)
+
+        self.members_list = QListWidget()
+        self.members_list.setSelectionMode(
+            QListWidget.SelectionMode.MultiSelection)
+        layout.addWidget(self.members_list)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.load_btn.clicked.connect(self._load_members)
+
+    def _load_members(self):
+        group = self.group_edit.text().strip()
+        if not group:
+            self.status.setText("请先填写群名称或群 ID")
+            return
+        self.status.setText("正在读取…")
+        self.members_list.clear()
+        try:
+            from modules.agent_wechat import AgentWeChatClient
+            settings = ConfigManager().load_global_settings()
+            client = AgentWeChatClient(
+                settings.get("agent_api_base_url", ""),
+                settings.get("agent_api_token", ""),
+                settings.get("agent_api_account", ""),
+                timeout=15.0,
+            )
+            thread_id = client.find_thread(group)
+            members = client.list_members(thread_id)
+            for m in members:
+                name = str(
+                    m.get("displayName") or m.get("nickname") or m.get("remark")
+                    or m.get("alias") or m.get("id") or ""
+                ).strip()
+                item = QListWidgetItem(name or "(未命名成员)")
+                item.setData(Qt.ItemDataRole.UserRole, name)
+                self.members_list.addItem(item)
+            self.status.setText(
+                f"✅ 已读取 {len(members)} 位成员，可多选后点「确定」填入 @成员")
+        except Exception as exc:
+            self.status.setText(f"❌ 读取失败：{exc}")
+
+    def selected_names(self) -> List[str]:
+        names = []
+        for item in self.members_list.selectedItems():
+            name = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if name:
+                names.append(name)
+        return names
+
+
 class ElasticPage(QWidget):
     """弹性 tab 页面容器：非当前显示的页不报告尺寸提示。
 
@@ -920,6 +1003,33 @@ class CloudExcelReadWorker(QThread):
             cleanup_temp_file(temp_path)
 
 
+class AgentWatchWorker(QThread):
+    """后台探测 Agent WeChat 服务/微信是否在线。
+
+    只做 GET /health + GET /v1/accounts 只读查询，不发送消息，
+    因此不会产生聊天流量，也不涉及微信发送风控。
+    """
+
+    checked = pyqtSignal(bool, str)  # 是否在线, 说明
+
+    def __init__(self, base_url: str, token: str, account: str = "",
+                 parent=None):
+        super().__init__(parent)
+        self._base_url = base_url
+        self._token = token
+        self._account = account
+
+    def run(self):
+        from modules.agent_wechat import AgentWeChatClient
+        try:
+            client = AgentWeChatClient(
+                self._base_url, self._token, self._account, timeout=6.0)
+            ok, detail = client.probe_status()
+        except Exception as exc:
+            ok, detail = False, f"探测异常：{exc}"
+        self.checked.emit(bool(ok), str(detail))
+
+
 class SendWorker(QThread):
     def __init__(
         self,
@@ -930,7 +1040,8 @@ class SendWorker(QThread):
         send_mode=None,
         minimize_after=True,
         attachment="",
-        retry_mode=False
+        retry_mode=False,
+        agent_api=False
     ):
         super().__init__()
         self.tasks = tasks
@@ -938,6 +1049,8 @@ class SendWorker(QThread):
         self.chat_delay = chat_delay
         self.minimize_after = bool(minimize_after)
         self.attachment = str(attachment or "").strip()
+        # Agent WeChat API 通道：勾选后不操作微信窗口，连接信息取全局设置
+        self.agent_api = bool(agent_api)
         # 用户手动"重试发送"：忽略收件人负预检缓存，强制重新搜索切换
         self.retry_mode = bool(retry_mode)
         # 发送顺序：显式 send_order 优先；兼容旧 send_mode 参数
@@ -1010,48 +1123,77 @@ class SendWorker(QThread):
             self.attachment = ""
 
         try:
-            # 全局发送批次锁：与其他发送任务（定时/监控）排队串行
-            acquired = WeChatSender.acquire_batch(
-                log_fn=self.signals.log.emit,
-                should_stop=self.stopped_event.is_set,
-            )
-            if not acquired:
-                self.signals.log.emit("❌ 发送已停止，取消排队")
-                self.signals.result.emit((0, total_count, total_count, list(self.tasks)))
-                result_emitted = True
-                return
             self.tasks = [self._normalize_task(t) for t in self.tasks]
-            self.signals.log.emit("初始化微信客户端...")
-            sender = WeChatSender.shared_instance()
-            sender.cleanup_temp_images()
-            if not sender.initialize():
-                # 单例失败不影响下次，清空让后续尝试重新 new WeChat
-                WeChatSender.reset_shared_instance()
-                # 只走 result 单通道（失败数=总数，支持一键重试）
-                self.signals.log.emit("❌ 微信未登录或未打开，本次发送全部失败")
-                self.signals.result.emit((0, total_count, total_count, list(self.tasks)))
-                result_emitted = True
-                return
-            self.signals.log.emit("微信客户端初始化成功")
-            # 保存原始 log 方法，在 finally 中还原，避免共享单例的 log
-            # 指向已销毁 QThread 的信号
-            _orig_sender_log = sender.log
-            try:
-                import logging as _logging
-                _py_logger = _logging.getLogger("wechat_sender")
+            if self.agent_api:
+                from modules.agent_wechat import (
+                    AgentWeChatClient,
+                    AgentWeChatSender,
+                )
+                settings = ConfigManager().load_global_settings()
+                self.signals.log.emit("初始化 Agent WeChat API 通道...")
+                sender = AgentWeChatSender(
+                    AgentWeChatClient(
+                        settings.get("agent_api_base_url", ""),
+                        settings.get("agent_api_token", ""),
+                        settings.get("agent_api_account", ""),
+                        log=self.signals.log.emit,
+                    ),
+                    log=self.signals.log.emit,
+                )
+                if not sender.initialize():
+                    self.signals.result.emit(
+                        (0, total_count, total_count, list(self.tasks))
+                    )
+                    result_emitted = True
+                    return
+                _orig_sender_log = sender.log
+            else:
+                # 全局发送批次锁：与其他发送任务（定时/监控）排队串行
+                acquired = WeChatSender.acquire_batch(
+                    log_fn=self.signals.log.emit,
+                    should_stop=self.stopped_event.is_set,
+                )
+                if not acquired:
+                    self.signals.log.emit("❌ 发送已停止，取消排队")
+                    self.signals.result.emit(
+                        (0, total_count, total_count, list(self.tasks))
+                    )
+                    result_emitted = True
+                    return
+                self.signals.log.emit("初始化微信客户端...")
+                sender = WeChatSender.shared_instance()
+                sender.cleanup_temp_images()
+                if not sender.initialize():
+                    # 单例失败不影响下次，清空让后续尝试重新 new WeChat
+                    WeChatSender.reset_shared_instance()
+                    # 只走 result 单通道（失败数=总数，支持一键重试）
+                    self.signals.log.emit("❌ 微信未登录或未打开，本次发送全部失败")
+                    self.signals.result.emit(
+                        (0, total_count, total_count, list(self.tasks))
+                    )
+                    result_emitted = True
+                    return
+                self.signals.log.emit("微信客户端初始化成功")
+                # 保存原始 log 方法，在 finally 中还原，避免共享单例的 log
+                # 指向已销毁 QThread 的信号
+                _orig_sender_log = sender.log
+                try:
+                    import logging as _logging
+                    _py_logger = _logging.getLogger("wechat_sender")
 
-                def _send_log_hook(m, _cb=self.signals.log.emit, _lg=_py_logger.info):
-                    try:
-                        _lg(str(m))
-                    except Exception:
-                        pass
-                    try:
-                        _cb(str(m))
-                    except Exception:
-                        pass
-                sender.log = _send_log_hook
-            except Exception:
-                pass
+                    def _send_log_hook(m, _cb=self.signals.log.emit,
+                                       _lg=_py_logger.info):
+                        try:
+                            _lg(str(m))
+                        except Exception:
+                            pass
+                        try:
+                            _cb(str(m))
+                        except Exception:
+                            pass
+                    sender.log = _send_log_hook
+                except Exception:
+                    pass
 
             # 自定义消息占位符：{{date}}/{{time:HH点mm分}}/{{weather}} 等按发送时刻渲染
             try:
@@ -1071,8 +1213,8 @@ class SendWorker(QThread):
                 sender,
                 send_order=self.send_order,
                 attachment=self.attachment,
-                send_interval=self.send_interval,
-                chat_delay=self.chat_delay,
+                send_interval=0 if self.agent_api else self.send_interval,
+                chat_delay=0 if self.agent_api else self.chat_delay,
                 log=self.signals.log.emit,
                 progress=lambda c, t: self.signals.progress.emit(c, t),
                 stop_event=self.stopped_event,
@@ -1206,6 +1348,7 @@ class ScheduleSendWorker(QThread):
         at_members=None,
         at_all=False,
         at_attach="text",
+        agent_api=False,
     ):
         super().__init__()
         self.recipients = list(recipients or [])
@@ -1219,6 +1362,8 @@ class ScheduleSendWorker(QThread):
         self.at_members = [str(m).strip() for m in (at_members or []) if str(m).strip()]
         self.at_all = bool(at_all)
         self.at_attach = "first" if str(at_attach) == "first" else "text"
+        # Agent WeChat API 通道：连接信息取全局设置，本任务自身独立开关
+        self.agent_api = bool(agent_api)
         # 指定区域截图（在线表格）：{cloud_file_id, cloud_file_name, sheet, range}
         self.region_spec = dict(region_spec) if isinstance(region_spec, dict) else {}
         # 发送顺序：显式 send_order 优先；否则按 attach_order 兼容旧调用
@@ -1241,6 +1386,11 @@ class ScheduleSendWorker(QThread):
 
     def stop(self):
         self.stopped_event.set()
+
+    @property
+    def _effective_chat_delay(self) -> float:
+        """Agent 通道用专属拟人节奏，忽略微信窗口的聊天延迟。"""
+        return 0.0 if self.agent_api else self.chat_delay
 
     def log(self, msg):
         try:
@@ -1298,46 +1448,69 @@ class ScheduleSendWorker(QThread):
         except Exception as exc:
             self.log(f"[定时] 天气渲染异常: {exc}")
 
-        self.log("[定时] 初始化微信客户端...")
+        self.log("[定时] 初始化发送通道...")
         _orig_sender_log = None
-        try:
-            # 全局发送批次锁：与其他发送任务（手动/监控）排队串行
-            self._batch_acquired = WeChatSender.acquire_batch(
-                log_fn=self.log,
-                should_stop=self.stopped_event.is_set,
+        if self.agent_api:
+            from modules.agent_wechat import AgentWeChatClient, AgentWeChatSender
+            settings = ConfigManager().load_global_settings()
+            self._sender = AgentWeChatSender(
+                AgentWeChatClient(
+                    settings.get("agent_api_base_url", ""),
+                    settings.get("agent_api_token", ""),
+                    settings.get("agent_api_account", ""),
+                    log=self.log,
+                ),
+                log=self.log,
             )
-            if not self._batch_acquired:
-                self.log("[定时] ❌ 已停止，取消排队")
-                self.finished_with_result.emit(0, len(self.recipients), list(self.recipients))
-                return
-            self._sender = WeChatSender.shared_instance()
-            # 保存原始 log 方法，在结束时还原，避免共享单例的 log 指向已销毁的 QThread
-            _orig_sender_log = self._sender.log
-            if self._log_cb:
-                self._sender.log = _SenderLogCb(self._log_cb).log
             if not self._sender.initialize():
+                self.log("[定时] Agent WeChat API 连接失败，本次任务失败")
+                self.finished_with_result.emit(
+                    0, len(self.recipients), list(self.recipients))
+                return
+            _orig_sender_log = self._sender.log
+            self.log("[定时] Agent WeChat API 通道已就绪")
+        else:
+            try:
+                # 全局发送批次锁：与其他发送任务（手动/监控）排队串行
+                self._batch_acquired = WeChatSender.acquire_batch(
+                    log_fn=self.log,
+                    should_stop=self.stopped_event.is_set,
+                )
+                if not self._batch_acquired:
+                    self.log("[定时] ❌ 已停止，取消排队")
+                    self.finished_with_result.emit(
+                        0, len(self.recipients), list(self.recipients))
+                    return
+                self._sender = WeChatSender.shared_instance()
+                # 保存原始 log 方法，在结束时还原，避免共享单例的 log 指向已销毁的 QThread
+                _orig_sender_log = self._sender.log
+                if self._log_cb:
+                    self._sender.log = _SenderLogCb(self._log_cb).log
+                if not self._sender.initialize():
+                    WeChatSender.reset_shared_instance()
+                    self.log("[定时] 微信初始化失败，本次任务失败")
+                    if self._batch_acquired:
+                        try:
+                            WeChatSender.release_batch()
+                        except Exception:
+                            pass
+                        self._batch_acquired = False
+                    self.finished_with_result.emit(
+                        0, len(self.recipients), list(self.recipients))
+                    return
+                self.log("[定时] 微信客户端初始化成功")
+            except Exception as exc:
+                self.log(f"[定时] 初始化异常: {exc}")
                 WeChatSender.reset_shared_instance()
-                self.log("[定时] 微信初始化失败，本次任务失败")
                 if self._batch_acquired:
                     try:
                         WeChatSender.release_batch()
                     except Exception:
                         pass
                     self._batch_acquired = False
-                self.finished_with_result.emit(0, len(self.recipients), list(self.recipients))
+                self.finished_with_result.emit(
+                    0, len(self.recipients), list(self.recipients))
                 return
-            self.log("[定时] 微信客户端初始化成功")
-        except Exception as exc:
-            self.log(f"[定时] 初始化异常: {exc}")
-            WeChatSender.reset_shared_instance()
-            if self._batch_acquired:
-                try:
-                    WeChatSender.release_batch()
-                except Exception:
-                    pass
-                self._batch_acquired = False
-            self.finished_with_result.emit(0, len(self.recipients), list(self.recipients))
-            return
 
         total = len(self.recipients)
         # 附加文件预检：配置了附件但文件不存在时提示并跳过附件（文字照常发送）
@@ -1373,7 +1546,7 @@ class ScheduleSendWorker(QThread):
                     self.log("[定时] 已手动停止")
                     failed_recipients.extend(self.recipients[idx:])
                     break
-                if idx > 0 and self.send_interval > 0:
+                if (idx > 0 and not self.agent_api and self.send_interval > 0):
                     if self.stopped_event.wait(self.send_interval):
                         failed_recipients.extend(self.recipients[idx:])
                         break
@@ -1409,7 +1582,7 @@ class ScheduleSendWorker(QThread):
                         break
                     if not self._sender.open_chat(
                         recipient,
-                        chat_delay=self.chat_delay,
+                        chat_delay=self._effective_chat_delay,
                         stop_event=self.stopped_event,
                     ):
                         self.log(f"[定时] ✗ 打开聊天窗口失败: {recipient}")
@@ -1432,7 +1605,7 @@ class ScheduleSendWorker(QThread):
                             text=self.message,
                             file_paths=file_paths,
                             recipient=recipient,
-                            chat_delay=self.chat_delay,
+                            chat_delay=self._effective_chat_delay,
                             fast_mode=True,
                             stop_event=self.stopped_event,
                             text_first=text_first,
@@ -1443,7 +1616,7 @@ class ScheduleSendWorker(QThread):
                         text_ok = self._sender.send_message(
                             content=self.message,
                             recipient=recipient,
-                            chat_delay=self.chat_delay,
+                            chat_delay=self._effective_chat_delay,
                             fast_mode=True,
                             stop_event=self.stopped_event,
                             at_members=msg_at_members,
@@ -1453,7 +1626,7 @@ class ScheduleSendWorker(QThread):
                         sender_ok = self._sender.send_files_batch(
                             file_paths,
                             recipient,
-                            chat_delay=self.chat_delay,
+                            chat_delay=self._effective_chat_delay,
                             fast_mode=True,
                             stop_event=self.stopped_event,
                             at_members=file_at_members,
@@ -1599,6 +1772,7 @@ class ProfileChainWorker(QThread):
         success_total = 0
         failed_names = []
         sender = None
+        wechat_sender = None
         _orig_sender_log = None
         # 结束信号全函数只允许发一次（early return 与 finally 竞态保护）
         _finished_emitted = False
@@ -1639,26 +1813,63 @@ class ProfileChainWorker(QThread):
                 self.log("[配置链] ❌ 已停止，取消排队")
                 _emit_finished()
                 return
-            self.log("[配置链] 初始化微信客户端...")
-            sender = WeChatSender.shared_instance()
-            _orig_sender_log = sender.log
-            if self._log_cb:
-                sender.log = _SenderLogCb(self._log_cb).log
-            try:
-                init_ok = bool(sender.initialize())
-            except Exception as exc:
-                self.log(f"[配置链] ❌ 微信初始化异常：{exc}")
-                init_ok = False
-            if not init_ok:
-                WeChatSender.reset_shared_instance()
-                self.log("[配置链] ❌ 微信初始化失败，本次任务失败")
-                failed_names.append("微信初始化失败")
-                _emit_finished()
-                return
-            sender.cleanup_temp_images()
-            self.log("[配置链] 微信客户端初始化成功")
 
             mgr = ConfigManager()
+            wechat_sender = None
+            _wechat_ready = False
+            agent_sender = None
+
+            def _get_wechat_sender():
+                """按需初始化微信客户端（仅当链路里有走微信窗口的配置）。"""
+                nonlocal wechat_sender, _wechat_ready, _orig_sender_log
+                if _wechat_ready:
+                    return wechat_sender
+                self.log("[配置链] 初始化微信客户端...")
+                ws = WeChatSender.shared_instance()
+                _orig_sender_log = ws.log
+                if self._log_cb:
+                    ws.log = _SenderLogCb(self._log_cb).log
+                try:
+                    init_ok = bool(ws.initialize())
+                except Exception as exc:
+                    self.log(f"[配置链] ❌ 微信初始化异常：{exc}")
+                    init_ok = False
+                if not init_ok:
+                    WeChatSender.reset_shared_instance()
+                    self.log("[配置链] ❌ 微信初始化失败")
+                    return None
+                ws.cleanup_temp_images()
+                wechat_sender = ws
+                _wechat_ready = True
+                self.log("[配置链] 微信客户端初始化成功")
+                return ws
+
+            def _get_agent_sender():
+                """按需初始化 Agent WeChat API 通道（连接信息取全局设置）。"""
+                nonlocal agent_sender
+                if agent_sender is not None:
+                    return agent_sender
+                from modules.agent_wechat import (
+                    AgentWeChatClient,
+                    AgentWeChatSender,
+                )
+                settings = mgr.load_global_settings()
+                ag = AgentWeChatSender(
+                    AgentWeChatClient(
+                        settings.get("agent_api_base_url", ""),
+                        settings.get("agent_api_token", ""),
+                        settings.get("agent_api_account", ""),
+                        log=self.log,
+                    ),
+                    log=self.log,
+                )
+                if not ag.initialize():
+                    self.log("[配置链] ❌ Agent WeChat API 连接失败")
+                    return None
+                agent_sender = ag
+                self.log("[配置链] Agent WeChat API 通道已就绪")
+                return ag
+
             for idx, path in enumerate(self.profile_paths):
                 if self.stopped_event.is_set():
                     self.log("[配置链] 已手动停止，后续配置不再执行")
@@ -1682,6 +1893,18 @@ class ProfileChainWorker(QThread):
                         f"{prep['sheet']} 共 {len(tasks)} 人，"
                         f"顺序 {'/'.join(prep['send_order']) or '(空)'}"
                     )
+                    # 本条配置按自身开关选择发送通道：Agent WeChat API 或微信窗口
+                    _use_agent = bool(
+                        (profile.get("send") or {}).get("agent_api", False))
+                    if _use_agent:
+                        sender = _get_agent_sender()
+                    else:
+                        sender = _get_wechat_sender()
+                    if sender is None:
+                        self.log(
+                            f"[配置链] ❌ 配置「{name}」发送通道初始化失败，跳过")
+                        failed_names.append(name)
+                        continue
                     # 先发一次 0/该链路人数：进度条在开始发送前就切到本条链路的
                     # 总人数并显示“发送中配置链 N”，不会残留上一条链路的进度。
                     self.send_progress.emit(idx + 1, total, 0, len(tasks))
@@ -1690,8 +1913,8 @@ class ProfileChainWorker(QThread):
                         sender,
                         send_order=prep["send_order"],
                         attachment=prep["attachment"],
-                        send_interval=prep["send_interval"],
-                        chat_delay=prep["chat_delay"],
+                        send_interval=0 if _use_agent else prep["send_interval"],
+                        chat_delay=0 if _use_agent else prep["chat_delay"],
                         log=self.log,
                         progress=lambda c, t: self.send_progress.emit(
                             idx + 1, total, c, t),
@@ -1713,17 +1936,17 @@ class ProfileChainWorker(QThread):
             # 初始化/外层任何意外异常都不能丢结束信号，否则标题永久“发送中…”
             self.log(f"[配置链] ❌ 任务异常中断：{exc}")
         finally:
-            if sender is not None:
-                if self.minimize_after:
-                    try:
-                        sender.minimize_window()
-                    except Exception:
-                        pass
-                if _orig_sender_log is not None:
-                    try:
-                        sender.log = _orig_sender_log
-                    except Exception:
-                        pass
+            # 最小化只对微信窗口通道有意义（Agent API 的 minimize_window 为空操作）
+            if wechat_sender is not None and self.minimize_after:
+                try:
+                    wechat_sender.minimize_window()
+                except Exception:
+                    pass
+            if wechat_sender is not None and _orig_sender_log is not None:
+                try:
+                    wechat_sender.log = _orig_sender_log
+                except Exception:
+                    pass
             # 释放全局发送批次锁
             if self._batch_acquired:
                 try:
@@ -2245,6 +2468,16 @@ class TableFilterTab(QWidget):
         )
         send_layout.addWidget(self.auto_send_check)
 
+        # 发送通道：勾选后走 Agent WeChat HTTP API（self-hosted），不再操作微信窗口。
+        # 连接信息在「全量设置 → Agent WeChat API」里统一配置，本开关随配置保存。
+        self.agent_api_check = QCheckBox("🤖 通过 Agent WeChat API 通道发送（替代微信窗口）")
+        self.agent_api_check.setToolTip(
+            "勾选后本配置的发送改走 Agent WeChat HTTP API（需在全局设置配置 Base URL/Token）。\n"
+            "不会打开/操作微信桌面窗口，也不会与企业微信等其它渠道重复发送。\n"
+            "@ 成员仍按本页填写，由 API 按群成员昵称自动匹配。"
+        )
+        send_layout.addWidget(self.agent_api_check)
+
         send_layout.addWidget(QLabel("微信接收人(手动指定):"))
         self.wechat_edit = QLineEdit()
         send_layout.addWidget(self.wechat_edit)
@@ -2356,6 +2589,14 @@ class TableFilterTab(QWidget):
         self.at_all_check = QCheckBox("@所有人")
         self.at_all_check.setEnabled(False)
         at_row.addWidget(self.at_all_check)
+        self.at_read_btn = QPushButton("读取成员")
+        self.at_read_btn.setFixedWidth(72)
+        self.at_read_btn.setToolTip(
+            "从 Agent WeChat API 读取群成员并多选填入 @成员。\n"
+            "群名默认取上方「微信接收人」；需先在全局设置配置连接信息。"
+        )
+        self.at_read_btn.setEnabled(False)
+        at_row.addWidget(self.at_read_btn)
         send_layout.addLayout(at_row)
         # @ 与谁一起发：跟随文字（@和文字同一个气泡）或随首条内容（@单独一条）
         at_mode_row = QHBoxLayout()
@@ -2735,6 +2976,7 @@ class TableFilterTab(QWidget):
         self.apply_filter_btn.clicked.connect(self.apply_filter)
         self.custom_msg_checkbox.stateChanged.connect(self.on_custom_msg_checkbox_changed)
         self.at_checkbox.toggled.connect(self.on_at_checkbox_changed)
+        self.at_read_btn.clicked.connect(self._on_read_agent_members)
         self.attach_pick_btn.clicked.connect(self._on_pick_attachment)
         self.attach_clear_btn.clicked.connect(self._on_clear_attachment)
         self.order_up_btn.clicked.connect(lambda: self._move_order_item(-1))
@@ -2837,6 +3079,8 @@ class TableFilterTab(QWidget):
                 "at_attach": (
                     self.at_mode_combo.currentData() or "text"
                 ),
+                # 本配置是否通过 Agent WeChat API 通道发送（连接信息在全局设置）
+                "agent_api": self.agent_api_check.isChecked(),
             },
             "filter_conditions": filter_conditions,
             "recipient_mapping": self._collect_recipient_mapping_from_ui(),
@@ -3168,6 +3412,8 @@ class TableFilterTab(QWidget):
         )
         self.at_mode_combo.setCurrentIndex(_attach_idx if _attach_idx >= 0 else 0)
         self.on_at_checkbox_changed(self.at_checkbox.isChecked())
+        # Agent WeChat API 通道开关（旧配置无此字段 → 默认关闭）
+        self.agent_api_check.setChecked(bool(send_settings.get("agent_api", False)))
 
         # 联系人映射：旧配置无此字段时按禁用+空表初始化（向后兼容）
         rm_cfg = profile.get("recipient_mapping") or {}
@@ -3417,6 +3663,26 @@ class TableFilterTab(QWidget):
         self.at_members_edit.setEnabled(enabled)
         self.at_all_check.setEnabled(enabled)
         self.at_mode_combo.setEnabled(enabled)
+        if getattr(self, "at_read_btn", None) is not None:
+            self.at_read_btn.setEnabled(enabled)
+
+    def _on_read_agent_members(self):
+        """从 Agent WeChat API 读取群成员，多选后追加到 @成员。"""
+        dlg = AgentGroupMemberPicker(self.wechat_edit.text().strip(), self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        names = dlg.selected_names()
+        if not names:
+            self.log("未选择任何群成员")
+            return
+        existing = self._split_rm_values(self.at_members_edit.text())
+        for name in names:
+            if name not in existing:
+                existing.append(name)
+        self.at_members_edit.setText(" / ".join(existing))
+        if not self.at_checkbox.isChecked():
+            self.at_checkbox.setChecked(True)
+        self.log(f"已从 Agent WeChat API 读取并填入 @成员: {'、'.join(names)}")
 
     def _on_pick_attachment(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -4857,6 +5123,8 @@ class TableFilterTab(QWidget):
             at_tip = "、".join(list(at_members) + (["所有人"] if at_all else []))
             at_stage = "文字消息" if at_attach == "text" else "首条消息"
             confirm_text += f"\n群聊{at_stage}将 @: {at_tip}"
+        if self.agent_api_check.isChecked():
+            confirm_text += "\n发送通道: Agent WeChat API（不操作微信窗口）"
         
         if auto:
             # 加载配置后自动发送：已按配置全选，跳过人工确认直接发送
@@ -4880,6 +5148,7 @@ class TableFilterTab(QWidget):
         self.progress_bar.setRange(0, len(tasks))
         self.progress_label.setText("正在发送...")
         self.last_send_order = list(send_order)
+        self.last_send_agent_api = bool(self.agent_api_check.isChecked())
 
         worker = SendWorker(
             tasks=tasks,
@@ -4887,7 +5156,8 @@ class TableFilterTab(QWidget):
             chat_delay=self.chat_delay_spin.value(),
             send_order=list(send_order),
             minimize_after=self.minimize_check.isChecked(),
-            attachment=self.attachment_edit.text().strip()
+            attachment=self.attachment_edit.text().strip(),
+            agent_api=self.agent_api_check.isChecked(),
         )
         self.worker = worker
         # 记录本轮是否为自动发送（加载配置后无人值守）：完成后不弹模态确认框
@@ -4953,6 +5223,7 @@ class TableFilterTab(QWidget):
             send_order=list(getattr(self, 'last_send_order', ['text'])),
             minimize_after=self.minimize_check.isChecked(),
             attachment=self.attachment_edit.text().strip(),
+            agent_api=bool(getattr(self, "last_send_agent_api", False)),
             # 手动重试必须重新搜索：上次失败可能是窗口被遮挡/最小化/搜索浮层
             # 卡住，不能沿用"最近 120 秒找不到"的负缓存（否则连搜索框都不激活）
             retry_mode=True
@@ -5948,6 +6219,12 @@ class ScheduleTab(QWidget):
         self.sched_at_all_check = QCheckBox("@所有人")
         self.sched_at_all_check.setEnabled(False)
         at_row.addWidget(self.sched_at_all_check)
+        self.sched_at_read_btn = QPushButton("读取成员")
+        self.sched_at_read_btn.setFixedWidth(72)
+        self.sched_at_read_btn.setEnabled(False)
+        self.sched_at_read_btn.setToolTip(
+            "从 Agent WeChat API 读取群成员并多选填入 @成员（群名取第一个接收人）")
+        at_row.addWidget(self.sched_at_read_btn)
         at_row.addWidget(QLabel("@位置:"))
         self.sched_at_mode_combo = QComboBox()
         self.sched_at_mode_combo.addItem("跟随文字", "text")
@@ -5955,6 +6232,17 @@ class ScheduleTab(QWidget):
         self.sched_at_mode_combo.setEnabled(False)
         at_row.addWidget(self.sched_at_mode_combo)
         msg_layout.addLayout(at_row)
+
+        # 发送通道：勾选后走 Agent WeChat API（连接信息在全局设置统一配置）
+        self.sched_agent_api_check = QCheckBox(
+            "通过 Agent WeChat API 通道发送（替代微信窗口）"
+        )
+        self.sched_agent_api_check.setToolTip(
+            "勾选后本任务改走 Agent WeChat HTTP API，不打开/操作微信桌面窗口。\n"
+            "需先在「全量设置 → Agent WeChat API」配置 Base URL/Token；"
+            "@ 成员按群成员昵称自动匹配。"
+        )
+        msg_layout.addWidget(self.sched_agent_api_check)
 
         # 在线表格指定区域截图：复用「数据发送」页的区域截图逻辑——任务触发时
         # 按需下载在线表格、按原表样式渲染，发送结束后自动删除下载与缓存文件。
@@ -6170,6 +6458,7 @@ class ScheduleTab(QWidget):
         self.region_read_btn.clicked.connect(self._on_read_region_sheets)
         self.region_cloud_edit.textChanged.connect(self._on_region_cloud_text_changed)
         self.sched_at_check.toggled.connect(self._on_sched_at_toggled)
+        self.sched_at_read_btn.clicked.connect(self._on_sched_read_members)
         self._update_region_controls()
         self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
         self.profile_add_btn.clicked.connect(self._on_add_profiles)
@@ -6210,6 +6499,7 @@ class ScheduleTab(QWidget):
         self.sched_at_members_edit.textChanged.connect(mark)
         self.sched_at_all_check.stateChanged.connect(mark)
         self.sched_at_mode_combo.currentIndexChanged.connect(mark)
+        self.sched_agent_api_check.stateChanged.connect(mark)
         self.profile_list.model().rowsInserted.connect(lambda *a: mark())
         self.profile_list.model().rowsRemoved.connect(lambda *a: mark())
 
@@ -6375,6 +6665,9 @@ class ScheduleTab(QWidget):
             mi = self.sched_at_mode_combo.findData(mode)
             self.sched_at_mode_combo.setCurrentIndex(mi if mi >= 0 else 0)
             self._on_sched_at_toggled(self.sched_at_check.isChecked())
+            self.sched_agent_api_check.setChecked(
+                bool(getattr(task, "agent_api", False))
+            )
             order = getattr(task, "send_order", None) or ["message"]
             # 附件为空时即使顺序里含 attachment 也不勾选
             if not self.attachment_edit.text().strip():
@@ -6439,6 +6732,7 @@ class ScheduleTab(QWidget):
             self.sched_at_members_edit.clear()
             self.sched_at_all_check.setChecked(False)
             self.sched_at_mode_combo.setCurrentIndex(0)
+            self.sched_agent_api_check.setChecked(False)
             self._set_sched_order(["message"])
             self._update_region_controls()
             self.kind_combo.setCurrentIndex(0)
@@ -6597,6 +6891,7 @@ class ScheduleTab(QWidget):
             at_members=self.sched_at_members_edit.text().strip(),
             at_all=self.sched_at_all_check.isChecked(),
             at_attach=str(self.sched_at_mode_combo.currentData() or "text"),
+            agent_api=self.sched_agent_api_check.isChecked(),
             kind=kind,
             profile_paths=profile_paths,
         )
@@ -6812,6 +7107,30 @@ class ScheduleTab(QWidget):
         self.sched_at_members_edit.setEnabled(bool(enabled))
         self.sched_at_all_check.setEnabled(bool(enabled))
         self.sched_at_mode_combo.setEnabled(bool(enabled))
+        if getattr(self, "sched_at_read_btn", None) is not None:
+            self.sched_at_read_btn.setEnabled(bool(enabled))
+
+    def _on_sched_read_members(self):
+        """从 Agent WeChat API 读取群成员，多选后追加到定时任务 @成员。"""
+        hint = ""
+        text = self.recipients_edit.toPlainText().strip()
+        if text:
+            hint = re.split(r"[/;、，,\s]+", text)[0].strip()
+        dlg = AgentGroupMemberPicker(hint, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        names = dlg.selected_names()
+        if not names:
+            return
+        existing = [p.strip() for p in re.split(
+            r"[/;、，,]", self.sched_at_members_edit.text()) if p.strip()]
+        for name in names:
+            if name not in existing:
+                existing.append(name)
+        self.sched_at_members_edit.setText(" / ".join(existing))
+        if not self.sched_at_check.isChecked():
+            self.sched_at_check.setChecked(True)
+        self.log(f"[定时] 已读取并填入 @成员: {'、'.join(names)}")
 
     @staticmethod
     def _sched_at_args(task_like):
@@ -7091,6 +7410,7 @@ class ScheduleTab(QWidget):
                 at_members=_at_members,
                 at_all=_at_all,
                 at_attach=_at_attach,
+                agent_api=bool(getattr(task, "agent_api", False)),
             )
 
         # 保存任务配置供完成回调使用
@@ -7605,6 +7925,15 @@ class MonitorTab(QWidget):
         self.wxwork_check.toggled.connect(self._on_wxwork_toggled)
         self.wxwork_fail_check.toggled.connect(self._on_wxwork_fail_toggled)
 
+        # Agent WeChat API 额外推送渠道（连接信息在全局设置统一配置）
+        self.monitor_agent_api_check = QCheckBox("Agent WeChat API 发送")
+        self.monitor_agent_api_check.setToolTip(
+            "通过你自建的 agent-wechat HTTP 服务发送（纯 HTTP，无需微信客户端，\n"
+            "不占用微信发送批次锁）。需先在「全量设置 → Agent WeChat API」配置连接信息；\n"
+            "@ 成员按群成员昵称自动匹配。该渠道失败只记日志，不影响微信基线重试。"
+        )
+        send_layout.addWidget(self.monitor_agent_api_check)
+
         self.send_source_check = QCheckBox("发送源文件")
         self.send_source_check.setToolTip("把本轮监控检出的最新源文件（Excel）作为附件，随已开启渠道一起发送（微信/企微均发）")
         send_layout.addWidget(self.send_source_check)
@@ -7807,6 +8136,12 @@ class MonitorTab(QWidget):
         self.monitor_at_all_check = QCheckBox("@所有人")
         self.monitor_at_all_check.setEnabled(False)
         at_row.addWidget(self.monitor_at_all_check)
+        self.monitor_at_read_btn = QPushButton("读取成员")
+        self.monitor_at_read_btn.setFixedWidth(72)
+        self.monitor_at_read_btn.setEnabled(False)
+        self.monitor_at_read_btn.setToolTip(
+            "从 Agent WeChat API 读取群成员并多选填入 @成员（群名取第一个接收人）")
+        at_row.addWidget(self.monitor_at_read_btn)
         recv_layout.addLayout(at_row)
         # @ 条数条件：本轮推送条数满足 大于/小于/等于… 才 @（随任务保存）
         at_cond_row = QHBoxLayout()
@@ -7835,6 +8170,7 @@ class MonitorTab(QWidget):
         at_mode_row.addWidget(self.monitor_at_mode_combo, 1)
         recv_layout.addLayout(at_mode_row)
         self.monitor_at_check.toggled.connect(self._on_monitor_at_toggled)
+        self.monitor_at_read_btn.clicked.connect(self._on_monitor_read_members)
         self.monitor_at_condition_combo.currentIndexChanged.connect(
             self._on_monitor_at_condition_changed
         )
@@ -8140,7 +8476,31 @@ class MonitorTab(QWidget):
         self.monitor_at_all_check.setEnabled(enabled)
         self.monitor_at_condition_combo.setEnabled(enabled)
         self.monitor_at_mode_combo.setEnabled(enabled)
+        if getattr(self, "monitor_at_read_btn", None) is not None:
+            self.monitor_at_read_btn.setEnabled(enabled)
         self._on_monitor_at_condition_changed()
+
+    def _on_monitor_read_members(self):
+        """从 Agent WeChat API 读取群成员，多选后追加到监控任务 @成员。"""
+        hint = ""
+        text = self.recipients_edit.toPlainText().strip()
+        if text:
+            hint = re.split(r"[/;、，,\s]+", text)[0].strip()
+        dlg = AgentGroupMemberPicker(hint, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        names = dlg.selected_names()
+        if not names:
+            return
+        existing = [p.strip() for p in re.split(
+            r"[/;、，,]", self.monitor_at_members_edit.text()) if p.strip()]
+        for name in names:
+            if name not in existing:
+                existing.append(name)
+        self.monitor_at_members_edit.setText(" / ".join(existing))
+        if not self.monitor_at_check.isChecked():
+            self.monitor_at_check.setChecked(True)
+        self.log(f"[监控] 已读取并填入 @成员: {'、'.join(names)}")
 
     def _on_monitor_at_condition_changed(self, _index=-1):
         """@ 条数条件：只有选择了比较式（非「不限条数」）才启用阈值输入。"""
@@ -8479,6 +8839,9 @@ class MonitorTab(QWidget):
             self.wx_enabled_check.setChecked(getattr(task, "wx_enabled", True))
             self.wxwork_check.setChecked(task.wxwork_enabled)
             self.wxwork_webhook_edit.setText(task.wxwork_webhook)
+            self.monitor_agent_api_check.setChecked(
+                bool(getattr(task, "agent_api_enabled", False))
+            )
             self.wxwork_fail_check.setChecked(task.wxwork_fail_enabled)
             self.wxwork_fail_webhook_edit.setText(task.wxwork_fail_webhook)
             self.wxwork_fail_webhook_edit.setEnabled(task.wxwork_fail_enabled)
@@ -8592,6 +8955,7 @@ class MonitorTab(QWidget):
         task.wxwork_webhook = self.wxwork_webhook_edit.text().strip()
         task.wxwork_fail_enabled = self.wxwork_fail_check.isChecked()
         task.wxwork_fail_webhook = self.wxwork_fail_webhook_edit.text().strip()
+        task.agent_api_enabled = self.monitor_agent_api_check.isChecked()
         task.send_source_file = self.send_source_check.isChecked()
         task.include_subdir = self.include_subdir_check.isChecked()
         task.compare_columns = self._selected_cols(self.compare_cols_list)
@@ -8744,6 +9108,7 @@ class MonitorTab(QWidget):
             self.wxwork_fail_webhook_edit.clear()
             self.wxwork_fail_webhook_edit.setEnabled(False)
             self.wxwork_detail.setVisible(False)
+            self.monitor_agent_api_check.setChecked(False)
             self.send_source_check.setChecked(False)
             self.include_subdir_check.setChecked(False)
             self.strip_space_check.setChecked(True)
@@ -9038,6 +9403,8 @@ class GlobalSettingsTab(QWidget):
     theme_mode_changed = pyqtSignal(str)
     # 玻璃质感切换请求（standard / clear / solid）：与明暗主题独立组合
     glass_style_changed = pyqtSignal(str)
+    # 「立即检测」Agent WeChat 在线状态（由 MainWindow 真正发起探测）
+    agent_watch_now = pyqtSignal()
 
     # (显示文本, 档位 key)；addItem(text, key) 存数据时以 key 为准
     _PROFILE_TEXT = [("关闭", "off"), ("快速", "fast"), ("自然", "natural"), ("保守", "calm")]
@@ -9238,6 +9605,130 @@ class GlobalSettingsTab(QWidget):
         ui_theme.apply_tone(notification_tip, "muted", small=True)
         nl.addWidget(notification_tip)
 
+        # ---------------- Agent WeChat API ----------------
+        agent_group = bar.add_section("🤖 Agent WeChat API", collapsed=True)
+        main_layout.addWidget(agent_group)
+        agl = agent_group.contentLayout()
+
+        ag_row = QHBoxLayout()
+        ag_row.addWidget(QLabel("Base URL:"))
+        self.agent_base_edit = QLineEdit()
+        self.agent_base_edit.setPlaceholderText("http://127.0.0.1:6174/v1")
+        ag_row.addWidget(self.agent_base_edit, 1)
+        agl.addLayout(ag_row)
+
+        ag_tok_row = QHBoxLayout()
+        ag_tok_row.addWidget(QLabel("Token:"))
+        self.agent_token_edit = QLineEdit()
+        self.agent_token_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.agent_token_edit.setPlaceholderText("API token（请求头 Authorization: Bearer）")
+        ag_tok_row.addWidget(self.agent_token_edit, 1)
+        agl.addLayout(ag_tok_row)
+
+        ag_acc_row = QHBoxLayout()
+        ag_acc_row.addWidget(QLabel("Account(可选):"))
+        self.agent_account_edit = QLineEdit()
+        self.agent_account_edit.setPlaceholderText("留空 = 自动使用第一个已登录账号")
+        ag_acc_row.addWidget(self.agent_account_edit, 1)
+        self.agent_test_btn = QPushButton("测试连接")
+        ag_acc_row.addWidget(self.agent_test_btn)
+        agl.addLayout(ag_acc_row)
+
+        self.agent_status_label = QLabel("")
+        self.agent_status_label.setWordWrap(True)
+        ui_theme.apply_tone(self.agent_status_label, "muted", small=True)
+        agl.addWidget(self.agent_status_label)
+
+        agent_tip = QLabel(
+            "在手动发送 / 定时任务 / 监控任务里可各自勾选「通过 Agent WeChat API 发送」。\n"
+            "该通道直接调用你自建的 agent-wechat HTTP 服务，无需微信桌面窗口；"
+            "@ 成员按昵称自动匹配，找不到的会跳过并记录日志。"
+        )
+        agent_tip.setWordWrap(True)
+        ui_theme.apply_tone(agent_tip, "muted", small=True)
+        agl.addWidget(agent_tip)
+
+        # 掉线探测：只读 /health + /accounts，不发送消息，不影响微信风控
+        watch_row = QHBoxLayout()
+        self.agent_watch_check = QCheckBox("检测服务/微信掉线")
+        self.agent_watch_check.setToolTip(
+            "定时探测 Agent WeChat 服务与微信在线状态：\n"
+            "服务器不可达、未登录、connection 非 online 时，右下角弹常驻卡片，"
+            "点击卡片打开软件，点 X 关闭。\n"
+            "只做只读状态查询，不发送消息，不会触发微信风控。"
+        )
+        watch_row.addWidget(self.agent_watch_check)
+        watch_row.addWidget(QLabel("间隔"))
+        self.agent_watch_interval_spin = QSpinBox()
+        self.agent_watch_interval_spin.setRange(1, 60)
+        self.agent_watch_interval_spin.setSuffix(" 分钟")
+        self.agent_watch_interval_spin.setFixedWidth(86)
+        self.agent_watch_interval_spin.setToolTip(
+            "建议 3 分钟：发现及时，且每天请求量不到 1MB。"
+        )
+        watch_row.addWidget(self.agent_watch_interval_spin)
+        self.agent_watch_now_btn = QPushButton("立即检测")
+        watch_row.addWidget(self.agent_watch_now_btn)
+        watch_row.addStretch(1)
+        agl.addLayout(watch_row)
+
+        self.agent_watch_status_label = QLabel("最近检测：—")
+        self.agent_watch_status_label.setWordWrap(True)
+        ui_theme.apply_tone(self.agent_watch_status_label, "muted", small=True)
+        agl.addWidget(self.agent_watch_status_label)
+
+        # Agent 专属拟人节奏：仅作用于 API 通道，与上方「拟人节流」互相独立
+        self.agent_rhythm_check = QCheckBox(
+            "启用 Agent 专属拟人节奏（仅本通道，不影响微信窗口发送）")
+        self.agent_rhythm_check.setToolTip(
+            "养号用：只对 Agent WeChat API 通道生效，与全局「拟人节流」互不影响。\n"
+            "每条消息：同一接收人的第 2 条消息起，随机等待指定区间；\n"
+            "每个人之间：切换到下一位接收人前，随机等待指定区间。"
+        )
+        agl.addWidget(self.agent_rhythm_check)
+
+        ar_msg_row = QHBoxLayout()
+        ar_msg_row.addWidget(QLabel("每条消息随机间隔(秒)："))
+        self.agent_rhythm_msg_min = QDoubleSpinBox()
+        self.agent_rhythm_msg_max = QDoubleSpinBox()
+        for spin, value in ((self.agent_rhythm_msg_min, 2.0),
+                            (self.agent_rhythm_msg_max, 5.0)):
+            spin.setRange(0.0, 600.0)
+            spin.setDecimals(1)
+            spin.setSingleStep(0.5)
+            spin.setValue(value)
+            spin.setFixedWidth(90)
+        ar_msg_row.addWidget(self.agent_rhythm_msg_min)
+        ar_msg_row.addWidget(QLabel("~"))
+        ar_msg_row.addWidget(self.agent_rhythm_msg_max)
+        ar_msg_row.addStretch(1)
+        agl.addLayout(ar_msg_row)
+
+        ar_person_row = QHBoxLayout()
+        ar_person_row.addWidget(QLabel("每个人之间随机间隔(秒)："))
+        self.agent_rhythm_person_min = QDoubleSpinBox()
+        self.agent_rhythm_person_max = QDoubleSpinBox()
+        for spin, value in ((self.agent_rhythm_person_min, 3.0),
+                            (self.agent_rhythm_person_max, 8.0)):
+            spin.setRange(0.0, 600.0)
+            spin.setDecimals(1)
+            spin.setSingleStep(0.5)
+            spin.setValue(value)
+            spin.setFixedWidth(90)
+        ar_person_row.addWidget(self.agent_rhythm_person_min)
+        ar_person_row.addWidget(QLabel("~"))
+        ar_person_row.addWidget(self.agent_rhythm_person_max)
+        ar_person_row.addStretch(1)
+        agl.addLayout(ar_person_row)
+
+        ar_tip = QLabel(
+            "这两个区间只作用于 Agent WeChat API 通道，与全局「拟人节流」独立；"
+            "可在任务运行中随时修改，下一次发送任务生效。"
+        )
+        ar_tip.setWordWrap(True)
+        ui_theme.apply_tone(ar_tip, "muted", small=True)
+        agl.addWidget(ar_tip)
+
         # ---------------- 待机与空闲 ----------------
         standby_group = bar.add_section("🌙 待机与空闲", collapsed=True)
         main_layout.addWidget(standby_group)
@@ -9281,24 +9772,39 @@ class GlobalSettingsTab(QWidget):
         self.idle_standby_check.toggled.connect(self._on_debounced_change)
         self.idle_minutes_spin.valueChanged.connect(self._on_debounced_change)
         self.progress_toast_check.toggled.connect(self._on_immediate_change)
+        self.agent_base_edit.editingFinished.connect(self._on_debounced_change)
+        self.agent_token_edit.editingFinished.connect(self._on_debounced_change)
+        self.agent_account_edit.editingFinished.connect(self._on_debounced_change)
+        self.agent_test_btn.clicked.connect(self._on_test_agent_api)
+        self.agent_watch_check.toggled.connect(self._on_immediate_change)
+        self.agent_watch_interval_spin.valueChanged.connect(
+            self._on_immediate_change)
+        self.agent_watch_now_btn.clicked.connect(self.agent_watch_now.emit)
+        self.agent_rhythm_check.toggled.connect(self._on_immediate_change)
+        for _spin in (self.agent_rhythm_msg_min, self.agent_rhythm_msg_max,
+                      self.agent_rhythm_person_min, self.agent_rhythm_person_max):
+            _spin.valueChanged.connect(self._on_debounced_change)
 
         self._load_to_ui()
         self._loading = False
 
         # 供手风琴 / 窗口弹性与左侧导航统一遍历
         self._collapsible_groups = [
-            theme_group, rhythm_group, map_group, notification_group, standby_group
+            theme_group, rhythm_group, map_group, notification_group,
+            agent_group, standby_group
         ]
         self.theme_group = theme_group
         self.rhythm_group = rhythm_group
         self.map_group = map_group
         self.notification_group = notification_group
+        self.agent_group = agent_group
         self.standby_group = standby_group
         self.nav_sections = [
             ("theme", "外观主题", [theme_group]),
             ("rhythm", "拟人节流", [rhythm_group]),
             ("mapping", "全量映射", [map_group]),
             ("notification", "任务通知", [notification_group]),
+            ("agent_api", "Agent WeChat", [agent_group]),
             ("standby", "待机与空闲", [standby_group]),
         ]
         # 右侧顶部小节按钮的分组展示
@@ -9307,6 +9813,7 @@ class GlobalSettingsTab(QWidget):
                         ("rhythm", "拟人节流"),
                         ("mapping", "全量映射"),
                         ("notification", "任务通知"),
+                        ("agent_api", "Agent WeChat"),
                         ("standby", "待机与空闲")]),
         ]
 
@@ -9375,6 +9882,40 @@ class GlobalSettingsTab(QWidget):
         self.progress_toast_check.setChecked(
             bool(self.settings.get("progress_toast_enabled", True))
         )
+
+        # Agent WeChat API 连接信息（全局唯一，供各任务勾选后复用）
+        self.agent_base_edit.setText(
+            str(self.settings.get("agent_api_base_url", "") or "")
+        )
+        self.agent_token_edit.setText(
+            str(self.settings.get("agent_api_token", "") or "")
+        )
+        self.agent_account_edit.setText(
+            str(self.settings.get("agent_api_account", "") or "")
+        )
+        self.agent_watch_check.setChecked(
+            bool(self.settings.get("agent_api_watch_enabled", False))
+        )
+        try:
+            _watch_min = int(self.settings.get("agent_api_watch_interval_min", 3))
+        except (TypeError, ValueError):
+            _watch_min = 3
+        self.agent_watch_interval_spin.setValue(max(1, min(60, _watch_min)))
+
+        ar = self.settings.get("agent_api_rhythm") or {}
+        if not isinstance(ar, dict):
+            ar = {}
+        self.agent_rhythm_check.setChecked(bool(ar.get("enabled", False)))
+        for _spin, _key, _default in (
+            (self.agent_rhythm_msg_min, "msg_min", 2.0),
+            (self.agent_rhythm_msg_max, "msg_max", 5.0),
+            (self.agent_rhythm_person_min, "person_min", 3.0),
+            (self.agent_rhythm_person_max, "person_max", 8.0),
+        ):
+            try:
+                _spin.setValue(float(ar.get(_key, _default)))
+            except (TypeError, ValueError):
+                _spin.setValue(_default)
 
         st = self.settings.get("standby") or {}
         self.idle_standby_check.setChecked(bool(st.get("idle_enabled", True)))
@@ -9638,11 +10179,63 @@ class GlobalSettingsTab(QWidget):
                 "idle_minutes": int(self.idle_minutes_spin.value()),
             },
             "progress_toast_enabled": self.progress_toast_check.isChecked(),
+            # Agent WeChat API 全局连接信息（各任务的独立开关在其自身配置里）
+            "agent_api_base_url": self.agent_base_edit.text().strip(),
+            "agent_api_token": self.agent_token_edit.text(),
+            "agent_api_account": self.agent_account_edit.text().strip(),
+            "agent_api_watch_enabled": self.agent_watch_check.isChecked(),
+            "agent_api_watch_interval_min": self.agent_watch_interval_spin.value(),
+            "agent_api_rhythm": {
+                "enabled": self.agent_rhythm_check.isChecked(),
+                "msg_min": round(self.agent_rhythm_msg_min.value(), 1),
+                "msg_max": round(self.agent_rhythm_msg_max.value(), 1),
+                "person_min": round(self.agent_rhythm_person_min.value(), 1),
+                "person_max": round(self.agent_rhythm_person_max.value(), 1),
+            },
             # 该选项在数据发送页修改；保存其他全局设置时原样保留
             "manual_minimize_wechat": bool(
                 self.settings.get("manual_minimize_wechat", True)
             ),
         }
+
+    def _on_test_agent_api(self):
+        """测试 Agent WeChat API 连通性（同步，超时 8 秒）。
+
+        以 /v1/accounts 能否取到账号为准（这才是真正发送用的接口）；
+        /health 仅作辅助信息，失败不影响判定（不同部署路径可能不同）。
+        """
+        from modules.agent_wechat import AgentWeChatClient
+
+        self.agent_test_btn.setEnabled(False)
+        self.agent_status_label.setText("正在连接…")
+        try:
+            client = AgentWeChatClient(
+                self.agent_base_edit.text().strip(),
+                self.agent_token_edit.text(),
+                self.agent_account_edit.text().strip(),
+                timeout=8.0,
+            )
+            client.ensure_account()
+            try:
+                client.health()
+                health_txt = "health ok"
+            except Exception as exc:
+                health_txt = f"health 检查失败（不影响发送）：{exc}"
+            self.agent_status_label.setText(
+                f"✅ 连接成功，account={client.account}（{health_txt}）"
+            )
+            logger.info("[Agent API] 测试连接成功 account=%s", client.account)
+        except Exception as exc:
+            self.agent_status_label.setText(f"❌ 连接失败：{exc}")
+            logger.warning("[Agent API] 测试连接失败：%s", exc)
+        finally:
+            self.agent_test_btn.setEnabled(True)
+
+    def set_agent_watch_status(self, ok: bool, detail: str, ts: str = ""):
+        """更新「最近检测」状态（由 MainWindow 的掉线探测回调调用）。"""
+        when = f"{ts} " if ts else ""
+        flag = "✅" if ok else "❌"
+        self.agent_watch_status_label.setText(f"最近检测 {when}{flag} {detail}")
 
     # ---------------- 落盘 + 应用 -----------------
     def _save(self):
@@ -9899,6 +10492,21 @@ class MainWindow(QMainWindow):
         self.global_settings_tab.settings_changed.connect(
             self._apply_progress_card_settings)
         self._apply_standby_idle_settings()
+
+        # ---- Agent WeChat 服务/微信掉线探测（只读，不发消息）----
+        self._agent_watch_timer = QTimer(self)
+        self._agent_watch_timer.timeout.connect(self._check_agent_online)
+        self._agent_watch_worker = None
+        self._agent_was_online = None
+        self._agent_offline_toast = None
+        self._agent_offline_dismissed = False
+        self._agent_alert_dialog = None
+        self._agent_alert_detail = ""
+        self.global_settings_tab.settings_changed.connect(
+            self._apply_agent_watch_settings)
+        self.global_settings_tab.agent_watch_now.connect(
+            lambda: self._check_agent_online(force=True))
+        self._apply_agent_watch_settings()
 
         # ---- 底部常驻坞：发送进度 + 全局日志（不随页面切换隐藏）----
         self.bottom_dock = ui_shell.BottomDock()
@@ -10734,10 +11342,27 @@ class MainWindow(QMainWindow):
             min_hint = content.minimumSizeHint()
             if not min_hint.isValid() or min_hint.width() <= 0:
                 min_hint = content.sizeHint()
+            # 顶部小节切换条是固定宽度的页面镶边：它可能比滚动区业务内容更宽，
+            # 不计入目标宽度时窗口会停在最小宽度，右侧小节按钮（如 Agent WeChat）
+            # 被窗口右边缘裁掉。
+            tabs_need = 0
+            if isinstance(page, ElasticPage):
+                page_lay = page.layout()
+                if page_lay is not None:
+                    for _i in range(page_lay.count()):
+                        _item = page_lay.itemAt(_i)
+                        _w = _item.widget() if _item is not None else None
+                        if isinstance(_w, ui_shell.SectionTabs):
+                            tabs_need = _w.width()
+                            break
+            if tabs_need > min_hint.width():
+                min_hint = QSize(tabs_need, min_hint.height())
             if expanding:
                 hint = content.sizeHint()
                 if not hint.isValid() or hint.width() <= 0:
                     hint = min_hint
+                if tabs_need > hint.width():
+                    hint = QSize(tabs_need, hint.height())
                 # 展开时理想尺寸与最小尺寸取较大者
                 target_w = max(hint.width(), min_hint.width())
                 target_h = max(hint.height(), min_hint.height())
@@ -11197,6 +11822,175 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    # ---------------- Agent WeChat 掉线探测 ----------------
+    def _apply_agent_watch_settings(self):
+        """按全局设置启动/停止掉线探测定时器（变更后即时生效）。"""
+        try:
+            settings = ConfigManager().load_global_settings()
+        except Exception:
+            return
+        enabled = bool(settings.get("agent_api_watch_enabled", False))
+        try:
+            minutes = int(settings.get("agent_api_watch_interval_min", 3))
+        except (TypeError, ValueError):
+            minutes = 3
+        minutes = max(1, min(60, minutes))
+        interval_ms = minutes * 60 * 1000
+        if enabled:
+            if self._agent_watch_timer.isActive():
+                self._agent_watch_timer.setInterval(interval_ms)
+            else:
+                self._agent_watch_timer.start(interval_ms)
+                # 启动后延迟几秒做首次探测，避开启动高峰
+                QTimer.singleShot(4000, self._check_agent_online)
+        else:
+            self._agent_watch_timer.stop()
+            self._agent_was_online = None
+
+    def _check_agent_online(self, force: bool = False):
+        """发起一次后台只读探测（QThread，失败/离线不会卡界面）。
+
+        force=True 供「立即检测」使用：即使自动探测未开启也执行一次。
+        """
+        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+            return  # 离屏测试不发起真实网络请求
+        if not force and not self._agent_watch_timer.isActive():
+            return
+        if (self._agent_watch_worker is not None
+                and self._agent_watch_worker.isRunning()):
+            return  # 上一次还没结束，跳过本轮
+        try:
+            settings = ConfigManager().load_global_settings()
+        except Exception:
+            return
+        if not force and not bool(settings.get("agent_api_watch_enabled", False)):
+            return
+        worker = AgentWatchWorker(
+            settings.get("agent_api_base_url", ""),
+            settings.get("agent_api_token", ""),
+            settings.get("agent_api_account", ""),
+            self,
+        )
+        worker.checked.connect(self._on_agent_watch_result)
+        worker.finished.connect(lambda w=worker: self._on_agent_watch_finished(w))
+        self._agent_watch_worker = worker
+        worker.start()
+
+    def _on_agent_watch_finished(self, worker):
+        if self._agent_watch_worker is worker:
+            self._agent_watch_worker = None
+        try:
+            worker.deleteLater()
+        except RuntimeError:
+            pass
+
+    def _on_agent_watch_result(self, ok: bool, detail: str):
+        ts = time.strftime("%H:%M:%S")
+        try:
+            self.global_settings_tab.set_agent_watch_status(ok, detail, ts)
+        except Exception:
+            pass
+        if ok:
+            if self._agent_was_online is False:
+                logger.info("[Agent Watch] 已恢复：%s", detail)
+                toast = self._agent_offline_toast
+                self._agent_offline_toast = None
+                self._agent_offline_dismissed = False
+                if toast is not None:
+                    try:
+                        toast.close()
+                    except RuntimeError:
+                        pass
+                ToastNotification.show_toast(
+                    "Agent WeChat 已恢复", detail,
+                    success=True, duration=5000, parent=self)
+                self._close_agent_alert_dialog()
+            self._agent_was_online = True
+            return
+
+        was_offline = self._agent_was_online is False
+        self._agent_was_online = False
+        logger.warning("[Agent Watch] 离线：%s", detail)
+        if not was_offline:
+            # 本次掉线的第一轮：重置关闭标记并弹出常驻卡片 + 详情
+            self._agent_offline_dismissed = False
+            self._set_agent_offline_toast(detail)
+            self._show_agent_alert_dialog(detail)
+        elif not self._agent_offline_dismissed:
+            # 持续离线：卡片还在就保留原卡片；被用户点 X 关闭后不再重复弹
+            toast = self._agent_offline_toast
+            if toast is None:
+                self._set_agent_offline_toast(detail)
+        else:
+            # 用户已点 X 关闭本次掉线提醒，在恢复前不再打扰
+            return
+
+    def _set_agent_offline_toast(self, detail: str):
+        """创建常驻掉线卡片：点击其他位置打开软件但不关闭，只有 X 能关闭。"""
+        toast = ToastNotification.show_toast(
+            "Agent WeChat 离线",
+            detail,
+            success=False,
+            parent=self,
+            on_click=self._on_agent_offline_click,
+            role="agent",
+        )
+        self._agent_offline_toast = toast
+        if toast is not None:
+            try:
+                toast.destroyed.connect(
+                    lambda *_, t=toast: self._on_agent_toast_destroyed(t))
+            except (RuntimeError, TypeError):
+                pass
+
+    def _on_agent_toast_destroyed(self, toast):
+        if self._agent_offline_toast is toast:
+            self._agent_offline_toast = None
+            # 用户在离线期间点了 X：本轮掉线不再重复弹卡片
+            if self._agent_was_online is False:
+                self._agent_offline_dismissed = True
+
+    def _on_agent_offline_click(self):
+        """点击掉线卡片：打开软件并显示详情，卡片保持到用户点 X。"""
+        self.show_main_window()
+        if self._agent_alert_detail:
+            self._show_agent_alert_dialog(self._agent_alert_detail)
+
+    def _show_agent_alert_dialog(self, detail: str):
+        self._agent_alert_detail = str(detail or "")
+        try:
+            if self._agent_alert_dialog is None:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Icon.Warning)
+                box.setWindowTitle("Agent WeChat 离线")
+                box.setStandardButtons(QMessageBox.StandardButton.Ok)
+                box.setModal(False)
+                box.finished.connect(self._on_agent_alert_dialog_closed)
+                self._agent_alert_dialog = box
+            self._agent_alert_dialog.setText("Agent WeChat 服务或微信当前不可用")
+            self._agent_alert_dialog.setInformativeText(
+                f"{detail}\n\n"
+                "请检查：服务器是否开机、Agent WeChat 是否在线、Token 是否有效。\n"
+                "可在「全量设置 → Agent WeChat API」点击「测试连接」查看详情。"
+            )
+            self._agent_alert_dialog.show()
+            self._agent_alert_dialog.raise_()
+            self._agent_alert_dialog.activateWindow()
+        except Exception:
+            logger.exception("显示 Agent 离线详情失败")
+
+    def _on_agent_alert_dialog_closed(self, *_):
+        self._agent_alert_dialog = None
+
+    def _close_agent_alert_dialog(self):
+        box = self._agent_alert_dialog
+        self._agent_alert_dialog = None
+        if box is not None:
+            try:
+                box.close()
+            except RuntimeError:
+                pass
+
     def _begin_schedule_progress_toast(self, worker):
         """主线程创建定时/配置链运行卡片，并绑定到所属 worker。"""
         try:
@@ -11473,6 +12267,7 @@ class MainWindow(QMainWindow):
                 at_members=_at_members,
                 at_all=_at_all,
                 at_attach=_at_attach,
+                agent_api=bool(getattr(task, "agent_api", False)),
             )
         self._schedule_worker = worker
         # 新执行周期：复位完成 Toast 去重守卫
@@ -11930,6 +12725,19 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(100, self._poll_worker_shutdown)
 
     def _request_worker_stop(self):
+        # 停止 Agent WeChat 掉线探测（等待当前一次只读请求结束，避免线程被销毁）
+        try:
+            self._agent_watch_timer.stop()
+        except Exception:
+            pass
+        try:
+            agent_worker = self._agent_watch_worker
+            if agent_worker is not None and agent_worker.isRunning():
+                agent_worker.wait(7000)
+            self._agent_watch_worker = None
+        except Exception:
+            pass
+
         worker = self.table_filter_tab.worker
         if worker and worker.isRunning():
             worker.set_stopped(True)

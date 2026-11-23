@@ -403,7 +403,9 @@ class MonitorWorker(QThread):
             out_file = monitor_engine.build_out_file(view_headers, view_rows, tmpx)
 
         # 只有本轮确有内容和有效推送渠道时才创建运行卡片；无新增/无接收人不打扰。
-        recipient_total = sum(1 for p in task.recipients if p) if task.wx_enabled else 0
+        _has_wx_target = bool(task.recipients) and (
+            task.wx_enabled or getattr(task, "agent_api_enabled", False))
+        recipient_total = sum(1 for p in task.recipients if p) if _has_wx_target else 0
         has_push = bool(clean_rows) and bool(
             recipient_total
             or task.airsync_enabled
@@ -474,9 +476,40 @@ class MonitorWorker(QThread):
 
         any_failed = False  # 微信推送 或 智能表格写入 任一失败即视为本次未完成 → 保留基线重试
 
+        # 本轮推送内容（微信 / Agent WeChat API 两个消息渠道共用同一份内容）
+        push_text = "\n".join(texts) if texts else None
+        push_files, text_first = self._resolve_send_order(task, png_path, out_file)
+        if task.send_source_file and fp and os.path.exists(fp):
+            push_files = list(push_files) + [fp]
+
+        # Agent WeChat API 额外推送渠道：纯 HTTP，不占用微信批次锁。
+        # 与微信同时开启时视为额外渠道（失败不推进基线，避免重复推送）；
+        # 关闭微信只开 Agent 时，Agent 即主渠道，结果计入完成统计与基线重试。
         msg_delivered = 0
         msg_failed = 0
-        if task.wx_enabled and task.recipients and clean_rows:
+        wx_channel_used = bool(task.wx_enabled and task.recipients and clean_rows)
+        agent_failed = False
+        if getattr(task, "agent_api_enabled", False) and clean_rows:
+            if not task.recipients:
+                self.emit(
+                    f"{log_prefix} 任务「{task.name}」已勾选 Agent WeChat API 但接收人为空，跳过该渠道")
+            else:
+                agent_delivered = 0
+                agent_failed_count = 0
+                try:
+                    agent_delivered, agent_failed_count = self._send_agent_api(
+                        task, push_text, push_files, log_prefix, len(clean_rows))
+                except Exception as exc:
+                    agent_failed_count = len(task.recipients)
+                    logger.exception("Agent WeChat API 推送失败 %s", task.name)
+                    self.emit(
+                        f"{log_prefix} 任务「{task.name}」Agent WeChat API 推送失败: {exc}")
+                agent_failed = agent_failed_count > 0
+                if not task.wx_enabled:
+                    msg_delivered += agent_delivered
+                    msg_failed += agent_failed_count
+
+        if wx_channel_used:
             # 全局发送批次锁：与其他发送任务（手动/定时/链路）排队串行，
             # 避免多个 worker 同时驱动同一份微信句柄导致窗口争抢发错对象。
             # 排队无时间上限；队列期间被停止则返回 None（跳过本轮）。
@@ -491,10 +524,8 @@ class MonitorWorker(QThread):
             # 走两步粘贴、一次 Enter），绝不逐条发送；与本轮内容同批推送，保持消息完整。
             # 粘贴顺序按任务配置 send_order（文字/图片/文件）联动：文字在前 → 先粘文字再粘文件。
             # v1.8.0 源文件发送：勾选后把本轮检出的最新源 Excel 随附件一并发给各接收人。
-            text = "\n".join(texts) if texts else None
-            files, text_first = self._resolve_send_order(task, png_path, out_file)
-            if task.send_source_file and fp and os.path.exists(fp):
-                files = list(files) + [fp]
+            text = push_text
+            files = push_files
             # @ 条数条件：本轮推送条数（clean_rows）满足任务配置的比较式才 @
             at_ok = should_mention(task, len(clean_rows))
             if task.at_enabled and not at_ok:
@@ -532,7 +563,7 @@ class MonitorWorker(QThread):
                 except Exception:
                     pass
                 # 发送完成后按配置最小化微信（隐私保护），避免窗口长时间停留前台/全屏
-                if task.minimize_after and (msg_delivered or msg_failed):
+                if task.minimize_after and wx_channel_used:
                     try:
                         WeChatSender.shared_instance().minimize_window()
                     except Exception:
@@ -540,7 +571,7 @@ class MonitorWorker(QThread):
         # 微信推送 或 智能表格写入 任一失败即视为本次未完成 → 保留基线重试
         any_failed = bool(msg_failed or airsync_failed)
         # v1.8.0：企微失败不推进基线/连败，仅参与失败通知判定（有独立 webhook 兜底）
-        notify_failed = any_failed or wxwork_failed
+        notify_failed = any_failed or wxwork_failed or agent_failed
 
         # 连续失败计数：发送/写入全部成功则清零；任一失败则累加并记录当前失败文件。
         # 从「未暂停」刚达到阈值（fail_streak 从 <N 升到 >=N）的边沿只发一次暂停信号，
@@ -687,7 +718,7 @@ class MonitorWorker(QThread):
 
     def _send_merged(self, person: str, text, files, task: MonitorTask,
                      prefix: str, text_first: bool = False,
-                     row_count: int = 0) -> None:
+                     row_count: int = 0, sender=None) -> None:
         """合并推送：文字/图片/附件一次粘贴 + 一次 Enter（v1.5.0 批处理合并约束）。
 
         - text+files → send_text_and_files（两步粘贴：文字/文件先后由 text_first 决定）
@@ -696,7 +727,7 @@ class MonitorWorker(QThread):
         发送返回 False 视为失败（抛异常由调用方计入 msg_failed）。
         row_count = 本轮推送条数，用于 @ 的条数阈值条件（大于/小于/等于…）。
         """
-        sender = WeChatSender.shared_instance()
+        sender = sender or WeChatSender.shared_instance()
         # 群聊 @（随本条监控任务配置走）：@ 开关 + @目标 + 本轮条数条件都满足才 @
         at_kwargs = {}
         if should_mention(task, row_count):
@@ -758,6 +789,55 @@ class MonitorWorker(QThread):
             self.emit(f"{prefix} → 「{person}」已发送{len(names)}个文件")
         else:
             self.emit(f"{prefix} → 「{person}」已发送文字")
+
+    def _send_agent_api(self, task: MonitorTask, text, files, prefix: str,
+                        row_count: int = 0):
+        """Agent WeChat API 额外渠道：逐接收人发送本轮同一份内容。
+
+        连接信息取全局设置；发送复用 _send_merged（含 @ 条数条件与合并顺序）。
+        返回 (成功人数, 失败人数)。
+        """
+        from .agent_wechat import AgentWeChatClient, AgentWeChatSender
+        from .config_manager import ConfigManager
+
+        settings = ConfigManager().load_global_settings()
+        base = str(settings.get("agent_api_base_url", "") or "")
+        token = str(settings.get("agent_api_token", "") or "")
+        account = str(settings.get("agent_api_account", "") or "")
+        if not base.strip() and not token.strip():
+            self.emit(
+                f"{prefix} 任务「{task.name}」未配置 Agent WeChat API，跳过该渠道")
+            return 0, len(task.recipients)
+        sender = AgentWeChatSender(
+            AgentWeChatClient(
+                base, token, account, log=lambda m: self.emit(m)),
+            log=lambda m: self.emit(m),
+        )
+        if not sender.initialize():
+            return 0, len(task.recipients)
+        _, text_first = self._resolve_send_order(task, None, None)
+        delivered = 0
+        failed = 0
+        total = max(1, len(task.recipients))
+        for person in task.recipients:
+            if self._stop:
+                failed += len(task.recipients) - delivered - failed
+                break
+            if not str(person or "").strip():
+                continue
+            try:
+                self._send_merged(
+                    person, text, files, task, prefix,
+                    text_first=text_first, row_count=row_count,
+                    sender=sender,
+                )
+                delivered += 1
+            except Exception as exc:
+                failed += 1
+                logger.exception("Agent API 推送失败 %s", person)
+                self.emit(f"{prefix} → 「{person}」Agent API 推送失败: {exc}")
+            self.task_progress.emit(task.name, delivered + failed, total)
+        return delivered, failed
 
     def _send_wecom(self, task: MonitorTask, texts, png_path, out_file,
                     source_fp: str, prefix: str):

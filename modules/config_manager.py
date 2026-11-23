@@ -178,6 +178,8 @@ class ConfigManager:
                     if str(send.get("at_attach", "text") or "text")
                     in ("text", "first") else "text"
                 ),
+                # 通过 Agent WeChat API 通道发送（随本配置走；连接信息在全局设置）
+                "agent_api": bool(send.get("agent_api", False)),
             },
             "filter_conditions": filter_conditions,
             "recipient_mapping": recipient_mapping,
@@ -351,6 +353,35 @@ class ConfigManager:
             idle_minutes = 10
         idle_minutes = max(1, min(120, idle_minutes))
 
+        # Agent WeChat 掉线探测：默认间隔 3 分钟（1~60 可调）；
+        # 仅在已配置 Token 时默认开启，避免未配置用户启动即报警。
+        try:
+            watch_minutes = int(raw.get("agent_api_watch_interval_min", 3))
+        except (TypeError, ValueError):
+            watch_minutes = 3
+        watch_minutes = max(1, min(60, watch_minutes))
+        watch_default = bool(str(raw.get("agent_api_token", "") or "").strip())
+
+        # Agent 专属拟人节奏：仅作用于 Agent WeChat API 通道，与全局拟人节流独立
+        ar = raw.get("agent_api_rhythm") or {}
+        if not isinstance(ar, dict):
+            ar = {}
+
+        def _ar_pair(name: str, dmin: float, dmax: float):
+            try:
+                lo = float(ar.get(f"{name}_min", dmin))
+                hi = float(ar.get(f"{name}_max", dmax))
+            except (TypeError, ValueError):
+                lo, hi = dmin, dmax
+            lo = max(0.0, min(600.0, lo))
+            hi = max(0.0, min(600.0, hi))
+            if hi < lo:
+                lo, hi = hi, lo
+            return round(lo, 1), round(hi, 1)
+
+        ar_msg = _ar_pair("msg", 2.0, 5.0)
+        ar_person = _ar_pair("person", 3.0, 8.0)
+
         return {
             "_version": 1,
             "rhythm": {
@@ -372,6 +403,27 @@ class ConfigManager:
             "manual_minimize_wechat": bool(
                 raw.get("manual_minimize_wechat", True)
             ),
+            # Agent WeChat HTTP API 通道（全局连接信息，任务级另有独立开关）
+            "agent_api_base_url": str(
+                raw.get("agent_api_base_url", "")
+                or "http://127.0.0.1:6174/v1"
+            ).strip(),
+            "agent_api_token": str(raw.get("agent_api_token", "") or ""),
+            "agent_api_account": str(
+                raw.get("agent_api_account", "") or ""
+            ).strip(),
+            # 掉线探测（全局）：服务/微信离线时弹常驻卡片；只读请求，不发送消息
+            "agent_api_watch_enabled": bool(
+                raw.get("agent_api_watch_enabled", watch_default)
+            ),
+            "agent_api_watch_interval_min": watch_minutes,
+            "agent_api_rhythm": {
+                "enabled": bool(ar.get("enabled", False)),
+                "msg_min": ar_msg[0],
+                "msg_max": ar_msg[1],
+                "person_min": ar_person[0],
+                "person_max": ar_person[1],
+            },
         }
 
     def load_global_settings(self):

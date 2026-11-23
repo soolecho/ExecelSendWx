@@ -77,6 +77,8 @@ class ScheduleTask:
     at_members: str = ""
     at_all: bool = False
     at_attach: str = "text"
+    # 是否通过 Agent WeChat API 通道发送（连接信息在全局设置，任务级独立开关）
+    agent_api: bool = False
     # 任务类型：message=发送纯文字/附件消息；profiles=顺序执行一个或多个表格配置文件
     kind: str = "message"
     # kind=profiles 时：配置文件（.json）绝对路径列表，按列表顺序串行执行
@@ -181,6 +183,7 @@ class ScheduleTask:
             at_all=bool(data.get("at_all", False)),
             at_attach=("first" if str(data.get("at_attach", "text")) == "first"
                        else "text"),
+            agent_api=bool(data.get("agent_api", False)),
             kind=kind,
             profile_paths=profile_paths,
             fired_log=_normalize_fired_log(data.get("fired_log")),
