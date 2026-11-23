@@ -5118,7 +5118,7 @@ class ToastNotification(QFrame):
     def show_toast(cls, title: str, message: str, *,
                     success: bool = True, duration: int = 8000,
                     parent=None, on_click=None, running: bool = False,
-                    total: int = 0):
+                    total: int = 0, role: str = "task"):
         """弹出通知窗口；``running=True`` 时创建可更新的任务进度卡片。"""
         try:
             # 有发送失败的通知常驻，必须手动关闭；运行卡片在结束前也常驻
@@ -5126,7 +5126,7 @@ class ToastNotification(QFrame):
                 duration = 0
             toast = cls(title, message, success=success,
                         duration=duration, parent=parent, on_click=on_click,
-                        running=running, total=total)
+                        running=running, total=total, role=role)
             cls._active_instances.append(toast)
             toast.destroyed.connect(
                 lambda *_: cls._active_instances.remove(toast)
@@ -5162,12 +5162,37 @@ class ToastNotification(QFrame):
             logger.exception("[Toast] show_toast 失败 title=%s", title)
 
     @classmethod
-    def show_progress(cls, title: str, total: int = 0, parent=None):
+    def show_progress(cls, title: str, total: int = 0, parent=None,
+                      role: str = "task"):
         """在右下角创建运行中卡片，不抢微信的鼠标、键盘或前台焦点。"""
         return cls.show_toast(
             title, "正在准备任务…", duration=0, parent=parent,
-            running=True, total=total,
+            running=True, total=total, role=role,
         )
+
+    @classmethod
+    def running_cards(cls, exclude=None):
+        """返回当前仍在运行且可见的任务卡片（可按实例排除）。"""
+        out = []
+        for toast in cls._active_instances:
+            try:
+                if toast is exclude or not toast.isVisible():
+                    continue
+                if getattr(toast, "_running", False):
+                    out.append(toast)
+            except RuntimeError:
+                continue
+        return out
+
+    @classmethod
+    def _reposition_all(cls) -> None:
+        """有卡片关闭后把其余卡片重新贴回右下角，避免底部留出空档。"""
+        for toast in list(cls._active_instances):
+            try:
+                if toast.isVisible():
+                    toast._reposition()
+            except RuntimeError:
+                continue
 
     @classmethod
     def finish_progress(cls, toast, title: str, message: str, *,
@@ -5195,7 +5220,7 @@ class ToastNotification(QFrame):
     def __init__(self, title: str, message: str, *,
                  success: bool = True, duration: int = 8000,
                  parent=None, on_click=None, running: bool = False,
-                 total: int = 0):
+                 total: int = 0, role: str = "task"):
         # parent 用于点击时把主窗口带到前台；不强设为 Qt 父对象，避免窗口嵌入
         self._main_window = parent
         # 自定义点击回调（如“发现新版本”点击后打开更新对话框）
@@ -5217,6 +5242,7 @@ class ToastNotification(QFrame):
         self._duration = duration
         self._closing = False
         self._running = bool(running)
+        self._role = str(role or "task")
         self._recent_logs = []
         self._dark = self._is_dark_mode()
 
@@ -5359,6 +5385,8 @@ class ToastNotification(QFrame):
                 continue
         x = geo.x() + geo.width() - self.width() - 16
         y = geo.y() + geo.height() - self.height() - offset_y
+        # 卡片过多时不要顶出屏幕外，至少保证整张卡片可见
+        y = max(geo.y() + 8, y)
         self.move(x, y)
 
     def _log_height(self) -> int:
@@ -5506,6 +5534,11 @@ class ToastNotification(QFrame):
             self._reposition()
         except RuntimeError:
             pass
+
+    def closeEvent(self, event):
+        super().closeEvent(event)
+        # 本卡片关掉后，其余卡片重新贴回右下角（否则会留下悬空的位置）
+        QTimer.singleShot(0, ToastNotification._reposition_all)
 
     def _find_main_window(self):
         """找到主窗口：优先 parent，其次顶层 MainWindow。"""
@@ -8840,8 +8873,14 @@ class MonitorTab(QWidget):
         worker.progress_toast = None
         if not self.progress_toast_enabled:
             return
+        # 已有其他任务卡片（手动/定时/另一个轮询任务）在显示时不再叠加：
+        # 轮询频繁弹出会把用户正在看的任务卡片向上挤出屏幕。
+        # 轮询日志仍会写入底部运行日志坞，不会丢失。
+        if ToastNotification.running_cards():
+            return
         worker.progress_toast = ToastNotification.show_progress(
-            f"监控执行中：{task_name}", total=total, parent=self.window()
+            f"监控执行中：{task_name}", total=total, parent=self.window(),
+            role="monitor",
         )
 
     def _on_task_progress(self, task_name: str, current: int, total: int):
