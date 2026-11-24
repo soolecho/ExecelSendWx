@@ -1025,6 +1025,17 @@ class AgentWatchWorker(QThread):
             client = AgentWeChatClient(
                 self._base_url, self._token, self._account, timeout=6.0)
             ok, detail = client.probe_status()
+            if not ok and not self.isInterruptionRequested():
+                # 失败二次短时确认：网络抖动/服务瞬时忙时先复核一次，
+                # 复核通过就按在线处理，避免误弹掉线提醒；之后仍按原间隔检测。
+                time.sleep(4.0)
+                if self.isInterruptionRequested():
+                    return
+                ok2, detail2 = client.probe_status()
+                if ok2:
+                    ok, detail = True, f"{detail2}（首次探测失败，4 秒后复核通过）"
+                else:
+                    detail = f"{detail}；4 秒后复核仍失败：{detail2}"
         except Exception as exc:
             ok, detail = False, f"探测异常：{exc}"
         self.checked.emit(bool(ok), str(detail))
@@ -5700,6 +5711,10 @@ class ToastNotification(QFrame):
             status = text or "任务正在执行…"
         self._msg_label.setText(
             self._elide_label_text(self._msg_label, status))
+
+    def update_from_chain(self, _p_cur, _p_total, s_cur, s_total) -> None:
+        """配置链 worker 的 send_progress(当前链/总链/当前人/总人数) 直连入口。"""
+        self.update_progress(s_cur, s_total)
 
     def _rebuild_log_view(self) -> None:
         """在固定高度的日志框内自动换行显示最新日志。
@@ -12080,6 +12095,12 @@ class MainWindow(QMainWindow):
                 worker.log_signal.connect(toast.append_log)
             elif hasattr(worker, "signals"):
                 worker.signals.log.connect(toast.append_log)
+            # 进度直连卡片：主窗口中转槽若因门闩/归属判断丢弃更新，卡片仍能刷新；
+            # 日志与进度走同一套绑定方法连接，保证「日志有数字、进度条却是 0」不再出现。
+            if hasattr(worker, "send_progress"):
+                worker.send_progress.connect(toast.update_from_chain)
+            elif hasattr(worker, "progress"):
+                worker.progress.connect(toast.update_progress)
 
     def _attach_global_progress_table(self, worker):
         """数据发送 worker（进度信号为 0-100 百分比）。
