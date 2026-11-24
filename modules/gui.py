@@ -7837,7 +7837,8 @@ class MonitorTab(QWidget):
         self.text_title_edit = QPlainTextEdit()
         self.text_title_edit.setPlaceholderText(
             "留空 = 默认「监控新增提醒」 （支持回车多行）\n"
-            "支持占位符：{{date}} {{weekday}} {{time:H点}} {{time:HH点mm分}} 等"
+            "支持占位符：{{date}} {{weekday}} {{time:H点}} {{time:HH点mm分}} 等\n"
+            "表格字段去重：{{unique:小区}} → 全部小区去重后用「、」连接（也支持 {{去重:列名}}）"
         )
         self.text_title_edit.setFixedHeight(54)
         title_row.addWidget(self.text_title_edit, 1)
@@ -9538,6 +9539,36 @@ class GlobalSettingsTab(QWidget):
         ui_theme.apply_tone(tip, "muted", small=True)
         rl.addWidget(tip)
 
+        # ---------------- 群聊 @ 版式 ----------------
+        at_group = bar.add_section("💬 群聊 @ 版式", collapsed=True)
+        main_layout.addWidget(at_group)
+        al = at_group.contentLayout()
+
+        self.at_newline_check = QCheckBox(
+            "「跟随文字」时 @ 单独占一行（不与正文连在同一行）")
+        self.at_newline_check.setToolTip(
+            "只在「@位置 = 跟随文字」且 @ 与文字同一条消息时生效；\n"
+            "关闭则维持原样：@ 后面直接跟正文。"
+        )
+        al.addWidget(self.at_newline_check)
+
+        at_row = QHBoxLayout()
+        at_row.addWidget(QLabel("跟随文字时 @ 位置："))
+        self.at_pos_combo = QComboBox()
+        self.at_pos_combo.addItem("文字开头", "start")
+        self.at_pos_combo.addItem("文字末尾", "end")
+        at_row.addWidget(self.at_pos_combo)
+        at_row.addStretch()
+        al.addLayout(at_row)
+
+        at_tip = QLabel(
+            "桌面微信通道：开头/末尾均生效；Agent WeChat API 通道由接口固定在\n"
+            "消息开头，只支持「单独一行」，末尾选项对 API 通道不生效。"
+        )
+        at_tip.setWordWrap(True)
+        ui_theme.apply_tone(at_tip, "muted", small=True)
+        al.addWidget(at_tip)
+
         # ---------------- 全量默认映射 ----------------
         map_group = bar.add_section("🔁 全量默认映射", collapsed=True)
         main_layout.addWidget(map_group)
@@ -9772,6 +9803,8 @@ class GlobalSettingsTab(QWidget):
         self.idle_standby_check.toggled.connect(self._on_debounced_change)
         self.idle_minutes_spin.valueChanged.connect(self._on_debounced_change)
         self.progress_toast_check.toggled.connect(self._on_immediate_change)
+        self.at_newline_check.toggled.connect(self._on_immediate_change)
+        self.at_pos_combo.currentIndexChanged.connect(self._on_immediate_change)
         self.agent_base_edit.editingFinished.connect(self._on_debounced_change)
         self.agent_token_edit.editingFinished.connect(self._on_debounced_change)
         self.agent_account_edit.editingFinished.connect(self._on_debounced_change)
@@ -9790,11 +9823,12 @@ class GlobalSettingsTab(QWidget):
 
         # 供手风琴 / 窗口弹性与左侧导航统一遍历
         self._collapsible_groups = [
-            theme_group, rhythm_group, map_group, notification_group,
+            theme_group, rhythm_group, at_group, map_group, notification_group,
             agent_group, standby_group
         ]
         self.theme_group = theme_group
         self.rhythm_group = rhythm_group
+        self.at_group = at_group
         self.map_group = map_group
         self.notification_group = notification_group
         self.agent_group = agent_group
@@ -9802,6 +9836,7 @@ class GlobalSettingsTab(QWidget):
         self.nav_sections = [
             ("theme", "外观主题", [theme_group]),
             ("rhythm", "拟人节流", [rhythm_group]),
+            ("at_layout", "群聊 @", [at_group]),
             ("mapping", "全量映射", [map_group]),
             ("notification", "任务通知", [notification_group]),
             ("agent_api", "Agent WeChat", [agent_group]),
@@ -9811,6 +9846,7 @@ class GlobalSettingsTab(QWidget):
         self.section_spec = [
             ("⚙ 设置", [("theme", "外观主题"),
                         ("rhythm", "拟人节流"),
+                        ("at_layout", "群聊 @"),
                         ("mapping", "全量映射"),
                         ("notification", "任务通知"),
                         ("agent_api", "Agent WeChat"),
@@ -9882,6 +9918,14 @@ class GlobalSettingsTab(QWidget):
         self.progress_toast_check.setChecked(
             bool(self.settings.get("progress_toast_enabled", True))
         )
+
+        # 群聊 @ 版式：单独一行 + 开头/末尾
+        self.at_newline_check.setChecked(
+            bool(self.settings.get("at_newline", False))
+        )
+        _at_pos = str(self.settings.get("at_position", "start") or "start")
+        _at_idx = self.at_pos_combo.findData(_at_pos)
+        self.at_pos_combo.setCurrentIndex(_at_idx if _at_idx >= 0 else 0)
 
         # Agent WeChat API 连接信息（全局唯一，供各任务勾选后复用）
         self.agent_base_edit.setText(
@@ -10179,6 +10223,9 @@ class GlobalSettingsTab(QWidget):
                 "idle_minutes": int(self.idle_minutes_spin.value()),
             },
             "progress_toast_enabled": self.progress_toast_check.isChecked(),
+            # 群聊 @ 版式：@ 与文字同一条时是否单独一行、放开头还是末尾
+            "at_newline": self.at_newline_check.isChecked(),
+            "at_position": str(self.at_pos_combo.currentData() or "start"),
             # Agent WeChat API 全局连接信息（各任务的独立开关在其自身配置里）
             "agent_api_base_url": self.agent_base_edit.text().strip(),
             "agent_api_token": self.agent_token_edit.text(),
@@ -10491,7 +10538,10 @@ class MainWindow(QMainWindow):
             self._apply_standby_idle_settings)
         self.global_settings_tab.settings_changed.connect(
             self._apply_progress_card_settings)
+        self.global_settings_tab.settings_changed.connect(
+            self._apply_at_layout_settings)
         self._apply_standby_idle_settings()
+        self._apply_at_layout_settings()
 
         # ---- Agent WeChat 服务/微信掉线探测（只读，不发消息）----
         self._agent_watch_timer = QTimer(self)
@@ -11821,6 +11871,18 @@ class MainWindow(QMainWindow):
             self.monitor_tab.progress_toast_enabled = enabled
         except Exception:
             pass
+
+    def _apply_at_layout_settings(self):
+        """把「群聊 @ 版式」同步到桌面微信桥接与 Agent 通道（即时生效）。"""
+        try:
+            settings = self.config_manager.load_global_settings()
+            newline = bool(settings.get("at_newline", False))
+            position = str(settings.get("at_position", "start") or "start")
+            from modules import uia_bridge, agent_wechat
+            uia_bridge.set_at_layout(newline, position)
+            agent_wechat.set_at_layout(newline, position)
+        except Exception as exc:
+            logger.warning(f"应用群聊 @ 版式失败: {exc}")
 
     # ---------------- Agent WeChat 掉线探测 ----------------
     def _apply_agent_watch_settings(self):

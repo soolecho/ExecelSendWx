@@ -492,6 +492,29 @@ def _side_pen(side, theme):
     return width, dash, rgb
 
 
+def _opaque_rgb(color, theme):
+    """解析颜色并过滤「完全透明」的 ARGB（alpha=00，openpyxl 常见 00000000）。
+
+    条件格式的差分样式里，未使用的颜色通道常写成 00000000；
+    若直接当黑色使用，会把无填充的单元格刷成黑底。
+    注意：_resolve_rgb 会丢掉 alpha，所以这里要先检查原始 ARGB。
+    """
+    if color is None:
+        return None
+    raw = ""
+    if isinstance(color, str):
+        raw = color.strip()
+    else:
+        try:
+            if getattr(color, "type", None) == "rgb":
+                raw = str(getattr(color, "rgb", None) or "").strip()
+        except Exception:
+            raw = ""
+    if len(raw) == 8 and raw[:2].upper() == "00":
+        return None
+    return _resolve_rgb(color, theme)
+
+
 def _fill_rgb(cell, theme):
     fill = getattr(cell, "fill", None)
     if fill is None:
@@ -502,11 +525,14 @@ def _fill_rgb(cell, theme):
         stops = getattr(fill, "stop", None)
         if stops:
             try:
-                return _resolve_rgb(stops[0].color, theme)
+                return _opaque_rgb(stops[0].color, theme)
             except Exception:
                 return None
         return None
-    return _resolve_rgb(getattr(fill, "fgColor", None), theme)
+    # 实心填充一般用 fgColor；部分 WPS 文件把可见色写在 bgColor，
+    # 因此两处都取「不透明」的那个，避免把透明色当黑色。
+    return (_opaque_rgb(getattr(fill, "fgColor", None), theme)
+            or _opaque_rgb(getattr(fill, "bgColor", None), theme))
 
 
 # ============================== 条件格式 ==============================
@@ -546,13 +572,20 @@ def _formula_value(ws, formula):
 
 
 def _dxf_fill_rgb(fill, theme):
-    """差分样式（条件格式）的填充色：Excel 常写在 bgColor 上。"""
+    """差分样式（条件格式）的填充色：只在确有填充图案时取不透明颜色。
+
+    Excel/WPS 的条件格式 dxf 可能只设置字体颜色，fill 仍带一个空的
+    patternFill（fg/bg 为 00000000）。若不校验 patternType，会把文字颜色
+    规则误渲染成黑底。
+    """
     if fill is None:
         return None
-    rgb = _resolve_rgb(getattr(fill, "bgColor", None), theme)
-    if not rgb:
-        rgb = _resolve_rgb(getattr(fill, "fgColor", None), theme)
-    return rgb
+    pattern = getattr(fill, "patternType", None) or getattr(fill, "fill_type", None)
+    if not pattern or str(pattern).lower() in ("none", "gray125"):
+        return None
+    # 不同文件把可见填充色写在 bgColor 或 fgColor，取第一个不透明的
+    return (_opaque_rgb(getattr(fill, "bgColor", None), theme)
+            or _opaque_rgb(getattr(fill, "fgColor", None), theme))
 
 
 def _dxf_style(dxf, theme):

@@ -403,6 +403,15 @@ class ConfigManager:
             "manual_minimize_wechat": bool(
                 raw.get("manual_minimize_wechat", True)
             ),
+            # 群聊 @ 版式（@ 跟随文字同一条消息时）：是否让 @ 单独占一行；
+            # at_position：start=@ 在文字前（默认），end=@ 在文字后
+            "at_newline": bool(raw.get("at_newline", False)),
+            "at_position": (
+                "end"
+                if str(raw.get("at_position", "start") or "start").strip().lower()
+                == "end"
+                else "start"
+            ),
             # Agent WeChat HTTP API 通道（全局连接信息，任务级另有独立开关）
             "agent_api_base_url": str(
                 raw.get("agent_api_base_url", "")

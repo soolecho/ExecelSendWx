@@ -12,6 +12,7 @@
 import glob
 import logging
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -57,6 +58,74 @@ def _render_placeholders(text: str) -> str:
     except Exception as exc:
         logger.warning("监控文案占位符渲染失败（保留原文）: %s", exc)
         return text
+
+
+# 表格字段去重占位符：{{unique:小区}} / {{去重:小区}} / {{uniq:小区}}
+_TABLE_UNIQUE_RE = re.compile(
+    r"\{\{\s*(?:unique|uniq|去重)\s*[:：]\s*([^{}]+?)\s*\}\}", re.IGNORECASE)
+
+
+def _find_column(headers, name: str):
+    """按列名查找下标：先全等（去首尾空格），再忽略大小写。"""
+    target = str(name or "").strip()
+    if not target:
+        return None
+    norm = [str(h).strip() for h in headers]
+    if target in norm:
+        return norm.index(target)
+    low = target.lower()
+    for idx, head in enumerate(norm):
+        if head.lower() == low:
+            return idx
+    return None
+
+
+def _unique_column_values(headers, rows, name: str):
+    """取某列的去重值（保持首次出现顺序，忽略空值）；列不存在返回 None。"""
+    idx = _find_column(headers, name)
+    if idx is None:
+        return None
+    seen = set()
+    values = []
+    for row in rows or []:
+        if idx >= len(row):
+            continue
+        value = str(row[idx]).strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        values.append(value)
+    return values
+
+
+def _render_table_placeholders(text: str, headers, rows,
+                               fallback_headers=None, fallback_rows=None,
+                               log_fn=None) -> str:
+    """渲染表格字段占位符：把 {{unique:列名}} 替换为该列去重值（顿号连接）。
+
+    优先在「提取后的表格」里找列；找不到再回退到清洗后的完整数据，
+    这样即使该列没被勾选为提取列，也能用于标题汇总。
+    列不存在时保留原占位符并记录日志，不影响本轮推送。
+    """
+    if not text or "{{" not in text:
+        return text
+
+    def _replace(match):
+        name = match.group(1).strip()
+        values = _unique_column_values(headers, rows, name)
+        used = "提取表"
+        if values is None and fallback_headers is not None:
+            values = _unique_column_values(fallback_headers, fallback_rows, name)
+            used = "数据表"
+        if values is None:
+            if log_fn:
+                log_fn(f"⚠ 自定义信息列「{name}」不存在，占位符保留原样")
+            return match.group(0)
+        if log_fn and used == "数据表":
+            logger.info("自定义信息列「%s」不在提取列中，已从清洗后的数据表取值", name)
+        return "、".join(values)
+
+    return _TABLE_UNIQUE_RE.sub(_replace, text)
 
 
 def _render_snapshot_image(snapshot_headers, snapshot_rows, snapshot_spec, tmp):
@@ -378,9 +447,14 @@ class MonitorWorker(QThread):
         png_path: Optional[str] = None
         out_file: Optional[str] = None
         if task.send_text:
+            # 先替换表格字段占位符（如 {{unique:小区}}），再渲染时间/天气等占位符
+            title = _render_table_placeholders(
+                task.text_title, view_headers, view_rows,
+                fallback_headers=headers, fallback_rows=clean_rows,
+                log_fn=self.emit)
             texts.append(monitor_engine.render_rows_text(
                 view_headers, view_rows,
-                title=_render_placeholders(task.text_title),
+                title=_render_placeholders(title),
                 show_detail=task.text_detail,
             ))
         if task.send_image:

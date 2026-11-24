@@ -28,6 +28,17 @@ _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 _SUCCESS_STATES = {"accepted", "sent", "delivered", "succeeded", "completed", "done"}
 _FAILURE_STATES = {"failed", "rejected", "error", "cancelled", "canceled"}
 
+# 群聊 @ 版式（与 uia_bridge 同步，由全量设置注入）。
+# Agent 接口把 mentions 渲染在正文前，这里只支持「@ 单独一行」；
+# 开头/末尾位置由接口固定为开头，position 参数仅作调用兼容。
+_AT_NEWLINE = False
+
+
+def set_at_layout(newline: bool = False, position: str = "start") -> None:
+    """设置 Agent 通道的 @ 版式（进程内全局）。"""
+    global _AT_NEWLINE
+    _AT_NEWLINE = bool(newline)
+
 
 class AgentWeChatError(RuntimeError):
     """API 调用失败（网络/鉴权/业务错误）。"""
@@ -401,9 +412,12 @@ class AgentWeChatClient:
         ext = os.path.splitext(file_path)[1].lower()
         kind = "image" if ext in _IMAGE_EXTS else "file"
         source = self.upload(file_path)
+        body = {"threadId": thread_id, "kind": kind, "sourceId": source}
+        if kind == "image":
+            # 官方默认会压缩图片；显式要求原图，避免大图/表格截图发糊
+            body["imageQuality"] = "original"
         send = self._request(
-            "POST", self._api("/sends"),
-            {"threadId": thread_id, "kind": kind, "sourceId": source},
+            "POST", self._api("/sends"), body,
             headers={"Idempotency-Key": uuid.uuid4().hex}, timeout=600)
         if isinstance(send, dict) and send.get("jobId"):
             # 附件任务：提交成功后交给守护进程继续，不阻塞整批发送
@@ -602,8 +616,13 @@ class AgentWeChatSender:
             if not self._wait_before_action(stop_event):
                 self.log("⏹ 拟人等待中被停止")
                 return False
+            mentions = self._mentions(at_members, at_all)
+            body_text = str(text)
+            if mentions and _AT_NEWLINE:
+                # 接口把 @ chip 渲染在正文前，补一个换行让正文另起一行
+                body_text = "\n" + body_text
             ok = self.client.send_text(
-                self._thread_id, str(text), self._mentions(at_members, at_all))
+                self._thread_id, body_text, mentions)
             if ok:
                 self._after_action_done()
             return ok
