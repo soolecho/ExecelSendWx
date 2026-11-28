@@ -6,6 +6,7 @@ import logging
 import re
 import threading
 import time
+from collections import deque
 from typing import List, Optional, Set, Dict, Tuple, Any
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -75,6 +76,7 @@ from modules.updater import (
 )
 from modules import ui_theme
 from modules import ui_shell
+from modules.web_server import WebActions, WebBridge, WebService
 
 
 # gui 模块自己的日志（Toast、定时触发/完成、跨线程信号等关键路径均需可追溯）
@@ -3228,24 +3230,32 @@ class TableFilterTab(QWidget):
         elif chosen == act_edit:
             self.edit_recent_config(item)
 
-    def _can_load_config(self):
+    def _can_load_config(self, silent=False):
         if self.excel_worker and self.excel_worker.isRunning():
+            if silent:
+                self.log("配置加载失败：Excel 正在读取，请稍候")
+                return False
             QMessageBox.warning(self, "请稍候", "Excel 正在读取，暂时不能加载配置")
             return False
         if self.worker and self.worker.isRunning():
+            if silent:
+                self.log("配置加载失败：正在发送消息，请稍候")
+                return False
             QMessageBox.warning(self, "请稍候", "正在发送消息，暂时不能加载配置")
             return False
         return True
 
-    def _load_config_file(self, config_path, *, trigger_auto_send=True):
-        if not self._can_load_config():
+    def _load_config_file(self, config_path, *, trigger_auto_send=True,
+                          force_auto_send=False, silent=False):
+        if not self._can_load_config(silent=silent):
             return False
 
         try:
             profile = self.config_manager.load_profile(config_path)
         except ConfigError as error:
-            QMessageBox.warning(self, "加载失败", str(error))
             self.log(f"✗ 配置加载失败: {error}")
+            if not silent:
+                QMessageBox.warning(self, "加载失败", str(error))
             return False
 
         excel_settings = profile["excel"]
@@ -3267,7 +3277,9 @@ class TableFilterTab(QWidget):
         if source == "wps_cloud":
             file_token = excel_settings.get("cloud_file_id", "").strip()
             if not file_token:
-                QMessageBox.warning(self, "加载失败", "该配置缺少云文档 ID")
+                self.log("✗ 配置加载失败：该配置缺少云文档 ID")
+                if not silent:
+                    QMessageBox.warning(self, "加载失败", "该配置缺少云文档 ID")
                 return False
             file_name = excel_settings.get("cloud_file_name", "")
             self._set_data_source("wps_cloud", refresh=False)
@@ -3278,15 +3290,22 @@ class TableFilterTab(QWidget):
                 "profile": profile,
                 "excel_path": f"wps-cloud://{file_token}",
                 "suppress_auto_send": not trigger_auto_send,
+                "force_auto_send": bool(force_auto_send),
+                "silent": bool(silent),
             }
             sheet_name = excel_settings.get("sheet") or None
-            if not self._load_cloud_data(file_token, file_name, sheet_name):
+            if not self._load_cloud_data(file_token, file_name, sheet_name,
+                                         silent=silent):
                 self.pending_config = None
                 return False
             return True
 
         excel_path = excel_settings["path"]
         if not os.path.isfile(excel_path):
+            if silent:
+                self.log(
+                    f"✗ 配置加载失败：Excel 文件不存在，请先在电脑端重新定位: {excel_path}")
+                return False
             QMessageBox.warning(
                 self,
                 "Excel 文件不存在",
@@ -3307,6 +3326,8 @@ class TableFilterTab(QWidget):
             "profile": profile,
             "excel_path": os.path.abspath(excel_path),
             "suppress_auto_send": not trigger_auto_send,
+            "force_auto_send": bool(force_auto_send),
+            "silent": bool(silent),
         }
         sheet_name = excel_settings.get("sheet") or None
         if not self._load_excel_data(excel_path, sheet_name):
@@ -3330,6 +3351,9 @@ class TableFilterTab(QWidget):
         # 编辑模式加载时抑制本次 auto_send（标志随 pending_config 同生命周期）
         suppress_auto_send = bool(
             self.pending_config.get("suppress_auto_send", False))
+        force_auto_send = bool(
+            self.pending_config.get("force_auto_send", False))
+        silent = bool(self.pending_config.get("silent", False))
         self.pending_config = None
         excel_settings = profile["excel"]
         send_settings = profile["send"]
@@ -3552,24 +3576,28 @@ class TableFilterTab(QWidget):
             self.apply_filter()
 
         if missing_settings:
-            QMessageBox.warning(
-                self,
-                "配置部分失效",
-                "\n".join(missing_settings),
-            )
+            if silent:
+                self.log("⚠ 配置部分失效：" + "；".join(missing_settings))
+            else:
+                QMessageBox.warning(
+                    self,
+                    "配置部分失效",
+                    "\n".join(missing_settings),
+                )
 
         # auto_send：配置要求加载后自动全选筛选人员并直接发送。
         # 延迟到本轮 UI 处理完成后再执行，确保列表已渲染、弹窗已关闭。
         # 编辑模式加载（suppress_auto_send）只把配置还原到界面供修改，不触发发送。
-        if can_load_data and bool(send_settings.get("auto_send", False)) \
-                and suppress_auto_send:
+        want_send = (
+            bool(send_settings.get("auto_send", False)) or force_auto_send
+        )
+        if can_load_data and want_send and suppress_auto_send:
             self.log(
                 "⚙ 该配置勾选了「加载后自动发送」，当前为编辑模式，已跳过"
                 "自动发送；修改后请点「保存配置」"
             )
 
-        if can_load_data and bool(send_settings.get("auto_send", False)) \
-                and not suppress_auto_send:
+        if can_load_data and want_send and not suppress_auto_send:
             def _auto_start_send():
                 try:
                     if not self.processor:
@@ -4531,15 +4559,18 @@ class TableFilterTab(QWidget):
         self.pending_config = None
         self._load_cloud_data(file_token, self.cloud_file_name)
 
-    def _load_cloud_data(self, file_token, file_name="", sheet_name=None):
+    def _load_cloud_data(self, file_token, file_name="", sheet_name=None,
+                         silent=False):
         if self.excel_worker and self.excel_worker.isRunning():
             self.log("文件正在读取，已忽略重复请求")
             return False
         if not self.wps_store.is_configured():
-            QMessageBox.warning(
-                self, "未配置凭证",
-                "请先点击“Cookie 凭证设置”粘贴浏览器里的 wps_sid",
-            )
+            self.log("✗ 云文档读取失败：未配置金山登录凭证")
+            if not silent:
+                QMessageBox.warning(
+                    self, "未配置凭证",
+                    "请先点击“Cookie 凭证设置”粘贴浏览器里的 wps_sid",
+                )
             return False
 
         self.cloud_file_id = file_token
@@ -4693,6 +4724,13 @@ class TableFilterTab(QWidget):
             self.sheet_combo.blockSignals(True)
             self.sheet_combo.setCurrentText(self.current_sheet)
             self.sheet_combo.blockSignals(False)
+        silent = bool(
+            self.pending_config and self.pending_config.get("silent"))
+        if silent:
+            # 网页触发的加载：不弹模态框，只写日志
+            self.pending_config = None
+            self.log(f"✗ 配置加载失败：读取表格出错: {error}")
+            return
         QMessageBox.warning(self, "读取失败", error)
     
     def on_excel_read_finished(self, worker):
@@ -4943,6 +4981,201 @@ class TableFilterTab(QWidget):
             "mtime": mtime,
         }
 
+    def web_run_profile(self, config_path, trigger_auto_send=True, silent=True):
+        """网页触发执行电脑端「数据发送 → 最近配置」里保存的配置。
+
+        trigger_auto_send=True：按配置立即发送（即使配置里的「加载后自动发送」
+        未勾选，也强制触发一次）；False：只载入到界面供编辑，不发送。
+        全程不弹模态框，失败原因写入运行日志。
+        """
+        path = os.path.abspath(str(config_path or ""))
+        if not path or not os.path.isfile(path):
+            return {"ok": False, "error": "配置文件不存在或已被移动"}
+        if self.worker is not None:
+            try:
+                if self.worker.isRunning():
+                    return {"ok": False, "error": "busy",
+                            "message": "电脑端正在发送，请稍后再试"}
+            except Exception:
+                pass
+        mw = self.window()
+        if mw is not None and hasattr(mw, "_is_other_send_running"):
+            try:
+                if mw._is_other_send_running(exclude=self.worker):
+                    return {"ok": False, "error": "busy",
+                            "message": "微信正在执行其他发送任务，请稍后再试"}
+            except Exception:
+                pass
+        if self.excel_worker and self.excel_worker.isRunning():
+            return {"ok": False, "error": "busy",
+                    "message": "表格正在读取，请稍后再试"}
+        ok = self._load_config_file(
+            path,
+            trigger_auto_send=bool(trigger_auto_send),
+            force_auto_send=bool(trigger_auto_send),
+            silent=bool(silent),
+        )
+        if not ok:
+            return {"ok": False, "error": "加载配置失败，请查看运行日志"}
+        return {
+            "ok": True,
+            "message": ("正在加载配置并发送" if trigger_auto_send
+                        else "已载入配置（编辑模式，未发送）"),
+        }
+
+    def web_send(self, opts, grid, file_path):
+        """网页端手动发送入口（只在主线程调用）。
+
+        用网页上传/预览得到的二维数据直接装配发送状态，复用桌面端同一套
+        ``send_data(auto=True)`` 流程（映射、接收人、区域截图、附件、@、通道、
+        并发互斥全部一致），不弹任何模态框。返回 dict：
+        ``{"ok":True,"worker":...,"total":N}`` 或 ``{"ok":False,"error":...}``。
+        """
+        # 并发守卫：与桌面手动发送 / 定时任务共用微信单例
+        if self.worker is not None:
+            try:
+                if self.worker.isRunning():
+                    return {"ok": False, "error": "busy",
+                            "message": "电脑端正在发送，请稍后再试"}
+            except Exception:
+                pass
+        mw = self.window()
+        if mw is not None and hasattr(mw, "_is_other_send_running"):
+            try:
+                if mw._is_other_send_running(exclude=self.worker):
+                    return {"ok": False, "error": "busy",
+                            "message": "微信正在执行其他发送任务，请稍后再试"}
+            except Exception:
+                pass
+        if not grid:
+            return {"ok": False, "error": "表格内容为空"}
+
+        try:
+            header_row = int(opts.get("header_row", 1) or 1)
+        except (TypeError, ValueError):
+            header_row = 1
+
+        self._loading_profile = True
+        try:
+            # 数据源状态（区域截图按本地临时文件渲染原表样式）
+            self.current_excel_path = file_path
+            self.data_source = "local"
+            self.cloud_file_id = ""
+            self.current_sheet = str(opts.get("sheet", "") or "")
+            self.table_data = grid
+            self._apply_header_row(header_row)
+            # 按新表头重建列下拉（否则开始发送时人名下拉还停留在旧表头）
+            self._update_column_combos()
+            headers = list(self.headers or [])
+            name_column = str(opts.get("name_column", "") or "").strip()
+            if not name_column or name_column not in headers:
+                name_column = headers[0] if headers else ""
+            extract_columns = [
+                str(c) for c in (opts.get("extract_columns") or [])
+                if str(c) in headers
+            ]
+            if not extract_columns:
+                extract_columns = [h for h in headers if h]
+
+            self.name_column_combo.blockSignals(True)
+            try:
+                idx = self.name_column_combo.findText(name_column)
+                if idx < 0 and headers:
+                    idx = 0
+                if idx >= 0:
+                    self.name_column_combo.setCurrentIndex(idx)
+            finally:
+                self.name_column_combo.blockSignals(False)
+
+            self.selected_columns = list(extract_columns)
+            self._update_selected_columns_label()
+            self.filter_conditions = []
+            self.wechat_mapping = {}
+            self.wechat_edit.setText("")
+            self.processor = TableProcessor(
+                self.table_data, header_row=max(1, header_row))
+            self.refresh_persons_list()
+
+            # 按网页勾选的人员选中；未勾选则全选
+            wanted = [str(n) for n in (opts.get("recipients") or []) if str(n)]
+            wanted_set = set(wanted)
+            self.persons_list.clearSelection()
+            selected_count = 0
+            missing = []
+            for i in range(self.persons_list.count()):
+                item = self.persons_list.item(i)
+                text = item.text()
+                if wanted_set and text not in wanted_set:
+                    continue
+                item.setSelected(True)
+                selected_count += 1
+            if wanted_set:
+                available = {self.persons_list.item(i).text()
+                             for i in range(self.persons_list.count())}
+                missing = [n for n in wanted if n not in available]
+            if selected_count == 0:
+                return {"ok": False, "error": "没有匹配的接收人",
+                        "message": "没有匹配的接收人，请检查人名所在列"}
+            if missing:
+                self.log(f"网页发送：以下人员不在当前筛选结果中，已跳过: {', '.join(missing)}")
+
+            # 发送内容与参数
+            send_order = [str(k) for k in (opts.get("send_order") or [])]
+            if not send_order:
+                send_order = ["text", "image"]
+            self._set_send_order(send_order)
+
+            custom_msg = str(opts.get("custom_msg", "") or "").strip()
+            self.custom_msg_checkbox.setChecked(bool(custom_msg))
+            self.custom_msg_edit.setPlainText(custom_msg)
+
+            region = opts.get("region") or {}
+            region_range = str(region.get("range", "") or "").strip()
+            region_sheet = str(region.get("sheet", "") or "").strip()
+            self.region_range_edit.setText(region_range)
+            ridx = self.region_sheet_combo.findData(region_sheet)
+            self.region_sheet_combo.setCurrentIndex(ridx if ridx >= 0 else 0)
+
+            attachment_path = str(opts.get("attachment_path", "") or "")
+            self.attachment_edit.setText(attachment_path)
+
+            at = opts.get("at") or {}
+            at_enabled = bool(at.get("enabled", False))
+            self.at_checkbox.setChecked(at_enabled)
+            self.at_members_edit.setText(str(at.get("members", "") or ""))
+            self.at_all_check.setChecked(bool(at.get("all", False)) and at_enabled)
+            midx = self.at_mode_combo.findData(
+                str(at.get("attach", "text") or "text"))
+            self.at_mode_combo.setCurrentIndex(midx if midx >= 0 else 0)
+
+            self.agent_api_check.setChecked(
+                str(opts.get("channel", "desktop")) == "agent")
+            try:
+                self.send_interval_spin.setValue(
+                    float(opts.get("send_interval", 0.5)))
+                self.chat_delay_spin.setValue(
+                    float(opts.get("chat_delay", 0.3)))
+            except (TypeError, ValueError):
+                pass
+        except Exception as exc:
+            logger.exception("网页发送参数装配失败")
+            return {"ok": False, "error": f"参数错误：{exc}"}
+        finally:
+            self._loading_profile = False
+
+        # 复用桌面发送流程（auto=True：不弹确认/结果模态框）
+        before = self.worker
+        self.send_data(auto=True)
+        worker = self.worker
+        if worker is None or worker is before:
+            return {"ok": False, "error": "发送任务未能启动",
+                    "message": "发送任务未能启动"}
+        try:
+            total = len(getattr(worker, "tasks", []) or [])
+        except Exception:
+            total = 0
+        return {"ok": True, "worker": worker, "total": total}
+
     def send_data(self, auto=False):
         # 并发守卫：手动发送/重试/auto_send 共用同一个微信单例，
         # 两个 worker 同时跑会争抢微信窗口、把消息发错对象。
@@ -4967,6 +5200,9 @@ class TableFilterTab(QWidget):
         
         extract_columns = self.selected_columns
         if not extract_columns:
+            if auto:
+                self.log("自动发送：未选择要提取的数据列，本次未发送")
+                return
             QMessageBox.warning(self, "警告", "请至少选择一列要提取的数据")
             return
         
@@ -5021,6 +5257,9 @@ class TableFilterTab(QWidget):
             or (k == "region" and not region_data)
         )]
         if not effective_order:
+            if auto:
+                self.log("自动发送：没有勾选任何实际可发送的内容，本次未发送")
+                return
             QMessageBox.warning(self, "警告", "请至少勾选一种要发送的内容（表格文字/表格图片/指定区域截图/自定义消息/附加文件）")
             return
         
@@ -5111,9 +5350,16 @@ class TableFilterTab(QWidget):
                 })
         
         if missing_wechat:
-            QMessageBox.warning(self, "警告", f"以下人员缺少微信接收人，已跳过:\n{', '.join(missing_wechat)}")
+            if auto:
+                self.log(
+                    f"自动发送：以下人员缺少微信接收人，已跳过: {', '.join(missing_wechat)}")
+            else:
+                QMessageBox.warning(self, "警告", f"以下人员缺少微信接收人，已跳过:\n{', '.join(missing_wechat)}")
         
         if not tasks:
+            if auto:
+                self.log("自动发送：没有可发送的任务，本次未发送")
+                return
             QMessageBox.warning(self, "警告", "没有可发送的任务")
             return
         
@@ -7403,31 +7649,38 @@ class ScheduleTab(QWidget):
 
         # 关键：worker 在子线程里调用 log_callback，不能直接碰 QWidget。
         # 这里把日志投递切回主线程，避免跨线程访问控件导致的偶发崩溃/挂起。
+        worker = self._build_schedule_worker(current, agent_source=task)
+        self._launch_worker(worker, current)
+
+    def _build_schedule_worker(self, current, agent_source=None):
+        """按任务配置创建发送 worker（配置链或普通消息任务）。"""
         if getattr(current, "kind", "message") == "profiles":
-            worker = ProfileChainWorker(
+            return ProfileChainWorker(
                 profile_paths=list(current.profile_paths or []),
                 log_callback=self._worker_log_signal.emit,
                 minimize_after=getattr(current, "minimize_after", True),
             )
-        else:
-            _at_members, _at_all, _at_attach = self._sched_at_args(current)
-            worker = ScheduleSendWorker(
-                recipients=current.recipients,
-                message=current.message,
-                chat_delay=current.chat_delay,
-                send_interval=current.send_interval,
-                log_callback=self._worker_log_signal.emit,
-                default_city=current.default_city,
-                minimize_after=getattr(current, "minimize_after", True),
-                attachment=getattr(current, "attachment", "") or "",
-                send_order=list(getattr(current, "send_order", None) or ["message"]),
-                region_spec=getattr(current, "region", None) or {},
-                at_members=_at_members,
-                at_all=_at_all,
-                at_attach=_at_attach,
-                agent_api=bool(getattr(task, "agent_api", False)),
-            )
+        _at_members, _at_all, _at_attach = self._sched_at_args(current)
+        agent_task = agent_source if agent_source is not None else current
+        return ScheduleSendWorker(
+            recipients=current.recipients,
+            message=current.message,
+            chat_delay=current.chat_delay,
+            send_interval=current.send_interval,
+            log_callback=self._worker_log_signal.emit,
+            default_city=current.default_city,
+            minimize_after=getattr(current, "minimize_after", True),
+            attachment=getattr(current, "attachment", "") or "",
+            send_order=list(getattr(current, "send_order", None) or ["message"]),
+            region_spec=getattr(current, "region", None) or {},
+            at_members=_at_members,
+            at_all=_at_all,
+            at_attach=_at_attach,
+            agent_api=bool(getattr(agent_task, "agent_api", False)),
+        )
 
+    def _launch_worker(self, worker, current):
+        """启动已创建好的定时发送 worker，并接管进度/按钮状态。"""
         # 保存任务配置供完成回调使用
         self._current_run_task = current
 
@@ -7446,13 +7699,36 @@ class ScheduleTab(QWidget):
                     mw.workstation_guard.start()
                     self.log(f"[定时] 任务「{current.name}」已开启防锁定守护")
 
-        self.log(f"[定时] 手动立即执行任务: {current.name}")
+        self.log(f"[定时] 立即执行任务: {current.name}")
         if self.worker_created_cb:
             try:
                 self.worker_created_cb(worker)
             except Exception:
                 pass
         worker.start()
+
+    def start_task_now(self, task):
+        """无弹窗启动指定定时任务（供局域网网页复用）。
+
+        返回 ``(ok, message)``；与手动发送/其他定时任务互斥，busy 时返回 False。
+        """
+        if self.send_worker and self.send_worker.isRunning():
+            return False, "已有定时发送正在进行中，请稍候"
+        mw = self.window()
+        if mw is not None and hasattr(mw, "_is_other_send_running"):
+            try:
+                if mw._is_other_send_running(exclude=self.send_worker):
+                    return False, "微信正在执行其他发送任务，请等待完成后再执行"
+            except Exception:
+                pass
+        if task is None:
+            return False, "任务不存在"
+        try:
+            worker = self._build_schedule_worker(task)
+        except Exception as exc:
+            return False, f"创建任务失败：{exc}"
+        self._launch_worker(worker, task)
+        return True, f"已开始执行任务「{task.name}」"
 
     def _cleanup_schedule_worker_after(self, worker):
         try:
@@ -9222,6 +9498,21 @@ class MonitorTab(QWidget):
         self.log(f"[监控] 手动执行一次: {task.name}")
         worker.start()
 
+    def start_task_once(self, task_id):
+        """无弹窗执行指定监控任务一次（供局域网网页复用），返回 (ok, message)。"""
+        if self._one_shot_worker is not None and self._one_shot_worker.isRunning():
+            return False, "正在执行监控任务，请稍候"
+        task = self.store.get(str(task_id))
+        if task is None:
+            return False, "任务不存在"
+        worker = MonitorWorker(store=self.store, one_shot=True,
+                               poll_floor_sec=30.0, only_task_id=str(task_id))
+        self._bind_worker_signals(worker)
+        self._one_shot_worker = worker
+        self.log(f"[监控] 手动执行一次: {task.name}")
+        worker.start()
+        return True, f"已开始执行监控任务「{task.name}」"
+
     def _bind_worker_signals(self, worker: MonitorWorker):
         worker.progress_toast = None
         worker.log.connect(self._worker_log_signal.emit)
@@ -9421,6 +9712,8 @@ class GlobalSettingsTab(QWidget):
     glass_style_changed = pyqtSignal(str)
     # 「立即检测」Agent WeChat 在线状态（由 MainWindow 真正发起探测）
     agent_watch_now = pyqtSignal()
+    # 请求打开局域网网页控制页面（由 MainWindow 用系统浏览器打开）
+    web_open_requested = pyqtSignal()
 
     # (显示文本, 档位 key)；addItem(text, key) 存数据时以 key 为准
     _PROFILE_TEXT = [("关闭", "off"), ("快速", "fast"), ("自然", "natural"), ("保守", "calm")]
@@ -9775,6 +10068,64 @@ class GlobalSettingsTab(QWidget):
         ui_theme.apply_tone(ar_tip, "muted", small=True)
         agl.addWidget(ar_tip)
 
+        # ---------------- 局域网网页控制 ----------------
+        web_group = bar.add_section("🌐 局域网网页控制", collapsed=True)
+        main_layout.addWidget(web_group)
+        wl = web_group.contentLayout()
+
+        self.web_enable_check = QCheckBox(
+            "启用局域网网页控制（手机 / 平板浏览器访问）")
+        self.web_enable_check.setToolTip(
+            "在电脑上开启内置网页服务后，同一局域网内的手机/平板打开提示的网址，\n"
+            "输入网页密码即可查看日志、手动发送、启停定时与监控任务。\n"
+            "仅限内网使用，请勿在路由器上把该端口映射到公网。"
+        )
+        wl.addWidget(self.web_enable_check)
+
+        web_row = QHBoxLayout()
+        web_row.addWidget(QLabel("服务端口："))
+        self.web_port_spin = QSpinBox()
+        self.web_port_spin.setRange(1024, 65535)
+        self.web_port_spin.setFixedWidth(110)
+        web_row.addWidget(self.web_port_spin)
+        self.web_open_btn = QPushButton("🌐 打开网页")
+        self.web_open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        web_row.addWidget(self.web_open_btn)
+        web_row.addStretch(1)
+        wl.addLayout(web_row)
+
+        self.web_status_label = QLabel("网页服务：未启用")
+        self.web_status_label.setWordWrap(True)
+        ui_theme.apply_tone(self.web_status_label, "muted", small=True)
+        wl.addWidget(self.web_status_label)
+
+        pwd_row = QHBoxLayout()
+        pwd_row.addWidget(QLabel("网页密码："))
+        self.web_pwd_edit = QLineEdit()
+        self.web_pwd_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.web_pwd_edit.setPlaceholderText("设置新密码（至少 4 位）")
+        pwd_row.addWidget(self.web_pwd_edit, 1)
+        self.web_pwd2_edit = QLineEdit()
+        self.web_pwd2_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.web_pwd2_edit.setPlaceholderText("确认新密码")
+        pwd_row.addWidget(self.web_pwd2_edit, 1)
+        self.web_pwd_save_btn = QPushButton("保存密码")
+        pwd_row.addWidget(self.web_pwd_save_btn)
+        wl.addLayout(pwd_row)
+
+        self.web_pwd_hint = QLabel("")
+        self.web_pwd_hint.setWordWrap(True)
+        ui_theme.apply_tone(self.web_pwd_hint, "muted", small=True)
+        wl.addWidget(self.web_pwd_hint)
+
+        web_tip = QLabel(
+            "密码只保存加密摘要，不会以明文保存；忘记密码可直接设置新密码。\n"
+            "网页与电脑端共用同一套发送互斥：一端正在发送时，另一端会提示稍后再试。"
+        )
+        web_tip.setWordWrap(True)
+        ui_theme.apply_tone(web_tip, "muted", small=True)
+        wl.addWidget(web_tip)
+
         # ---------------- 待机与空闲 ----------------
         standby_group = bar.add_section("🌙 待机与空闲", collapsed=True)
         main_layout.addWidget(standby_group)
@@ -9832,6 +10183,11 @@ class GlobalSettingsTab(QWidget):
         for _spin in (self.agent_rhythm_msg_min, self.agent_rhythm_msg_max,
                       self.agent_rhythm_person_min, self.agent_rhythm_person_max):
             _spin.valueChanged.connect(self._on_debounced_change)
+        # 局域网网页控制：开关/端口改动后防抖重启服务；密码单独保存
+        self.web_enable_check.toggled.connect(self._on_immediate_change)
+        self.web_port_spin.valueChanged.connect(self._on_debounced_change)
+        self.web_pwd_save_btn.clicked.connect(self._on_save_web_password)
+        self.web_open_btn.clicked.connect(self.web_open_requested.emit)
 
         self._load_to_ui()
         self._loading = False
@@ -9839,7 +10195,7 @@ class GlobalSettingsTab(QWidget):
         # 供手风琴 / 窗口弹性与左侧导航统一遍历
         self._collapsible_groups = [
             theme_group, rhythm_group, at_group, map_group, notification_group,
-            agent_group, standby_group
+            agent_group, web_group, standby_group
         ]
         self.theme_group = theme_group
         self.rhythm_group = rhythm_group
@@ -9847,6 +10203,7 @@ class GlobalSettingsTab(QWidget):
         self.map_group = map_group
         self.notification_group = notification_group
         self.agent_group = agent_group
+        self.web_group = web_group
         self.standby_group = standby_group
         self.nav_sections = [
             ("theme", "外观主题", [theme_group]),
@@ -9855,6 +10212,7 @@ class GlobalSettingsTab(QWidget):
             ("mapping", "全量映射", [map_group]),
             ("notification", "任务通知", [notification_group]),
             ("agent_api", "Agent WeChat", [agent_group]),
+            ("web", "网页控制", [web_group]),
             ("standby", "待机与空闲", [standby_group]),
         ]
         # 右侧顶部小节按钮的分组展示
@@ -9865,6 +10223,7 @@ class GlobalSettingsTab(QWidget):
                         ("mapping", "全量映射"),
                         ("notification", "任务通知"),
                         ("agent_api", "Agent WeChat"),
+                        ("web", "网页控制"),
                         ("standby", "待机与空闲")]),
         ]
 
@@ -9983,6 +10342,20 @@ class GlobalSettingsTab(QWidget):
         except (TypeError, ValueError):
             idle_minutes = 10
         self.idle_minutes_spin.setValue(max(1, min(120, idle_minutes)))
+
+        # 局域网网页控制
+        self.web_enable_check.setChecked(
+            bool(self.settings.get("web_enabled", False)))
+        try:
+            web_port = int(self.settings.get("web_port", 8765))
+        except (TypeError, ValueError):
+            web_port = 8765
+        self.web_port_spin.setValue(max(1024, min(65535, web_port)))
+        self.web_pwd_hint.setText(
+            f"已设置网页密码（摘要 {str(self.settings.get('web_password_hash'))[:8]}…）"
+            if self.settings.get("web_password_hash") else
+            "尚未设置网页密码，请先设置后再启用网页控制"
+        )
 
     @staticmethod
     def _fmt_mapping_name(name):
@@ -10258,7 +10631,81 @@ class GlobalSettingsTab(QWidget):
             "manual_minimize_wechat": bool(
                 self.settings.get("manual_minimize_wechat", True)
             ),
+            # 局域网网页控制：密码摘要/盐由「保存密码」按钮单独写入，这里原样带出，
+            # 否则普通设置保存会把已有密码清空。
+            "web_enabled": self.web_enable_check.isChecked(),
+            "web_port": int(self.web_port_spin.value()),
+            "web_password_hash": str(
+                self.settings.get("web_password_hash", "") or ""),
+            "web_password_salt": str(
+                self.settings.get("web_password_salt", "") or ""),
         }
+
+    def _on_save_web_password(self):
+        """保存网页登录密码（PBKDF2-SHA256 摘要 + 随机盐，不保存明文）。"""
+        # 保存与登录都去掉首尾空格，避免手机输入法/复制粘贴带入空格导致对不上
+        pwd = self.web_pwd_edit.text().strip()
+        confirm = self.web_pwd2_edit.text().strip()
+        if len(pwd) < 4:
+            QMessageBox.warning(self, "密码过短", "网页密码至少 4 位")
+            return
+        if pwd != confirm:
+            QMessageBox.warning(self, "密码不一致", "两次输入的密码不一致")
+            return
+        try:
+            from modules.web_server import hash_password, verify_password
+            hash_hex, salt_hex = hash_password(pwd)
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", f"密码加密失败：{exc}")
+            return
+        self.settings["web_password_hash"] = hash_hex
+        self.settings["web_password_salt"] = salt_hex
+        # 不依赖内存副本：用当前界面值重新收集后写入摘要/盐，彻底落盘
+        try:
+            settings = self._collect_settings()
+            settings["web_password_hash"] = hash_hex
+            settings["web_password_salt"] = salt_hex
+            self.settings = self.config_manager.save_global_settings(settings)
+        except Exception as exc:
+            logger.warning("[web] 保存网页密码失败: %s", exc)
+            QMessageBox.warning(self, "保存失败", f"写入配置失败：{exc}")
+            return
+        # 落盘后立刻回读校验，确保下次启动登录一定对得上（防止保存链路丢字段）
+        try:
+            saved = self.config_manager.load_global_settings()
+            ok = verify_password(
+                pwd,
+                str(saved.get("web_password_hash", "") or ""),
+                str(saved.get("web_password_salt", "") or ""),
+            )
+        except Exception:
+            ok = False
+        if not ok:
+            self.web_pwd_hint.setText("❌ 密码写入校验失败，请重试")
+            QMessageBox.warning(
+                self, "保存失败",
+                "密码写入后回读校验不一致，请重试；若持续失败请检查配置目录权限。")
+            return
+        self.web_pwd_edit.clear()
+        self.web_pwd2_edit.clear()
+        self.web_pwd_hint.setText(
+            f"✅ 网页密码已更新（摘要 {hash_hex[:8]}…，下次登录生效）")
+        logger.info("[web] 网页登录密码已更新")
+        # 改密后让所有已登录设备重新登录
+        try:
+            mw = self.window()
+            if mw is not None and getattr(mw, "web_service", None) is not None:
+                mw.web_service.revoke_all_sessions()
+        except Exception:
+            pass
+        self.settings_changed.emit()
+
+    def set_web_status(self, text: str):
+        """更新网页服务状态文字（由 MainWindow 调用）。"""
+        try:
+            self.web_status_label.setText(text)
+        except Exception:
+            pass
 
     def _on_test_agent_api(self):
         """测试 Agent WeChat API 连通性（同步，超时 8 秒）。
@@ -10302,7 +10749,18 @@ class GlobalSettingsTab(QWidget):
     # ---------------- 落盘 + 应用 -----------------
     def _save(self):
         try:
-            self.settings = self.config_manager.save_global_settings(self._collect_settings())
+            data = self._collect_settings()
+            # 保险：任何一次普通设置保存都不能把已设置的网页密码清空
+            if not data.get("web_password_hash") or not data.get("web_password_salt"):
+                try:
+                    disk = self.config_manager.load_global_settings()
+                except Exception:
+                    disk = {}
+                if (disk.get("web_password_hash")
+                        and disk.get("web_password_salt")):
+                    data["web_password_hash"] = disk["web_password_hash"]
+                    data["web_password_salt"] = disk["web_password_salt"]
+            self.settings = self.config_manager.save_global_settings(data)
         except Exception as exc:
             logger.warning(f"保存全量设置失败: {exc}")
 
@@ -10398,6 +10856,16 @@ class MainWindow(QMainWindow):
         # 都会尝试弹，由该标志去重；新任务在主线程触发时复位
         self._schedule_result_toast_shown = False
         self._schedule_progress_toast = None
+
+        # 全局日志环形缓冲：供局域网网页端增量拉取日志
+        self._global_log_buffer = deque(maxlen=800)
+        self._global_log_seq = 0
+        self._global_log_lock = threading.Lock()
+        # 网页控制服务对象（init_ui 末尾创建）
+        self.web_bridge = None
+        self.web_actions = None
+        self.web_service = None
+        self._web_restart_timer = None
 
         # 关键：跨线程日志用 pyqtSignal 投递，不能用 QTimer.singleShot(0,...)
         # 因为子线程没有 Qt event loop，singleShot 永远不会触发
@@ -10692,6 +11160,103 @@ class MainWindow(QMainWindow):
         # 门闩：数据发送完成弹窗等待用户点击期间，禁止 worker.finished 提前清除任务栏
         self._progress_waiting_dismiss = False
 
+        # ---- 局域网网页控制服务（内置 HTTP，仅监听局域网）----
+        self._init_web_service()
+
+    # ------------------------- 局域网网页控制 -------------------------
+    def _init_web_service(self):
+        """创建网页服务对象，并按当前全局设置决定是否随程序启动。"""
+        try:
+            self.web_bridge = WebBridge(self)
+            self.web_actions = WebActions(self)
+            self.web_service = WebService(
+                self.web_bridge, self.config_manager, self.web_actions)
+            self._web_restart_timer = QTimer(self)
+            self._web_restart_timer.setSingleShot(True)
+            self._web_restart_timer.setInterval(700)
+            self._web_restart_timer.timeout.connect(self._apply_web_settings)
+            self.global_settings_tab.settings_changed.connect(
+                self._schedule_web_restart)
+            self.global_settings_tab.web_open_requested.connect(
+                self._open_web_page)
+            self._apply_web_settings()
+        except Exception as exc:
+            logger.warning("初始化网页控制服务失败: %s", exc)
+
+    def _schedule_web_restart(self):
+        """全局设置变更后防抖重启，避免拖端口/勾选时反复开关监听。"""
+        if self._web_restart_timer is not None:
+            self._web_restart_timer.start()
+
+    def _apply_web_settings(self):
+        """按全局设置启动/停止/重启网页服务，并刷新设置页状态文字。"""
+        if self.web_service is None:
+            return
+        if os.environ.get("QT_QPA_PLATFORM", "").lower() == "offscreen":
+            self.global_settings_tab.set_web_status("网页服务：测试模式未启动")
+            return
+        try:
+            settings = self.config_manager.load_global_settings()
+        except Exception:
+            return
+        enabled = bool(settings.get("web_enabled", False))
+        try:
+            port = int(settings.get("web_port", 8765) or 8765)
+        except (TypeError, ValueError):
+            port = 8765
+        has_pwd = bool(
+            settings.get("web_password_hash")
+            and settings.get("web_password_salt"))
+        logger.info(
+            "[web] 配置检查：enabled=%s port=%s password=%s",
+            enabled, port, "已设置" if has_pwd else "未设置")
+        if not enabled or not has_pwd:
+            if self.web_service.running:
+                self.web_service.stop()
+            self.global_settings_tab.set_web_status(
+                "网页服务：未启用" if not enabled
+                else "网页服务：未启动（请先设置网页密码）")
+            return
+        if self.web_service.running and self.web_service.port == port:
+            self.global_settings_tab.set_web_status(
+                f"✅ 网页服务运行中 · {self.web_service.url()}")
+            return
+        try:
+            self.web_service.stop()
+            self.web_service.start(port)
+        except Exception as exc:
+            logger.warning("网页控制服务启动失败: %s", exc)
+            self.global_settings_tab.set_web_status(f"❌ 启动失败：{exc}")
+            return
+        self.global_settings_tab.set_web_status(
+            f"✅ 网页服务运行中 · {self.web_service.url()}")
+
+    def _open_web_page(self):
+        if self.web_service is None or not self.web_service.running:
+            QMessageBox.information(
+                self, "网页服务未运行",
+                "请先勾选「启用局域网网页控制」并设置网页密码。")
+            return
+        QDesktopServices.openUrl(QUrl(self.web_service.url()))
+
+    def _shutdown_web_service(self):
+        try:
+            if self._web_restart_timer is not None:
+                self._web_restart_timer.stop()
+        except Exception:
+            pass
+        try:
+            if self.web_bridge is not None:
+                self.web_bridge.shutdown()
+        except Exception:
+            pass
+        try:
+            if self.web_service is not None:
+                self.web_service.stop()
+                self.web_service.cleanup_all_uploads()
+        except Exception:
+            pass
+
     # ------------------------- 导航 / 主题 -------------------------
     def _unwrap_page(self, page: QWidget) -> QWidget:
         """穿透 ElasticPage / QScrollArea 包装层，取真实业务页面。"""
@@ -10826,6 +11391,17 @@ class MainWindow(QMainWindow):
         try:
             stamp = time.strftime("%H:%M:%S") if ts is None else ts
             self.bottom_dock.log_text.append_log(message, stamp)
+        except Exception:
+            pass
+        # 同步写入环形缓冲，供网页端 /api/logs 增量拉取
+        try:
+            with self._global_log_lock:
+                self._global_log_seq += 1
+                self._global_log_buffer.append({
+                    "seq": self._global_log_seq,
+                    "ts": stamp,
+                    "msg": str(message),
+                })
         except Exception:
             pass
 
@@ -12808,6 +13384,8 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(100, self._poll_worker_shutdown)
 
     def _request_worker_stop(self):
+        # 停止局域网网页控制服务（先让挂起请求返回，再关监听）
+        self._shutdown_web_service()
         # 停止 Agent WeChat 掉线探测（等待当前一次只读请求结束，避免线程被销毁）
         try:
             self._agent_watch_timer.stop()

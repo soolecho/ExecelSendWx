@@ -318,6 +318,17 @@ class ConfigManager:
         }
 
     @staticmethod
+    def _normalize_web_port(value):
+        """网页控制端口：非数字或越界时回退 8765（仅允许 1024-65535）。"""
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            return 8765
+        if port < 1024 or port > 65535:
+            return 8765
+        return port
+
+    @staticmethod
     def _normalize_global_settings(raw):
         """规范化全局设置，返回一个含默认值的完整 dict。"""
         if not isinstance(raw, dict):
@@ -433,6 +444,17 @@ class ConfigManager:
                 "person_min": ar_person[0],
                 "person_max": ar_person[1],
             },
+            # 局域网网页控制：内置 HTTP 服务（仅监听局域网，密码登录）
+            "web_enabled": bool(raw.get("web_enabled", False)),
+            "web_port": ConfigManager._normalize_web_port(
+                raw.get("web_port", 8765)),
+            # 登录密码只保存 PBKDF2 摘要与盐，明文不落盘
+            "web_password_hash": str(
+                raw.get("web_password_hash", "") or ""
+            ).strip(),
+            "web_password_salt": str(
+                raw.get("web_password_salt", "") or ""
+            ).strip(),
         }
 
     def load_global_settings(self):

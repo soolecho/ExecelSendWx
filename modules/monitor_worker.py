@@ -171,11 +171,13 @@ class MonitorWorker(QThread):
     _TASK_BUSY_LOCK = threading.Lock()
 
     def __init__(self, store: Optional[MonitorManager] = None, one_shot: bool = False,
-                 poll_floor_sec: float = 30.0):
+                 poll_floor_sec: float = 30.0, only_task_id: Optional[str] = None):
         super().__init__()
         self.store = store or MonitorManager()
         self.one_shot = one_shot
         self.poll_floor_sec = max(5.0, float(poll_floor_sec))
+        # 仅处理指定任务（网页「立即执行」用）：跳过其他任务，且不受 enabled 限制
+        self.only_task_id = str(only_task_id).strip() if only_task_id else ""
         self._stop = False
         self._last_run: Dict[str, float] = {}
 
@@ -211,7 +213,10 @@ class MonitorWorker(QThread):
         for task in tasks:
             if self._stop:
                 break
-            if not task.enabled:
+            if self.only_task_id and task.id != self.only_task_id:
+                continue
+            # 指定任务模式是用户显式「立即执行」，即使任务已停用也执行一次
+            if not task.enabled and not self.only_task_id:
                 continue
             if not _now_in_window(task, now):
                 continue

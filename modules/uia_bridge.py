@@ -57,6 +57,21 @@ AT_POPOVER_AID = "MentionPopover"
 # @所有人 在不同版本/语言包里的候选名（依次尝试）
 AT_ALL_ALIASES = ("所有人", "全部成员", "All", "Everyone")
 
+# 群聊 @ 版式（来自「全量设置」）：@ 与文字同一条消息时
+#   _AT_NEWLINE  True=@ 单独占一行（与文字之间换行）
+#   _AT_POSITION start=@ 在文字前（默认）；end=@ 在文字后
+_AT_NEWLINE = False
+_AT_POSITION = "start"
+
+
+def set_at_layout(newline: bool = False, position: str = "start") -> None:
+    """设置 @ 版式（进程内全局，GUI 在全量设置加载/保存时调用）。"""
+    global _AT_NEWLINE, _AT_POSITION
+    _AT_NEWLINE = bool(newline)
+    _AT_POSITION = (
+        "end" if str(position or "").strip().lower() == "end" else "start"
+    )
+
 
 def _mention_key(name: str) -> str:
     """@ 匹配用的归一化名字：去空格（微信弹层里昵称不含空格）。"""
@@ -637,7 +652,8 @@ class UiaBridge:
         """在已打开会话的输入框发送文本（粘贴 + 回读相似度校验 + 回车）。
 
         带 ``at_members`` / ``at_all`` 时先把 @ chip 插进输入框再粘文字；
-        不带 @ 时走驱动原路径（行为完全不变）。
+        不带 @ 时走驱动原路径（行为完全不变）。@ 单独一行 / 放文字前后由
+        ``set_at_layout()`` 控制（全量设置里可切换）。
         """
         has_at = self._has_at_targets(at_members, at_all)
         with self._lock:
@@ -655,10 +671,21 @@ class UiaBridge:
                     logger.warning("uia_bridge.send_text: 聚焦输入框失败")
                     return False
                 self._clear_chat_input(e)
-                inserted = self._insert_mentions(driver, e, at_members, at_all)
                 text = text or ""
+                # @ 版式（全量设置）：默认 @ 在文字前；at_end 时先粘文字再插 @。
+                # 开启「单独一行」时在 @ 与文字之间补一个换行（粘贴多行文本实现，
+                # 不用 Shift+Enter，避免用户改过快捷键时误发送）。
+                at_end = bool(text) and _AT_POSITION == "end"
+                inserted = 0
+                if not at_end:
+                    inserted = self._insert_mentions(driver, e, at_members, at_all)
                 if text:
-                    if not clipboard_set_text(text):
+                    paste_text = text
+                    if at_end:
+                        paste_text = text + ("\n" if _AT_NEWLINE else "")
+                    elif inserted and _AT_NEWLINE:
+                        paste_text = "\n" + text
+                    if not clipboard_set_text(paste_text):
                         logger.warning("uia_bridge.send_text: 写文字剪贴板失败")
                         return False
                     try:
@@ -674,6 +701,8 @@ class UiaBridge:
                         except Exception:
                             pass
                         return False
+                    if at_end:
+                        self._insert_mentions(driver, e, at_members, at_all)
                 elif inserted == 0:
                     return False
                 try:
