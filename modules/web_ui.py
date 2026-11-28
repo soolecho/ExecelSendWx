@@ -9,7 +9,7 @@ PAGE_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>表格自动发送 · 局域网控制</title>
+<title>表格自动发送By春风予Lu · 局域网控制</title>
 <style>
 :root{
   --bg:#f4f6fb; --card:#ffffff; --text:#1f2430; --muted:#7a8294;
@@ -122,6 +122,7 @@ main{padding:14px;max-width:920px;margin:0 auto}
     padding:6px 8px calc(6px + env(safe-area-inset-bottom));overflow:visible}
   .tabs button{flex:1;padding:8px 4px;font-size:12px;border-radius:10px}
   main{padding:12px 12px 88px}
+  .brand{font-size:13px;overflow:hidden;text-overflow:ellipsis}
   #lanUrl{display:none}
 }
 </style>
@@ -130,7 +131,7 @@ main{padding:14px;max-width:920px;margin:0 auto}
 
 <div id="login" class="login-wrap">
   <div class="login-card">
-    <h1>📨 表格自动发送</h1>
+    <h1>📨 表格自动发送By春风予Lu</h1>
     <p class="muted small">局域网网页控制</p>
     <input id="pwd" type="password" placeholder="网页控制密码" autocomplete="current-password">
     <button id="loginBtn" class="primary">登录</button>
@@ -140,7 +141,7 @@ main{padding:14px;max-width:920px;margin:0 auto}
 
 <div id="app" class="hidden">
   <header class="topbar">
-    <div class="brand">📨 表格自动发送</div>
+    <div class="brand">📨 表格自动发送By春风予Lu</div>
     <div id="lanUrl" class="muted small"></div>
     <button id="logoutBtn" class="ghost">退出</button>
   </header>
